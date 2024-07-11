@@ -1,0 +1,11 @@
+numpy
+matplotlib
+opencv-python-headless  # If you don't need GUI functions from OpenCV, use headless for environments without GUI support.
+h5py
+scipy
+xgboost
+scikit-image
+scikit-learn
+abtem  # This might need to be installed from a specific source if not available in PyPI.
+# Node_class, helper_function, genData_Direct, dp_denoise, abTEM_helpers - these appear to be custom or local modules.
+ase  # If the 'ase' library is the atomic simulation environment package.
