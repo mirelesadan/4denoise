@@ -6,11 +6,12 @@ Rice University
 April 2024
 """
 
-import os
-# os.chdir("/home/han/Users/adan/pythonCodes/InverseFunction")
-os.chdir("C:/Users/haloe/Documents/CodeWriting/pythonCodes/HanLab/InverseFunction/")
-import sys
-sys.path.append("C:/Users/haloe/Documents/CodeWriting/4Denoise/")
+if __name__ == '__main__':
+    import os
+    # os.chdir("/home/han/Users/adan/pythonCodes/InverseFunction")
+    os.chdir("C:/Users/haloe/Documents/CodeWriting/pythonCodes/HanLab/InverseFunction/")
+    import sys
+    sys.path.append("C:/Users/haloe/Documents/CodeWriting/4Denoise/")
 
 import numpy as np
 import h5py
@@ -3550,4 +3551,3 @@ if __name__ == '__main__':
     del(rippleData)
     HyperData = HyperData(singleRipple)
     
-    #%%
