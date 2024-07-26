@@ -8,10 +8,12 @@ April 2024
 
 if __name__ == '__main__':
     import os
-    # os.chdir("/home/han/Users/adan/pythonCodes/InverseFunction")
-    os.chdir("C:/Users/haloe/Documents/CodeWriting/pythonCodes/HanLab/InverseFunction/")
+    os.chdir("/home/han/Users/adan/pythonCodes/InverseFunction")
+    # os.chdir("C:/Users/haloe/Documents/CodeWriting/pythonCodes/HanLab/InverseFunction/")
     import sys
-    sys.path.append("C:/Users/haloe/Documents/CodeWriting/4Denoise/")
+    sys.path.append("/home/han/Users/adan/4denoise")
+    # sys.path.append("C:/Users/haloe/Documents/CodeWriting/4Denoise/")
+
 
 import numpy as np
 import h5py
@@ -32,27 +34,54 @@ from scipy.optimize import minimize
 from scipy.ndimage import affine_transform
 
 import matplotlib.pyplot as plt
-from Node_class import *
+from matplotlib.colors import ListedColormap
+from matplotlib.cm import ScalarMappable
+plt.rcParams['font.family'] = 'Lato'
+plt.rcParams['figure.dpi'] = 300
+plt.rcParams['savefig.dpi'] = 300
+
+# from Node_class import *
 # import helper_function as hf
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from time import perf_counter
 from tqdm import tqdm
 import time
 import xgboost as xgb
-from genData_Direct import VectorSol_all, VectorSol_matrix
-from matplotlib.colors import ListedColormap
+# from genData_Direct import VectorSol_all, VectorSol_matrix
 
 from skimage.measure import profile_line
 from skimage import transform
 from skimage import feature
 from skimage.restoration import denoise_nl_means, estimate_sigma, denoise_tv_chambolle
-
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 import cv2
 import inspect
 
+import numba #new
+from numba import jit, prange #new
+
+from scipy.ndimage import gaussian_filter
+import tensorly as tl
+
+from tensorly.decomposition import constrained_parafac
+from tensorly.decomposition import parafac2 as par2
+from tensorly.decomposition import tensor_ring as t_ring
+from tensorly.decomposition import tensor_train_matrix as tt_mat
+from tensorly.decomposition import tensor_train as tt
+from tensorly.decomposition import non_negative_tucker_hals as nnth
+from tensorly.decomposition import non_negative_tucker as nnt
+from tensorly.decomposition import partial_tucker as partial_tuck
+from tensorly.decomposition import tucker as tuck
+from tensorly.decomposition import randomised_parafac as rand_parafac
+from tensorly.decomposition import non_negative_parafac_hals as nn_parafac_hals
+from tensorly.decomposition import non_negative_parafac as nn_parafac
+from tensorly.decomposition import parafac as par
+
+from tensorly.decomposition import parafac_power_iteration as parafac_power_iter
+from tensorly.decomposition import symmetric_parafac_power_iteration as sym_parafac_power_iter
 
 #%%
 
@@ -142,16 +171,50 @@ def read_4D(fname, dp_dims = (128, 130), trim_dims = (128,128), trim_meta = True
     return dp
 
 def read_mat_file(filename):
-    
-    data = io.loadmat(filename)
-    
-    for key in data.keys():
-        content = data[key]
+    try:
+        file = io.loadmat(filename)
+
+        for key in file.keys():
+            content = file[key]
+            
+            if isinstance(content, np.ndarray):
+                if len(content.shape) > 1:
+                    return content
+        else:
+            print("No good key not found in the .mat file.")
+            return file
         
-        if isinstance(content, np.ndarray):
-            if len(content.shape) > 1:
-                return content
+    except NotImplementedError:
+        print("This file may be in HDF5 format. Trying h5py to load.")
+        return read_mat_file_h5py(filename)
     
+    except Exception as e:
+        print(f"Failed to read the .mat file: {e}")
+        return None
+
+def read_mat_file_h5py(filename):
+    try:
+        success_msg = "...Data loaded successfully."
+        with h5py.File(filename, 'r') as file:
+            
+            for key in file.keys():
+                content = file[key]
+                
+                if isinstance(content, np.ndarray):
+                    if len(content.shape) > 1:
+                        print(success_msg)
+                        return content
+                    
+                elif len(content.shape) > 1:
+                    print(success_msg)
+                    return np.array(content)
+            else:
+                print("No good key not found in the .mat file.")
+                return file
+            
+    except Exception as e:
+        print(f"Error reading with h5py: {e}")
+        return None
 
 def save_mat_data(data, fileName, varName):
     """
@@ -182,31 +245,22 @@ def circular_mask(center_y, center_x, radius):
     mask = x**2 + y**2 <= radius**2
     return mask
 
-def make_mask(center, r_mask, mask_dim=(128,128)):
+def make_mask(center, r_mask, mask_dim=(128,128), invert=False):
     """
     Create a 2D mask of user-defined dimensions at a defined radius from a central point
     """
-    
-    mask = np.zeros(mask_dim)
+
+    mask = np.zeros(mask_dim, dtype=bool)
     y, x = center
     for i in range(mask_dim[0]):
         for j in range(mask_dim[1]):
             if (i-y)**2 + (j-x)**2 <= r_mask**2:
-                mask[i][j] = 1
-
-    return mask
-
-def rem_negs(array):
-    """
-    Function to replace negative values in diffraction data.
+                mask[i,j] = True
     
-    Input: 4D dataset
-    Output: 4D dataset with values less than 1 replaced with 1
-    """
-
-    array[array < 1] = 1
-
-    return array
+    if invert:
+        mask = np.logical_not(mask)
+    
+    return mask
 
 def anscombe_transform(array, inverse=False):
     """
@@ -238,6 +292,205 @@ def add_poisson_noise(array, counts):
     
     return noisy_array
 
+def get_surface_tilt_and_direction(surface, units='rad', show_results=True):
+    """
+    Calculate the tilt magnitude and tilt axis (gradient direction) of a surface and optionally display the results.
+
+    Parameters
+    ----------
+    surface : numpy.ndarray
+        A 2D array of height values representing the surface.
+    units : str, optional
+        The unit of the tilt magnitude and direction. Can be 'rad' for radians or 'deg' for degrees.
+        Default is 'rad'.
+    show_results : bool, optional
+        If True, plots the tilt magnitude and direction. Default is True.
+
+    Returns
+    -------
+    tilt_magnitude : numpy.ndarray
+        A 2D array where each value represents the angular magnitude of the gradient (tilt magnitude),
+        in specified units (either radians or degrees).
+    tilt_direction : numpy.ndarray
+        A 2D array where each value represents the direction of the gradient, in specified units
+        (either radians or degrees).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> surface = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    >>> tilt_magnitude, tilt_direction = calculate_surface_tilt(surface, units='deg', show_results=True)
+
+    Notes
+    -----
+    The tilt direction is calculated relative to the horizontal axis. Edge values for the tilt
+    magnitude and direction are set based on the boundary conditions and may not accurately
+    represent the actual tilt due to the lack of neighboring data.
+    """
+    
+    # Compute gradients along x and y axes
+    gy, gx = np.gradient(surface)
+    
+    # Calculate gradient magnitude and then calculate arctan of this magnitude
+    gradient_magnitude = np.sqrt(gx**2 + gy**2)
+    tilt_magnitude = np.arctan(gradient_magnitude)
+    tilt_direction = np.arctan2(gy, gx) + np.pi
+    
+    # Convert tilt magnitude and direction to degrees if required
+    if units == 'deg':
+        tilt_magnitude = np.degrees(tilt_magnitude)
+        tilt_direction = np.degrees(tilt_direction)
+        unit_label = 'Degrees'
+    else:
+        unit_label = 'Radians'
+    
+    if show_results:
+        plt.figure(figsize=(12, 6))
+
+        # Tilt magnitude
+        ax1 = plt.subplot(1, 2, 1)
+        cax1 = plt.imshow(tilt_magnitude, cmap='gray')
+        plt.title('Tilt Magnitude')
+        cb1 = plt.colorbar(cax1, ax=ax1)
+        cb1.ax.set_title(unit_label, pad=10)
+
+        # Tilt direction
+        ax2 = plt.subplot(1, 2, 2)
+        cax2 = plt.imshow(tilt_direction, cmap='hsv')
+        plt.title('Tilt Direction')
+        cb2 = plt.colorbar(cax2, ax=ax2)
+        cb2.ax.set_title(unit_label, pad=10)
+
+        plt.tight_layout()
+        plt.show()
+    
+    return tilt_direction, tilt_magnitude
+
+
+def visualize_field_phase_amplitude(field, Amp='raw', scale=True, subplot=True):
+    """
+    Visualize the phase and amplitude of a field as an RGB image and optionally display a color wheel.
+
+    Parameters
+    ----------
+    field : complex ndarray or tuple
+        The input field. Can be a complex array or a tuple of (phase, magnitude).
+    Amp : str, optional
+        Control for amplitude visualization:
+        'uniform' - use a uniform amplitude across the image,
+        'log' - use logarithmic scaling of the amplitude,
+        'raw' - use the raw amplitude values.
+    scale : bool, optional
+        If True, plots a color wheel with corresponding phase hues. Default is False.
+    subplot : bool, optional
+        If True, uses subplots to show the image and color wheel; otherwise, separate figures.
+
+    Returns
+    -------
+    rgb_image : ndarray
+        An array representing the RGB visualization of the input field.
+    
+    Notes
+    -----
+    This code is based on the MATLAB code written by [author] in [date].
+    """
+    
+    if isinstance(field, tuple):
+        phase, amplitude = field
+    else:
+        phase = np.angle(field)
+        amplitude = np.abs(field)
+    
+    # Normalize amplitude
+    amplitude = amplitude/np.max(amplitude)
+    
+    if Amp == 'uniform':
+        amplitude = np.ones_like(amplitude)
+    elif Amp == 'log':
+        min_amplitude = np.min(amplitude[amplitude > 0])
+        amplitude = np.log(amplitude / min_amplitude) / np.log(amplitude.max())
+    elif Amp != 'raw':
+        raise ValueError("Amp must be 'uniform', 'log', or 'raw'.")
+
+    # Create RGB image
+    rgb_image = np.zeros((*amplitude.shape, 3))
+    rgb_image[..., 0] = 0.5 * (np.sin(phase) + 1) * amplitude  # Red
+    rgb_image[..., 1] = 0.5 * (np.sin(phase + np.pi / 2) + 1) * amplitude  # Green
+    rgb_image[..., 2] = 0.5 * (-np.sin(phase) + 1) * amplitude  # Blue
+
+    if not subplot:
+        plt.figure(figsize=(10, 10))
+        plt.axis('off')
+        plt.imshow(rgb_image)
+        plt.show()
+    
+    if scale:
+        # Color wheel
+        phase = np.linspace(0, 2 * np.pi, 256)
+        r = 0.5 * (np.sin(phase) + 1)
+        g = 0.5 * (np.sin(phase + np.pi / 2) + 1)
+        b = 0.5 * (-np.sin(phase) + 1)
+        colorwheel = np.stack([r, g, b], axis=1)
+        warphase = ListedColormap(colorwheel)
+
+        x, y = np.meshgrid(np.linspace(-1, 1, 256), np.linspace(-1, 1, 256))
+        z = x + 1j * y
+        mask = x**2 + y**2 > 1
+        z[mask] = np.nan
+
+        hue = np.angle(z)     
+        idx = np.clip(((hue + np.pi) / (2 * np.pi) * 255).astype(int), 0, 255)
+        color_wheel = colorwheel[idx]
+        color_wheel = (color_wheel.T * np.abs(z)).T
+        color_wheel = np.rot90(color_wheel, 2)
+        color_wheel[np.isnan(color_wheel)] = 1.0
+
+        # if subplot:
+        #     plt.figure(figsize=(12, 6))  # Increase the figure size for better visibility
+        #     plt.subplot(1, 2, 1)
+        #     plt.imshow(rgb_image)
+        #     # plt.title("RGB Image of Field")
+        #     plt.axis('off')
+        #     plt.subplot(1, 2, 2)
+        #     plt.imshow(color_wheel, origin='lower')
+        #     # plt.title("Color Wheel")
+        #     plt.axis('off')
+        #     sm = ScalarMappable(cmap=warphase)
+        #     sm.set_array([])
+        #     # cbar = plt.colorbar(sm, orientation='vertical', ticks=[0, 0.25, 0.5, 0.75, 1])
+        #     cbar = plt.colorbar(sm, orientation='vertical', ticks=[0, 0.25, 0.5, 0.75, 1], fraction=0.046, pad=0.04)  # Adjusted size
+        #     cbar.set_label('Hue', rotation=270, labelpad=15)
+        #     cbar.set_ticklabels(["0", "π/2", "π", "3π/2", "2π"])
+        #     plt.tight_layout()
+        #     plt.show()
+        # else:
+        #     plt.figure(figsize=(10, 10))
+        #     plt.imshow(color_wheel, origin='lower')
+        #     plt.axis('off')
+        #     plt.show()
+            
+        if subplot:
+            fig, axs = plt.subplots(1, 2, figsize=(12, 6))  # Unified figure creation
+            axs[0].imshow(rgb_image)
+            axs[0].axis('off')
+            axs[1].imshow(color_wheel, origin='lower')
+            axs[1].axis('off')
+            sm = ScalarMappable(cmap=warphase)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=axs[1], orientation='vertical', ticks=[0, 0.25, 0.5, 0.75, 1], fraction=0.046, pad=0.04)
+            cbar.set_label('Hue', rotation=270, labelpad=15)
+            cbar.set_ticklabels(["0", "π/2", "π", "3π/2", "2π"])
+            plt.tight_layout()
+            plt.show()
+        else:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(color_wheel, origin='lower')
+            plt.axis('off')
+            plt.show()
+
+
+    return rgb_image
+
 # def calculate_PSNR(noisy_arr, clean_arr):
 #     """
     
@@ -245,8 +498,396 @@ def add_poisson_noise(array, counts):
     
 #     PSNR = 0
 
-#%% Denoising Functions and Classes
+def unfold_tensor(tensor, unfold_domain, undo=False, original_shape=None):
+    
+    #TODO: assert that unfold_domain is a string and is included in a list of possible unfolding methods
+    
+    if original_shape and unfold_domain in ['real', 'reciprocal', 'both']:
+        tensor = tensor.reshape(original_shape)
+        return tensor
+    
+    if not undo:
+        original_shape = tensor.shape
+    
+    # Unfold real space and obtain a stack of diffraction patterns
+    if unfold_domain == 'real':
+        
+        new_tensor_shape = (original_shape[0]*original_shape[1],) + original_shape[2:]
+        tensor = tensor.reshape(new_tensor_shape)
+    
+    # Unfold reciprocal space and obtain a stack of real-space images
+    elif unfold_domain == 'reciprocal':
+        new_tensor_shape = original_shape[:2] + (original_shape[2]*original_shape[3],)
+        tensor = tensor.reshape(new_tensor_shape)
+    
+    # Create a large 2D array with mixed coordinates
+    elif unfold_domain == 'both':
+        new_tensor_shape = (original_shape[0]*original_shape[1],) + (original_shape[2]*original_shape[3],)
+        tensor = tensor.reshape(new_tensor_shape)
+    
+    elif unfold_domain == 'coordinate_aligned_real':
+               
+        if not undo:
+            # From (0, 1, 2, 3, ...) we swap 1 and 2
+            tensor = np.transpose(tensor, (0, 2, 1, 3, ))
+            
+            new_tensor_shape = (original_shape[0]*original_shape[2],) + (original_shape[1]*original_shape[3],)
+            tensor = tensor.reshape(new_tensor_shape) 
+        
+        elif undo:
+            
+            intermediate_shape = (original_shape[0], original_shape[2], original_shape[1], original_shape[3],)
+            tensor = tensor.reshape(intermediate_shape)
+            # print(tensor)
+            tensor = np.transpose(tensor, (0, 2, 1, 3, ))
+    
+    elif unfold_domain == 'coordinate_aligned_reciprocal':
+               
+        if not undo:
+            # From (0, 1, 2, 3, ...) we swap 1 and 2
+            tensor = np.transpose(tensor, (2, 0, 3, 1 ))
+            
+            new_tensor_shape = (original_shape[2]*original_shape[0],) + (original_shape[3]*original_shape[1],)
+            tensor = tensor.reshape(new_tensor_shape) 
+        
+        elif undo:
+            
+            intermediate_shape = (original_shape[2], original_shape[0], original_shape[3], original_shape[1],)
+            tensor = tensor.reshape(intermediate_shape)
+            # print(tensor)
+            tensor = np.transpose(tensor, (1, 3, 0, 2))
+    
+    # Create a typical 
+    # elif unfold_domain == 'coordinate_aligned_real':
+    #     new_tensor_shape = (original_shape[0]*original_shape[1],) + (original_shape[2]*original_shape[3],)
+    #     tensor = tensor.reshape(new_tensor_shape) 
+    
+    # By default, the serpentine method unfolds real-space
+    elif unfold_domain == 'serpentine':
+        #TODO add serpentine unfolding
+        pass
+    
+    elif unfold_domain == 'spiral_real':
+        #TODO add spiral unfolding
+        pass
+    
+    elif unfold_domain == 'spiral_reciprocal':
+        #TODO add spiral unfolding
+        pass
+    
+    return tensor
 
+def clip_values(array, a_min=1, a_max=None):
+    """
+    Function to clip values in array.
+    """
+
+    return np.clip(array, a_min, a_max)
+
+from scipy.spatial import ConvexHull
+def plot_centers_of_mass_with_histograms(centers_data, colors, labels=None, drawConvexHull=True,
+                                         transparency=0.5, hist_height=0.16, bins=150,
+                                         alpha=0.5, density=True, label_size=22, tick_label_size=18,
+                                         x_range=(-0.9, 0.9), y_range=(-0.9, 0.9), hist_title_size=16):
+    """
+    Plots the centers of mass for all features from each dataset, centered at (0, 0),
+    with histograms of the x and y coordinates.
+
+    centers_data: The dataset with shape (n_datasets, A1, A2, n_spots, 2)
+    hist_height: Height of the histograms as a fraction of total figure height
+    label_size: Font size for the labels
+    """
+
+    # Check data compatibility
+    assert type(drawConvexHull) is bool, "'drawConvexHull' must be a boolean (True/False) variable"
+    assert type(density) is bool, "'density' must be a boolean  (True/False) variable"
+    assert len(colors) == centers_data.shape[0], "The number of colors must match the number of datasets to plot."
+    assert all(isinstance(item, str) for item in colors), "Not all elements are strings."
+
+    n_datasets = centers_data.shape[0]
+
+    # Create the main plot
+    fig = plt.figure(figsize=(9, 9))
+    ax_scatter = plt.axes([0.1, 0.1, 0.65, 0.65])
+    ax_histx = plt.axes([0.1, 0.75, 0.65, hist_height], sharex=ax_scatter)
+    ax_histy = plt.axes([0.75, 0.1, hist_height, 0.65], sharey=ax_scatter)
+
+    # Disable labels on histogram to prevent overlap
+    plt.setp(ax_histx.get_xticklabels(), visible=False)
+    plt.setp(ax_histy.get_yticklabels(), visible=False)
+
+    # Initialize standard deviation lists
+    std_dev_y = []
+    std_dev_x = []
+
+    markers = ['*', 'D', 's', '.', 'v', 'o', 'P', 'X']  # Different markers
+    line_styles = ['--', '-', '-.', ':']  # Different line styles
+
+    for i in range(n_datasets):
+        all_x_coords = []
+        all_y_coords = []
+
+        # Collect all coordinates from all feature indices for the current dataset
+        for feature_index in range(centers_data.shape[3]):
+            y_coords = centers_data[i, :, :, feature_index, 0].flatten()
+            x_coords = centers_data[i, :, :, feature_index, 1].flatten()
+            y_mean, x_mean = np.mean(y_coords), np.mean(x_coords)
+
+            all_y_coords.extend(y_coords - y_mean)
+            all_x_coords.extend(x_coords - x_mean)
+
+            # Scatter plot for each feature of the dataset with different markers
+            if feature_index == 1:
+                transparency /= 3
+            ax_scatter.scatter(x_coords - x_mean, y_coords - y_mean, color=colors[i], alpha=transparency,
+                               marker=markers[i % len(markers)])
+
+        # Calculate and store standard deviations
+        std_dev_y.append(np.std(all_y_coords))
+        std_dev_x.append(np.std(all_x_coords))
+
+        # Combine all x and y coordinates
+        combined_coords = np.column_stack((all_x_coords, all_y_coords))
+
+        # Draw convex hull for the combined coordinates of the dataset with different line styles
+        if drawConvexHull and len(combined_coords) > 2:
+            hull = ConvexHull(combined_coords)
+            for simplex in hull.simplices:
+                ax_scatter.plot(combined_coords[simplex, 0], combined_coords[simplex, 1], color=colors[i],
+                                linewidth=2, linestyle=line_styles[i % len(line_styles)])
+
+        # Add label for the dataset
+        if labels is not None:
+            ax_scatter.plot([], [], color=colors[i], label=labels[i], linestyle='None',
+                            marker=markers[i % len(markers)], markerfacecolor=colors[i])
+        else:
+            ax_scatter.plot([], [], color=colors[i], label=f'Dataset {i+1}', linestyle='None',
+                            marker=markers[i % len(markers)], markerfacecolor=colors[i],)
+
+        # Plot histograms
+        ax_histx.hist(all_x_coords, bins=bins, color=colors[i], alpha=alpha,
+                      density=density, label=rf'$\sigma$ = {std_dev_x[-1]:.2f}')
+        ax_histy.hist(all_y_coords, bins=bins, color=colors[i], alpha=alpha, orientation='horizontal',
+                      density=density, label=rf'$\sigma$ = {std_dev_y[-1]:.2f}')
+
+        print(rf'$\sigma$ = {std_dev_x[-1]:.2f}')
+        print(rf'$\sigma$ = {std_dev_y[-1]:.2f}')
+
+    # Set labels and title for the scatter plot
+    ax_scatter.set_xlabel(r'$k_x$ Displacement (px.)', fontsize=label_size)
+    ax_scatter.set_ylabel(r'$k_y$ Displacement (px.)', fontsize=label_size)
+    # ax_scatter.set_title('Centers of Mass with Histograms', fontsize=label_size)
+    # ax_scatter.legend(fontsize=label_size)
+    
+    ax_scatter.set_xlim(x_range)
+    ax_scatter.set_ylim(y_range)
+    ax_scatter.set_xticks(np.linspace(-.8,.8,9))
+    ax_scatter.set_yticks(np.linspace(-.8,.8,9))
+
+    
+    ax_scatter.tick_params(axis='both', which='major', labelsize=tick_label_size)
+    ax_histx.tick_params(axis='both', which='major', labelsize=tick_label_size)
+    ax_histy.tick_params(axis='both', which='major', labelsize=tick_label_size)
+    ax_histx.set_title('Center of Mass Precision', fontsize=25, pad=30)
+
+    # Set the tick labels for the histograms
+    ax_histx.set_yticks([0, 1, 2, 3])
+    ax_histy.set_xticks([0, 1, 2, 3])
+    
+    # ax_histx.set_title('Probability\n Density', fontsize=hist_title_size, rotation=270,pad=50)
+    ax_histy.set_title('Noisy Dataset\n \n Denoised Dataset', fontsize=hist_title_size,pad=50)
+    
+    plt.show()
+
+# Function specific to simple monolayer data
+def getStrains(spots_order, centers_data, ref_centers=None, ang=49, gs=1, plot=True, order=False):
+    """
+    spots_order = 1,2,3
+    """
+
+    if order:
+        diff_pos = centers_data
+    else:
+        diff_pos = centers_data[spots_order-1]
+
+    if ref_centers is None:
+        mean_pos = (np.mean(np.mean(diff_pos[40:60, 25:65], axis=0), axis=0)
+                    + np.mean(np.mean(diff_pos[40:60, 95:115], axis=0), axis=0)
+                    + np.mean(np.mean(diff_pos[40:60, 157:175], axis=0), axis=0)
+                    + np.mean(np.mean(diff_pos[40:60, 210:230], axis=0), axis=0))/4
+    else:
+        mean_pos = ref_centers
+
+    """ g vectors """
+    g1 = diff_pos[:, :, gs-1, :] - diff_pos[:, :, gs+2, :]
+    g2 = (diff_pos[:, :, gs, :] + diff_pos[:, :, gs+1, :]) / 2 - \
+        (diff_pos[:, :, (gs+3) % 6, :] + diff_pos[:, :, (gs+4) % 6, :]) / 2
+
+    print("g1: ", np.mean(g1, axis=(0, 1)))
+    print("g2: ", np.mean(g2, axis=(0, 1)))
+
+    """ Reference g's """
+    ref_g1 = mean_pos[gs-1] - mean_pos[gs+2]
+    ref_g2 = (mean_pos[gs] + mean_pos[gs+1]) / 2 - \
+        (mean_pos[(gs+3) % 6] + mean_pos[(gs+4) % 6]) / 2
+
+    """ G array """
+    G_ref = np.array([[ref_g2[0], ref_g1[0]],
+                      [ref_g2[1], ref_g1[1]]])
+
+    """ R matrices """
+    ang = np.radians(ang)
+    R1 = np.array([[np.cos(ang), np.sin(ang)],
+                  [-np.sin(ang), np.cos(ang)]])
+
+    """ Strain arrays """
+    ydim = centers_data.shape[0]
+    xdim = centers_data.shape[1]
+
+    exx1 = np.zeros((ydim, xdim))
+    eyy1 = np.zeros((ydim, xdim))
+    exy1 = np.zeros((ydim, xdim))
+    theta1 = np.zeros((ydim, xdim))
+
+    """ Calculations """
+    for i in range(ydim):
+        for j in range(xdim):
+            G1 = np.array([[g2[i][j][0], g1[i][j][0]],
+                          [g2[i][j][1], g1[i][j][1]]])
+            T = R1@G1@np.linalg.inv(G_ref)@np.linalg.inv(R1)
+
+            R, U = polar(T)
+
+            # Uniaxial
+            eyy1[i][j] = 1-U[0, 0]
+            exx1[i][j] = 1-U[1, 1]
+
+            # Shear
+            exy1[i][j] = U[1, 0]
+
+            # Rotation
+            theta1[i][j] = np.arccos(R[0, 1])
+
+    if plot:
+        # Plot uncorrected strain
+        plotStrain(exx1, 0.06)
+        plotStrain(eyy1, 0.03)
+        plotStrain(exy1, 0.06)
+        plotRot(theta1)
+
+    return exx1, eyy1, exy1, theta1
+
+
+def plotStrain(strain_data, title='Strain', axis='on', lim_val=0.05):
+    """ Strain/Rotation map plotting """
+
+    plt.figure(figsize=(4.5, 10))
+
+    im1 = plt.imshow(strain_data, vmin=-lim_val, vmax=lim_val, cmap='RdBu')
+
+    # plt.xticks(np.arange(0, 255, 10))
+    # plt.yticks(np.arange(0, 110, 10))
+    # plt.yticks(np.arange(0, 60, step=10), size = 20)
+    plt.axis(axis)
+    plt.title(title)
+    # plt.grid()
+    ax = plt.gca()
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.05)
+
+    cb = plt.colorbar(im1, cax=cax)
+    cb.ax.tick_params(labelsize=10)
+
+    plt.show()
+
+def plotHist_andClusters(data, clusters, cluster_indices, bins=100, xrange=None, yrange=None, 
+                         axis_title_size=18, tick_label_size=14, color='blue', outline_color='red'):
+    """
+    Plot a histogram from "data" and outline histograms for specified clusters.
+
+    :param data: Data to be plotted.
+    :param clusters: Array of integers indicating cluster membership for each data point.
+    :param cluster_indices: List of cluster indices for which to plot histogram outlines.
+    :param bins: Number of bins in the histogram.
+    :param xrange: Tuple specifying the (min, max) range of the x-axis.
+    :param color: Color of the main histogram.
+    :param outline_color: Color of the outlines for specified clusters.
+    """
+
+    # Flatten data
+    flattened_data = data.flatten()
+
+    plt.figure(figsize=(6.5, 5))
+
+    # Plot the main histogram
+    counts, bin_edges, _ = plt.hist(
+        flattened_data, bins=bins, range=xrange, color=color, alpha=0.5, label='All Data')
+
+    # Calculate bin centers from edges
+    bin_centers = 0.5 * (bin_edges[1:] + bin_edges[:-1])
+
+    for index in cluster_indices:
+        # Extract data for the current cluster
+        cluster_data = flattened_data[clusters.flatten() == index]
+
+        # Calculate histogram for the current cluster
+        cluster_counts, _ = np.histogram(cluster_data, bins=bin_edges)
+
+        # Plot histogram outline for the current cluster with the user-specified outline color
+        plt.plot(bin_centers, cluster_counts,
+                 label=f'Cluster {index}', color=outline_color, drawstyle='steps-mid')
+    
+    # Set the x-axis and y-axis range if specified
+    if xrange:
+        plt.xlim(xrange)
+    if yrange:
+        plt.ylim(yrange)
+    
+    for tick in plt.gca().get_xticks():
+        plt.axvline(x=tick, color='gray', linestyle='--', linewidth=0.5)
+    
+    # Set tick label sizes
+    plt.xticks(fontsize=tick_label_size)
+    plt.yticks(fontsize=tick_label_size)
+    
+    plt.xlabel('Strain (%)', fontsize=axis_title_size)
+    plt.ylabel('Frequency', fontsize=axis_title_size)
+    # plt.legend()
+    plt.show()
+
+def apply_majority_filter(cluster_map, kernel_size=3, iterations=1):
+    """
+    Apply a majority filter to a 2D cluster map.
+
+    cluster_map: A 2D numpy array with cluster indices.
+    kernel_size: The length of the square kernel (must be an odd number).
+
+    Returns a 2D numpy array after applying the majority filter.
+    """
+
+    if kernel_size % 2 == 0:
+        raise ValueError("Kernel size must be an odd number.")
+
+    def majority_filter(pixel_values):
+        # Return the mode (most common element) of the array.
+        return mode(pixel_values, axis=None)[0][0]
+
+    # Generate a footprint for the filter (square kernel)
+    footprint = np.ones((kernel_size, kernel_size))
+
+    # Apply generic filter with the custom majority function
+    filtered_map = ndimage.generic_filter(
+        cluster_map, majority_filter, footprint=footprint, mode='constant', cval=0)
+
+    # Filter more times if user specified this
+    if iterations > 1:
+        for i in range(iterations-1):
+            filtered_map = ndimage.generic_filter(
+                filtered_map, majority_filter, footprint=footprint, mode='constant', cval=0)
+
+    return filtered_map
+
+#%% Denoising Functions and Classes
 
 class DenoisingMethods:
     
@@ -254,7 +895,7 @@ class DenoisingMethods:
     # Spatial Filters
     # =============================================================================
 
-    def gaussian(self, target_data, kernel_size=(5, 5), sigma=1):
+    def gaussian(self, target_data, kernel_size=3, sigma=1):
         """Apply a Gaussian filter to 2D data.
     
         The Gaussian filter reduces noise by averaging the pixel values within a Gaussian kernel,
@@ -265,7 +906,6 @@ class DenoisingMethods:
         target_data : ndarray
             The 2D data to be denoised.
         kernel_size : tuple of int, optional
-            The size of the Gaussian kernel (default is (5, 5)).
         sigma : float, optional
             The standard deviation of the Gaussian distribution (default is 1).
     
@@ -280,7 +920,7 @@ class DenoisingMethods:
         Adjust the kernel size and sigma to control the degree of smoothing.
         """
         
-        return cv2.GaussianBlur(target_data, kernel_size, sigma)
+        return cv2.GaussianBlur(target_data, (kernel_size,kernel_size), sigma)
     
     
     # Tested successfully
@@ -324,15 +964,17 @@ class DenoisingMethods:
         d : int, optional
             Diameter of each pixel neighborhood used during filtering (default is 9).
         sigma_color : float, optional
-            Filter sigma in the color space (default is 75).
+            Filter sigma in the color space (default is 75). 
         sigma_space : float, optional
-            Filter sigma in the coordinate space (default is 75).
+            Filter sigma in the coordinate space (default is 75). As this parameter gets larger, the
+            filter behaves like a regular Gaussian filter.
     
         Returns
         -------
         denoised_data : ndarray
             The denoised 2D data.
         """
+
         return cv2.bilateralFilter(np.float32(target_data), d, sigma_color, sigma_space)
     
     
@@ -402,7 +1044,7 @@ class DenoisingMethods:
             # Update the image
             modified_data += gamma * divergence
     
-        return rem_negs(modified_data)
+        return clip_values(modified_data)
 
     
     # Tested successfully on (4/30/2024) for real-space denoising
@@ -422,14 +1064,10 @@ class DenoisingMethods:
         max_num_iter int, optional
         Maximal number of iterations used for the optimization.
         """
-        
+
         return denoise_tv_chambolle(target_data, weight=weight, eps=eps, max_num_iter=max_num_iter)
     
-# =============================================================================
-# 
-# =============================================================================
-
-    #
+    # @jit(nopython=True, parallel=True) #new
     def adaptive_median_filter(self, target_data, s=3, sMax=7):
         """
         Apply an adaptive median filter to reduce noise while preserving edges.
@@ -457,42 +1095,17 @@ class DenoisingMethods:
         if target_data.ndim != 2:
             raise ValueError("Single channel target_data only")
         
-        padded_target_data = self._pad_image(target_data, sMax//2)
+        padded_target_data = np.pad(target_data, sMax//2, mode='constant', constant_values=np.min(target_data))
         H, W = target_data.shape
         filtered_target_data = np.zeros_like(target_data)
-
+        
+        # for i in tqdm(range(H), desc = 'Applying adaptive median filter'):
         for i in range(H):
             for j in range(W):
                 value = self._process_pixel(padded_target_data, i + sMax//2, j + sMax//2, s, sMax)
                 filtered_target_data[i, j] = value
 
         return filtered_target_data
-    
-    # Private method (helper function) for the adaptive median filter
-    def _pad_image(self, image, pad_width):
-        """
-        Pads the image with the minimum value to handle edge cases.
-
-        Parameters
-        ----------
-        image : numpy.ndarray
-            The image to pad.
-        pad_width : int
-            The amount of padding to apply to each border.
-
-        Returns
-        -------
-        padded_image : numpy.ndarray
-            The padded image.
-
-        Notes
-        -----
-        This method uses constant mode padding with the image's minimum as the pad value.
-        """
-        
-        padded_image = np.pad(image, pad_width, mode='constant', constant_values=np.min(image))
-        
-        return padded_image
 
     # Private method (helper function for adaptive median filter)
     def _process_pixel(self, padded_target_data, y, x, s, sMax):
@@ -576,137 +1189,1521 @@ class DenoisingMethods:
         
         
         
-    #     return rem_negs(filtered_data)    
+    #     return clip_values(filtered_data)    
     
-    # # =============================================================================
-    # # Tensor Decomposition and Factorization
-    # # =============================================================================
-    
-    # #
-    # def pca_sk(self, other):
-        
-        
-        
-    #     return rem_negs(filtered_data)
+    # =============================================================================
+    # Unsupervised Learning
+    # =============================================================================
     
     # #
-    # def kernelPCA_sk(self, other):
+    # def PCA(self, other):
         
         
         
-    #     return rem_negs(filtered_data)
+    #     return clip_values(filtered_data)
     
     # #
-    # def fastICA_sk(self, other):
+    # def kernelPCA(self, other):
         
         
         
-    #     return rem_negs(filtered_data)
+    #     return clip_values(filtered_data)
     
     # #
-    # def nmf_sk(self, other):
+    # def fastICA(self, other):
         
         
         
-    #     return rem_negs(filtered_data)
+    #     return clip_values(filtered_data)
     
-    # #
-    # def tucker_TL(self, other):
-    #     """
-    #     Tucker Decomposition based on TensorLy implementation.
-    #     [link].
+    def nmf(self, X, n_components=None, init='random', update_H=True, solver='cd', 
+            beta_loss='frobenius', tol=0.0001, max_iter=200, alpha_W=0.0, alpha_H='same', 
+            l1_ratio=0.0, random_state=None, verbose=0, shuffle=False, return_decomposition=False,
+            plot_eigenvalues=False, unfold_domain=None):
+        """
+        Non-negative Matrix Factorization (NMF) using scikit-learn's `non_negative_factorization`.
         
-    #     """        
+        Computes a decomposition of matrix X into two non-negative matrices W and H such that:
+        X ≈ W @ H
         
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            The input data matrix to decompose.
         
-    #     return rem_negs(filtered_data)
+        n_components : int, optional, default=None
+            Number of components to use for the factorization. If not set, all features are kept.
+        
+        init : {'random', 'nndsvd', 'nndsvda', 'nndsvdar', 'custom'}, optional, default='random'
+            Initialization method to use:
+            - 'random': non-negative random matrices
+            - 'nndsvd': Nonnegative Double Singular Value Decomposition
+            - 'nndsvda': NNDSVD with zeros filled with the average of X
+            - 'nndsvdar': NNDSVD with zeros filled with small random values
+            - 'custom': Custom matrices W and H must be provided if update_H is True
+            
+        update_H : bool, default=True
+            Whether to update the matrix H in the factorization. If False, H is fixed.
+        
+        solver : {'cd', 'mu'}, default='cd'
+            The numerical solver to use:
+            - 'cd': Coordinate Descent
+            - 'mu': Multiplicative Update
+        
+        beta_loss : float or {'frobenius', 'kullback-leibler', 'itakura-saito'}, default='frobenius'
+            Beta divergence to be minimized, measuring the distance between X and the dot product WH.
+        
+        tol : float, default=0.0001
+            Tolerance of the stopping condition.
+        
+        max_iter : int, default=200
+            Maximum number of iterations to run the algorithm.
+        
+        alpha_W : float, default=0.0
+            Regularization parameter for W. Set to 0 for no regularization.
+        
+        alpha_H : float or "same", default="same"
+            Regularization parameter for H. Set to 0 for no regularization. If "same", it takes the same value as alpha_W.
+        
+        l1_ratio : float, default=0.0
+            The regularization mixing parameter, with 0 <= l1_ratio <= 1. Determines the balance between L1 and L2 penalties.
+        
+        random_state : int, RandomState instance or None, default=None
+            Used for NMF initialization and in the Coordinate Descent solver. Pass an int for reproducible results.
+        
+        verbose : int, default=0
+            The verbosity level.
+        
+        shuffle : bool, default=False
+            If True, randomize the order of coordinates in the Coordinate Descent solver.
     
-    # #
-    # def tucker_zhang(self, other):
-    #     """
-    #     Tucker Decomposition based on implementation by Zhang et al. (2020).
-    #     See reference:
-    #         Zhang, C., Han, R., Zhang, A. R., & Voyles, P. M. (2020). 
-    #         "Denoising atomic resolution 4D scanning transmission electron 
-    #         microscopy data with tensor singular value decomposition." 
-    #         Ultramicroscopy, 219, 113123.
-        
-    #     """
-        
-    #     # Initial parameters Tucker decomposition in ref.: 7 for real space and 30 for unwrapped k
-        
-    #     return rem_negs(filtered_data)
+        return_decomposition : bool, default=False
+            If True, return the decomposition W and H.
     
+        plot_scree : bool, default=False
+            If True, plot a scree plot showing the variance explained by each component.
+        
+        Returns
+        -------
+        W : ndarray of shape (n_samples, n_components)
+            The resulting matrix of the factorization.
+        
+        H : ndarray of shape (n_components, n_features)
+            The resulting matrix of the factorization.
+        
+        n_iter : int
+            The number of iterations run.
     
-    # #
-    # def cp_TL(self, other):
-    #     """
-    #     CANDECOMP-PARAFAC Decomposition based on TensorLy implementation.
-    #     [link]
-    #     """
+        reconstruction : ndarray of shape (n_samples, n_features)
+            The reconstructed matrix X from W and H, returned if return_reconstruction is True.
+        """
+        from sklearn.decomposition import non_negative_factorization
+        import numpy as np
+    
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            original_shape = X.shape
+            X = unfold_tensor(X, unfold_domain)
+    
+        # Perform NMF
+        W, H, n_iter = non_negative_factorization(X, n_components=n_components, init=init,
+                                                  update_H=update_H, solver=solver,
+                                                  beta_loss=beta_loss, tol=tol, max_iter=max_iter,
+                                                  alpha_W=alpha_W, alpha_H=alpha_H, l1_ratio=l1_ratio,
+                                                  random_state=random_state, verbose=verbose, shuffle=shuffle)
         
+        # Calculate the sum of squared elements in each component (row of H)
+        component_significance = np.sum(H ** 2, axis=1)
         
-    #     return rem_negs(filtered_data)
+        # Sort components by significance
+        sorted_indices = np.argsort(-component_significance)
+        H = H[sorted_indices]
+        W = W[:, sorted_indices]
+        component_significance = component_significance[sorted_indices]
+        
+        # Plotting option for log10 of eigenvalues vs. number of components
+        if plot_eigenvalues:
+            plt.figure(figsize=(8, 5))
+            plt.plot(np.arange(1, len(component_significance) + 1), np.log10(component_significance), 'o-')
+            plt.title('Log10 of Eigenvalues vs. Number of Components')
+            plt.xlabel('Component Number')
+            plt.ylabel('Log10(Eigenvalue)')
+            plt.grid()
+            plt.show()
+        
+        # Reconstruct decomposition
+        reconstruction = W @ H
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:               
+            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+        if return_decomposition:
+            return [reconstruction, [W, H, n_iter]]
 
-    # #
-    # def tensor_train_TL(self, other):
-    #     """
-    #     Tensor Train Decomposition based on TensorLy implementation.
-    #     [link]
-    #     """
-        
-        
-    #     return rem_negs(filtered_data)
-        
-    # #
-    # def parafac2_TL(self, other):
-    #     """
-    #     PARAFAC-2 Decomposition based on TensorLy implementation.
-    #     [link]
-    #     """
-        
-        
-    #     return rem_negs(filtered_data)
+        else:
+            return reconstruction
+
     
-    # #
-    # def partialTucker_TL(self, other):
-    #     """
-    #     Partial Tucker Decomposition based on TensorLy implementation.
-    #     [link]
-    #     """
+    # Good results with 'reciprocal' unfolding and rank=50
+    def parafac(self, tensor, rank, n_iter_max=100, init='svd', svd='truncated_svd', 
+                normalize_factors=False, orthogonalise=False, tol=1e-08, random_state=None, 
+                verbose=0, return_errors=False, sparsity=None, l2_reg=0, mask=None, 
+                cvg_criterion='abs_rec_error', fixed_modes=None, svd_mask_repeats=5, 
+                linesearch=False, callback=None, implementation='tensorly', 
+                return_decomposition=False, unfold_domain=None):
         
+        """CANDECOMP/PARAFAC decomposition via alternating least squares (ALS)
         
-    #     return rem_negs(filtered_data)
+        Computes a rank-rank decomposition of tensor such that:
+        
+        tensor = [|weights; factors[0], ..., factors[-1] |]
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : int
+            Number of components.
+        
+        n_iter_max : int, optional, default is 100
+            Maximum number of iterations.
+        
+        init : {'svd', 'random', CPTensor}, optional, default is 'svd'
+            Type of factor matrix initialization. If a CPTensor is passed, this 
+            is directly used for initialization.
+        
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+        
+        normalize_factors : bool, optional, default is False
+            If True, aggregate the weights of each factor in a 1D-tensor of shape 
+            (rank, ), which will contain the norms of the factors.
+        
+        orthogonalise : bool, optional, default is False
+            If True, enforce orthogonality on the factors.
+        
+        tol : float, optional, default is 1e-08
+            Relative reconstruction error tolerance. The algorithm is considered 
+            to have found the global minimum when the reconstruction error is less than tol.
+        
+        random_state : {None, int, np.random.RandomState}, optional
+            Random seed or state to initialize the random number generator.
+        
+        verbose : int, optional, default is 0
+            Level of verbosity.
+        
+        return_errors : bool, optional, default is False
+            Activate return of iteration errors.
+        
+        sparsity : float or int, optional, default is None
+            If sparsity is not None, we approximate tensor as a sum of low_rank_component 
+            and sparse_component, where low_rank_component = cp_to_tensor((weights, factors)). 
+            sparsity denotes desired fraction or number of non-zero elements in 
+            the sparse_component of the tensor.
+        
+        l2_reg : float, optional, default is 0
+            L2 regularization parameter.
+        
+        mask : ndarray, optional
+            Array of booleans with the same shape as tensor. Should be 0 where 
+            the values are missing and 1 everywhere else.
+        
+        cvg_criterion : {'abs_rec_error', 'rec_error'}, optional, default is 'abs_rec_error'
+            Stopping criterion for ALS, works if tol is not None. If 'rec_error', 
+            ALS stops at current iteration if (previous rec_error - current rec_error) < tol. 
+            If 'abs_rec_error', ALS terminates when |previous rec_error - current rec_error| < tol.
+        
+        fixed_modes : list, optional, default is None
+            A list of modes for which the initial value is not modified. 
+            The last mode cannot be fixed due to error computation.
+        
+        svd_mask_repeats : int, optional, default is 5
+            If using a tensor with masked values, this initializes using SVD 
+            multiple times to remove the effect of these missing values on the initialization.
+        
+        linesearch : bool, optional, default is False
+            Whether to perform line search as proposed by Bro.
+        
+        callback : callable, optional
+            Function to call at the end of each iteration.
+        
+        implementation : str, optional, default is 'tensorly'
+            Implementation to use for the decomposition.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor 
+                                        and computation time).
+        
+        Returns
+        -------
+        CPTensor(weight, factors) : tuple
+            weights : 1D array of shape (rank, )
+                All ones if normalize_factors is False (default).
+                Weights of the (normalized) factors otherwise.
+            factors : list of ndarray
+                List of factors of the CP decomposition. Element i is of shape 
+                (tensor.shape[i], rank).
+            sparse_component : nD array of shape tensor.shape
+                Returns only if sparsity is not None.
+        
+        errors : list
+            A list of reconstruction errors at each iteration of the algorithms 
+            (if return_errors is True).
+        
+        Notes
+        -----
+        CANDECOMP/PARAFAC decomposition via alternating least squares (ALS).
+        """
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            original_shape = tensor.shape
+            tensor = unfold_tensor(tensor, unfold_domain)
+        
+        # Conditional implementation
+        if implementation == 'tensorly':
+            # CANDECOMP/PARAFAC decomposition via ALS
+            result = par(tensor, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, normalize_factors=normalize_factors,
+                                                    orthogonalise=orthogonalise, tol=tol, random_state=random_state, verbose=verbose, return_errors=return_errors,
+                                                    sparsity=sparsity, l2_reg=l2_reg, mask=mask, cvg_criterion=cvg_criterion, fixed_modes=fixed_modes,
+                                                    svd_mask_repeats=svd_mask_repeats, linesearch=linesearch, callback=callback)
+            if return_errors:
+                factors, weights, errors = result
+            else:
+                factors, weights = result
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
+        
+        # Reconstruct the tensor from CP factors
+        reconstruction = tl.cp_to_tensor((factors, weights))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+        if return_decomposition:
+            results = [weights, factors, reconstruction]
+            if return_errors:
+                results.append(errors)
+            if sparsity is not None:
+                sparse_component = result[2] if return_errors else result[1]
+                results.append(sparse_component)
+            return results
+        else:
+            return reconstruction
+
+    # Dataset must be 3D
+    def parafac2(self, target_data, rank=5, n_iter_max=100, n_iter_parafac=5, 
+                 implementation='tensorly', return_decomposition=False, 
+                 unfold_domain=None, init='random', svd='truncated_svd', 
+                 normalize_factors=False, tol=1e-08, absolute_tol=1e-13, 
+                 nn_modes=None, random_state=None, verbose=False, return_errors=False,):
+        """
+        Apply PARAFAC2 decomposition to input tensor.
+        """
+        
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        #TODO consider that this will be in all decomposition functions, so probably add this to HyperData...
+        if unfold_domain is not None:
+        
+            original_shape = target_data.shape
+        
+            target_data = unfold_tensor(target_data, unfold_domain, )
+        
+        if implementation == 'tensorly':
+            
+            decomposition = par2(target_data, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, normalize_factors=normalize_factors, 
+                 tol=tol, absolute_tol=absolute_tol, nn_modes=nn_modes, random_state=random_state, verbose=verbose, return_errors=return_errors, n_iter_parafac=n_iter_parafac,)
+            
+            # reconstruction = clip_values(tl.parafac2_tensor.parafac2_to_tensor(decomposition))
+            reconstruction = tl.parafac2_tensor.parafac2_to_tensor(decomposition)
+            
+            
+            if unfold_domain is not None:
+                
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, 
+                                               undo=True, original_shape=original_shape, )
+            
+            if return_decomposition:
+                results = []
+                results.extend((decomposition, HyperData(reconstruction)))
+                return results
+                
+            else:
+                return reconstruction
     
+    # Testing...
+    def randomised_parafac(self, tensor, rank, n_samples, n_iter_max=100, init='random', 
+                           svd='truncated_svd', tol=1e-08, max_stagnation=20, 
+                           return_errors=False, random_state=None, verbose=0, 
+                           callback=None, implementation='tensorly', 
+                           return_decomposition=False, unfold_domain=None):
+        """Randomised CP decomposition via sampled ALS
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : int
+            Number of components.
+        
+        n_samples : int
+            Number of samples per ALS step.
+        
+        n_iter_max : int, optional, default is 100
+            Maximum number of iterations.
+        
+        init : {'svd', 'random'}, optional, default is 'random'
+            Method to initialize the decomposition.
+        
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+        
+        tol : float, optional, default is 1e-08
+            Tolerance: the algorithm stops when the variation in the reconstruction error is less than the tolerance.
+        
+        max_stagnation : int, optional, default is 20
+            Maximum allowed number of iterations with no decrease in fit.
+        
+        random_state : {None, int, np.random.RandomState}, optional, default is None
+            Random seed or state to initialize the random number generator.
+        
+        return_errors : bool, optional, default is False
+            If True, return a list of all errors.
+        
+        verbose : int, optional, default is 0
+            Level of verbosity.
+        
+        callback : callable, optional
+            Function to call at the end of each iteration.
+        
+        implementation : str, optional, default is 'tensorly'
+            Implementation to use for the decomposition.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+        
+        Returns
+        -------
+        factors : ndarray list
+            List of positive factors of the CP decomposition. Element i is of shape (tensor.shape[i], rank).
+        
+        Notes
+        -----
+        Randomised CP decomposition via sampled ALS.
+        """
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            original_shape = tensor.shape
+            tensor = unfold_tensor(tensor, unfold_domain)
+        
+        # Conditional implementation
+        if implementation == 'tensorly':
+            # Randomised CP decomposition
+            factors, weights = rand_parafac(tensor, rank=rank, n_samples=n_samples, 
+                                           n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
+                                           max_stagnation=max_stagnation, return_errors=return_errors, 
+                                           random_state=random_state, verbose=verbose, callback=callback)
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
+        
+        # Reconstruct the tensor from CP factors
+        reconstruction = tl.cp_to_tensor((factors, weights))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, 
+                                           original_shape=original_shape)
+        
+        if return_decomposition:
+            results = [factors, weights, reconstruction]
+            if return_errors:
+                results.append(errors)
+            return results
+        else:
+            return reconstruction     
+
+
+    def parafac_power_iteration(self, tensor, rank, n_repeat=10, n_iteration=10, 
+                                verbose=0, implementation='tensorly', 
+                                return_decomposition=False, unfold_domain=None):
+        """CP Decomposition via Robust Tensor Power Iteration
+        
+        Parameters
+        ----------
+        tensor : tl.tensor
+            Input tensor to decompose.
+        
+        rank : int
+            Rank of the decomposition (number of rank-1 components).
+        
+        n_repeat : int, optional, default is 10
+            Number of initializations to be tried.
+        
+        n_iteration : int, optional, default is 10
+            Number of power iterations.
+        
+        verbose : bool, optional, default is 0
+            Level of verbosity.
+        
+        implementation : str, optional, default is 'tensorly'
+            Implementation to use for the decomposition.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor 
+                                        and computation time).
+        
+        Returns
+        -------
+        weights : 1D tl.tensor of length rank
+            Contains the eigenvalue of each eigenvector.
+        
+        factors : list of 2-D tl.tensor of shape (size, rank)
+            Each column of each factor corresponds to one eigenvector.
+        
+        Notes
+        -----
+        CP Decomposition via Robust Tensor Power Iteration.
+        """
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            original_shape = tensor.shape
+            tensor = unfold_tensor(tensor, unfold_domain)
+        
+        # Conditional implementation
+        if implementation == 'tensorly':
+            # CP Decomposition via Robust Tensor Power Iteration
+            factors, weights = parafac_power_iter(tensor, rank=rank, n_repeat=n_repeat, n_iteration=n_iteration, verbose=verbose)
+            
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
+        
+        # Reconstruct the tensor from CP factors
+        reconstruction = tl.cp_to_tensor((factors, weights))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+        if return_decomposition:
+            return weights, factors, reconstruction
+        else:
+            return reconstruction
+
+
+    def symmetric_parafac_power_iteration(self, tensor, rank, n_repeat=10, 
+                                          n_iteration=10, verbose=False, 
+                                          implementation='tensorly', 
+                                          return_decomposition=False, unfold_domain=None):
+        """Symmetric CP Decomposition via Robust Symmetric Tensor Power Iteration
+        
+        Parameters
+        ----------
+        tensor : tl.tensor
+            Input tensor to decompose, must be symmetric of shape (size, )*order.
+        
+        rank : int
+            Rank of the decomposition (number of rank-1 components).
+        
+        n_repeat : int, optional, default is 10
+            Number of initializations to be tried.
+        
+        n_iteration : int, optional, default is 10
+            Number of power iterations.
+        
+        verbose : bool, optional, default is False
+            Level of verbosity.
+        
+        implementation : str, optional, default is 'tensorly'
+            Implementation to use for the decomposition.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+        
+        Returns
+        -------
+        weights : 1D tl.tensor of length rank
+            Contains the eigenvalue of each eigenvector.
+        
+        factor : 2-D tl.tensor of shape (size, rank)
+            Each column corresponds to one eigenvector.
+        
+        Notes
+        -----
+        Symmetric CP Decomposition via Robust Symmetric Tensor Power Iteration.
+        """
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            original_shape = tensor.shape
+            tensor = unfold_tensor(tensor, unfold_domain)
+        
+        # Conditional implementation
+        if implementation == 'tensorly':
+            # Symmetric CP Decomposition via Robust Symmetric Tensor Power Iteration
+            factors, weights = sym_parafac_power_iter(tensor, rank=rank, n_repeat=n_repeat,
+                                                     n_iteration=n_iteration, verbose=verbose)
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
+        
+        # Reconstruct the tensor from CP factors
+        reconstruction = tl.cp_to_tensor((factors, weights))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+        if return_decomposition:
+            return weights, factor, reconstruction
+        else:
+            return reconstruction
+
+
+
+    def non_negative_parafac_hals(self, tensor, rank, n_iter_max=100, init='svd', 
+                    svd='truncated_svd', tol=1e-07, random_state=None, 
+                    sparsity_coefficients=None, fixed_modes=None, 
+                    nn_modes='all', exact=False, normalize_factors=False, 
+                    verbose=False, return_errors=False, cvg_criterion='abs_rec_error', 
+                    implementation='tensorly', return_decomposition=False, unfold_domain=None):
+        """Non-negative CP decomposition via HALS
+        
+        Uses Hierarchical ALS (Alternating Least Squares) which updates each factor 
+        column-wise (one column at a time while keeping all other columns fixed).
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : int
+            Number of components.
+        
+        n_iter_max : int, optional, default is 100
+            Maximum number of iterations.
+        
+        init : {'svd', 'random'}, optional, default is 'svd'
+            Method to initialize the decomposition.
+        
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+        
+        tol : float, optional, default is 1e-07
+            Tolerance: the algorithm stops when the variation in the reconstruction 
+            error is less than the tolerance.
+        
+        random_state : {None, int, np.random.RandomState}, optional, default is None
+            Random seed or state to initialize the random number generator.
+        
+        sparsity_coefficients : array of float, optional, default is None
+            The sparsity coefficients on each factor. If None, the algorithm is 
+            computed without sparsity.
+        
+        fixed_modes : array of integers, optional, default is None
+            Indices of modes that should not be updated.
+        
+        nn_modes : None, 'all' or array of integers, optional, default is 'all'
+            Specify which modes to impose non-negativity constraints on. If 'all', 
+            then non-negativity is imposed on all modes.
+        
+        exact : bool, optional, default is False
+            If True, the algorithm gives results with high precision but it needs 
+            high computational cost. If False, the algorithm gives an approximate solution.
+        
+        normalize_factors : bool, optional, default is False
+            If True, aggregate the weights of each factor in a 1D-tensor of shape 
+            (rank, ), which will contain the norms of the factors.
+        
+        verbose : bool, optional, default is False
+            Indicates whether the algorithm prints the successive reconstruction 
+            errors or not.
+        
+        return_errors : bool, optional, default is False
+            Indicates whether the algorithm should return all reconstruction 
+            errors and computation time of each iteration.
+        
+        cvg_criterion : {'abs_rec_error', 'rec_error'}, optional, default is 'abs_rec_error'
+            Stopping criterion for ALS, works if tol is not None. If 'rec_error', 
+            ALS stops at current iteration if (previous rec_error - current rec_error) < tol. 
+            If 'abs_rec_error', ALS terminates when |previous rec_error - current rec_error| < tol.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor 
+                                        and computation time).
+        
+        Returns
+        -------
+        factors : ndarray list
+            List of positive factors of the CP decomposition. Element i is of 
+            shape (tensor.shape[i], rank).
+        
+        errors : list
+            A list of reconstruction errors at each iteration of the algorithm 
+            (if return_errors is True).
+        
+        Notes
+        -----
+        Non-negative CP decomposition via HALS.
+        """
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            original_shape = tensor.shape
+            tensor = unfold_tensor(tensor, unfold_domain)
+        
+        # Conditional implementation
+        if implementation == 'tensorly':
+            # Non-negative CP decomposition via HALS
+            # TODO modify the error things
+            factors, weights = nn_parafac_hals(tensor, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
+                                              random_state=random_state, sparsity_coefficients=sparsity_coefficients,
+                                              fixed_modes=fixed_modes, nn_modes=nn_modes, exact=exact, normalize_factors=normalize_factors,
+                                              verbose=verbose, return_errors=return_errors, cvg_criterion=cvg_criterion)
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
+        
+        # Reconstruct the tensor from CP factors
+        reconstruction = tl.cp_to_tensor((factors, weights))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+        if return_decomposition:
+            results = [factors, reconstruction]
+            if return_errors:
+                results.append(errors)
+            return results
+        else:
+            return reconstruction
+
+    def non_negative_parafac(self, tensor, rank, n_iter_max=100, init='svd', 
+                             svd='truncated_svd', tol=1e-06, random_state=None,
+                             verbose=0, normalize_factors=False, return_errors=False, 
+                             mask=None, cvg_criterion='abs_rec_error', fixed_modes=None, 
+                             implementation='tensorly', return_decomposition=False, unfold_domain=None):
+        """Non-negative CP decomposition using multiplicative updates
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : int
+            Number of components.
+        
+        n_iter_max : int, optional, default is 100
+            Maximum number of iterations.
+        
+        init : {'svd', 'random'}, optional, default is 'svd'
+            Method to initialize the decomposition.
+        
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+        
+        tol : float, optional, default is 1e-06
+            Tolerance: the algorithm stops when the variation in the reconstruction error is less than the tolerance.
+        
+        random_state : {None, int, np.random.RandomState}, optional
+            Random seed or state to initialize the random number generator.
+        
+        verbose : int, optional, default is 0
+            Level of verbosity.
+        
+        normalize_factors : bool, optional, default is False
+            If True, aggregate the weights of each factor in a 1D-tensor of shape (rank, ), which will contain the norms of the factors.
+        
+        return_errors : bool, optional, default is False
+            Indicates whether to return all reconstruction errors and computation time of each iteration.
+        
+        mask : ndarray, optional
+            Array of booleans with the same shape as tensor. Should be 0 where the values are missing and 1 everywhere else.
+        
+        cvg_criterion : {'abs_rec_error', 'rec_error'}, optional, default is 'abs_rec_error'
+            Stopping criterion for ALS, works if tol is not None. If 'rec_error', ALS stops at current iteration if (previous rec_error - current rec_error) < tol. If 'abs_rec_error', ALS terminates when |previous rec_error - current rec_error| < tol.
+        
+        fixed_modes : list, optional, default is None
+            A list of modes for which the initial value is not modified. The last mode cannot be fixed due to error computation.
+        
+        implementation : str, optional, default is 'tensorly'
+            Implementation to use for the decomposition.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+        
+        Returns
+        -------
+        factors : ndarray list
+            List of positive factors of the CP decomposition. Element i is of shape (tensor.shape[i], rank).
+        
+        errors : list
+            A list of reconstruction errors at each iteration of the algorithm (if return_errors is True).
+        
+        Notes
+        -----
+        Non-negative CP decomposition using multiplicative updates.
+        """
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            original_shape = tensor.shape
+            tensor = unfold_tensor(tensor, unfold_domain)
+        
+        # Conditional implementation
+        if implementation == 'tensorly':
+            # Non-negative CP decomposition using multiplicative updates
+            factors , weights = nn_parafac(tensor, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
+                                         random_state=random_state, verbose=verbose, normalize_factors=normalize_factors,
+                                         return_errors=return_errors, mask=mask, cvg_criterion=cvg_criterion, fixed_modes=fixed_modes)
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
+        
+        # Reconstruct the tensor from CP factors
+        reconstruction = tl.cp_to_tensor((factors, weights))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+        if return_decomposition:
+            results = [factors, reconstruction]
+            if return_errors:
+                results.append(errors)
+            return results
+        else:
+            return reconstruction
+
+
+    def cp_constrained(self, target_data, rank=5, n_iter_max=100, n_iter_max_inner=10, 
+                       implementation='tensorly', return_decomposition=False, 
+                       unfold_domain=None,):
+        """
+        Apply constrained PARAFAC decomposition to input tensor.
+
+        Parameters
+        ----------
+        rank : int
+            Number of components for the decomposition.
+        return_decomposition : bool, optional
+            If True, return the decomposition weights and factors instead of the reconstructed tensor.
+        **kwargs
+            Additional arguments for the constrained_parafac function.
+
+        Returns
+        -------
+        results : list
+            List of either reconstructed tensors or decomposition results (weights and factors) for each 3D tensor.
+
+        Examples
+        --------
+        >>> my4Dobject = HyperData(data)
+        >>> reconstructed_data = my4Dobject.denoiser.apply_deonising(advanced_method='cp_constrained', unfold_domain='real', 
+                                                                     rank=3, n_iter_max=50, tol_outer=1e-6)
+        """
+        
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        #TODO consider that this will be in all decomposition functions, so probably add this to HyperData...
+        if unfold_domain is not None:
+        
+            original_shape = target_data.shape
+        
+            target_data = unfold_tensor(target_data, unfold_domain, )
+        
+        if implementation == 'tensorly':
+            
+            decomposition = constrained_parafac(target_data, rank=rank, 
+                                                n_iter_max=n_iter_max, n_iter_max_inner=n_iter_max_inner,)
+            
+            reconstruction = tl.cp_to_tensor(decomposition)
+            
+            if unfold_domain is not None:
+                
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, 
+                                               undo=True, original_shape=original_shape, )
+            
+            if return_decomposition:
+                results = []
+                results.extend((decomposition, HyperData(reconstruction)))
+                return results
+                
+            else:
+                return reconstruction
+
+          
+    
+    # def tensor_ring(self, input_tensor, rank, mode=0, svd='truncated_svd', implementation='tensorly', 
+    #                 return_decomposition=False, unfold_domain=None, verbose=False, ):
+    #     """
+    #     Tensor Ring decomposition via recursive SVD
+    
+    #     Decomposes input_tensor into a sequence of order-3 tensors (factors).
+    
+    #     Parameters
+    #     ----------
+    #     input_tensor : tensorly.tensor
+    #         The input tensor to decompose.
+        
+    #     rank : Union[int, List[int]]
+    #         Maximum allowable TR rank of the factors. If int, then this is the same for all the factors.
+    #         If list, then rank[k] is the rank of the kth factor.
+    
+    #     mode : int, optional, default is 0
+    #         Index of the first factor to compute.
+    
+    #     svd : str, optional, default is 'truncated_svd'
+    #         Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+    
+    #     verbose : boolean, optional
+    #         Level of verbosity.
+    
+    #     return_decomposition : boolean, optional
+    #         Whether to return the decomposition along with the reconstruction.
+    
+    #     unfold_domain : any, optional
+    #         Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+    
+    #     Returns
+    #     -------
+    #     factors : TR factors
+    #         Order-3 tensors of the TR decomposition.
+    
+    #     Examples
+    #     --------
+    #     Decompose a tensor into Tensor Ring factors
+    #     >>> tr_factors = tensor_ring(tensor, rank=5)
+    #     >>> tr_factors.shape
+    #     (5, 3, 3)
+    
+    #     Notes
+    #     -----
+    #     Tensor Ring decomposition decomposes the input tensor into a sequence of order-3 tensors
+    #     (factors) by recursively applying SVD.
+    #     """
+    #     # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+    #     if unfold_domain is not None:
+    #         original_shape = input_tensor.shape
+    #         input_tensor = unfold_tensor(input_tensor, unfold_domain)
+    
+    #     # Tensor Ring decomposition
+    #     factors = t_ring(input_tensor, rank=rank, mode=mode, svd=svd, verbose=verbose)
+    
+    #     # Reconstruct the tensor from TR factors
+    #     #TODO: how to get original back?
+    #     reconstruction = tl.tt_matrix.tt_matrix_to_tensor(factors)
+        
+    #     # Re-fold the tensor if it was unfolded
+    #     if unfold_domain is not None:
+    #         reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+    
+    #     if return_decomposition:
+    #         results = []
+    #         results.extend((factors, HyperData(reconstruction)))
+    #         return results
+    #     else:
+    #         return reconstruction
+        
+    def tensor_train_matrix(self, tensor, rank='same', svd='truncated_svd', implementation='tensorly',
+                            verbose=False, return_decomposition=False, unfold_domain=None):
+        """Decompose a tensor into a matrix in tt-format
+    
+        Decomposes the input tensor into a matrix in Tensor Train (TT) format.
+    
+        Parameters
+        ----------
+        tensor : tensorized matrix
+    
+        rank : 'same', float or int tuple, optional
+            If 'same', creates a decomposition with the same number of parameters as tensor.
+            If float, creates a decomposition with rank x the number of parameters of tensor.
+            Otherwise, the actual rank to be used, e.g., (1, rank_2, ..., 1) of size tensor.ndim//2.
+            Note that boundary conditions dictate that the first rank = last rank = 1.
+    
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+    
+        verbose : boolean, optional
+            Level of verbosity.
+    
+        return_decomposition : boolean, optional
+            Whether to return the decomposition along with the reconstruction.
+    
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+    
+        Returns
+        -------
+        reconstruction :
+        list containing 'reconstruction' and 'tt_matrix'
+    
+        Notes
+        -----
+        Tensor Train (TT) decomposition decomposes the input tensor into a sequence of matrices
+        in TT-format by recursively applying SVD.
+        """
+        
+        if implementation == 'tensorly':
+    
+            # Apply unfolding 
+            if unfold_domain is not None:
+                original_shape = tensor.shape
+                tensor = unfold_tensor(tensor, unfold_domain)
+        
+            # Tensor Train matrix decomposition
+            tt_matrix = tt_mat(tensor, rank=rank, svd=svd, verbose=verbose)
+        
+            # Reconstruct the matrix from TT decomposition
+            reconstruction = tl.tt_matrix_to_tensor(tt_matrix)
+            
+            # Re-fold the tensor if it was unfolded
+            if unfold_domain is not None:
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+            if return_decomposition:
+                results = []
+                results.extend((tt_matrix, HyperData(reconstruction)))
+                return results
+            else:
+                return reconstruction
+            
+
+    def tensor_train(self, input_tensor, rank, svd='truncated_svd', verbose=False, 
+                     return_decomposition=False, unfold_domain=None,
+                     implementation = 'tensorly',):
+        """TT decomposition via recursive SVD
+    
+        Decomposes input_tensor into a sequence of order-3 tensors (factors) – also known as Tensor-Train decomposition.
+    
+        Parameters
+        ----------
+        input_tensor : tensorly.tensor
+            The input tensor to decompose.
+        
+        rank : {int, int list}
+            Maximum allowable TT rank of the factors. If int, then this is the same for all the factors.
+            If int list, then rank[k] is the rank of the kth factor.
+    
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+    
+        verbose : boolean, optional
+            Level of verbosity.
+    
+        return_decomposition : boolean, optional
+            Whether to return the decomposition along with the reconstruction.
+    
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+    
+        Returns
+        -------
+        factors : TT factors
+            Order-3 tensors of the TT decomposition.
+    
+        Notes
+        -----
+        Tensor-Train (TT) decomposition decomposes the input tensor into a sequence of order-3 tensors
+        (factors) by recursively applying SVD.
+        """
+        
+        if implementation == 'tensorly':
+            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+            if unfold_domain is not None:
+                original_shape = input_tensor.shape
+                input_tensor = unfold_tensor(input_tensor, unfold_domain)
+        
+            # Tensor-Train decomposition
+            factors = tt(input_tensor, rank=rank, svd=svd, verbose=verbose)
+        
+            # Reconstruct the tensor from TT factors
+            reconstruction = tl.tt_matrix_to_tensor(factors)
+            
+            # Re-fold the tensor if it was unfolded
+            if unfold_domain is not None:
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+        
+            if return_decomposition:
+                results = []
+                results.extend((factors, HyperData(reconstruction)))
+                return results
+            else:
+                return reconstruction
+    
+    def non_negative_tucker_hals(self, tensor, rank, n_iter_max=100, init='svd', 
+                                 svd='truncated_svd', tol=1e-08, sparsity_coefficients=None, 
+                                 core_sparsity_coefficient=None, fixed_modes=None, 
+                                 random_state=None, verbose=False, normalize_factors=False, 
+                                 return_errors=False, exact=False, algorithm='fista', 
+                                 return_decomposition=False, unfold_domain=None,
+                                 implementation = 'tensorly',):
+        """Non-negative Tucker decomposition with HALS
+        
+        Uses HALS to update each factor column-wise and uses FISTA or active set algorithm to update the core.
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : None, int or int list
+            Size of the core tensor, (len(ranks) == tensor.ndim) if int, the same rank is used for all modes.
+        
+        n_iter_max : int, optional, default is 100
+            Maximum number of iterations.
+        
+        init : {'svd', 'random'}, optional, default is 'svd'
+            Method to initialize the decomposition.
+        
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+        
+        tol : float, optional, default is 1e-08
+            Tolerance: the algorithm stops when the variation in the reconstruction error is less than the tolerance.
+        
+        sparsity_coefficients : array of float, optional, default is None
+            The sparsity coefficients for each factor. If None, the algorithm is computed without sparsity.
+        
+        core_sparsity_coefficient : array of float, optional, default is None
+            Coefficient imposing sparsity on the core when updated with FISTA.
+        
+        fixed_modes : array of integers, optional, default is None
+            Indices of modes that should not be updated.
+        
+        random_state : any, optional
+            Random seed or state to initialize the random number generator.
+        
+        verbose : bool, optional, default is False
+            Level of verbosity.
+        
+        normalize_factors : bool, optional, default is False
+            If True, aggregates the norms of the factors in the core.
+        
+        return_errors : bool, optional, default is False
+            Indicates whether to return all reconstruction errors and computation time of each iteration.
+        
+        exact : bool, optional, default is False
+            If True, the HALS NNLS subroutines give results with high precision but with a higher computational cost.
+            If False, the algorithm gives an approximate solution.
+        
+        algorithm : {'fista', 'active_set'}, optional, default is 'fista'
+            Non-negative least square solution to update the core.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+        
+        Returns
+        -------
+        factors : ndarray list
+            List of positive factors of the Tucker decomposition.
+        
+        errors : list
+            List of reconstruction errors at each iteration of the algorithm (if return_errors is True).
+        
+        Notes
+        -----
+        Non-negative Tucker decomposition decomposes the input tensor into a core tensor and factor matrices,
+        ensuring all elements are non-negative.
+        """
+        
+        if implementation == 'tensorly':
+        
+            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+            if unfold_domain is not None:
+                original_shape = tensor.shape
+                tensor = unfold_tensor(tensor, unfold_domain)
+            
+            # Non-negative Tucker decomposition with HALS
+            factors, core, errors = nnth(tensor, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
+                                            sparsity_coefficients=sparsity_coefficients, core_sparsity_coefficient=core_sparsity_coefficient,
+                                            fixed_modes=fixed_modes, random_state=random_state, verbose=verbose,
+                                            normalize_factors=normalize_factors, return_errors=return_errors, exact=exact,
+                                            algorithm=algorithm)
+            
+            # Reconstruct the tensor from Tucker factors and core
+            reconstruction = tl.tucker_to_tensor((core, factors))
+            
+            # Re-fold the tensor if it was unfolded
+            if unfold_domain is not None:
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            
+            if return_decomposition:
+                results = [factors, core, reconstruction]
+                if return_errors:
+                    results.append(errors)
+                return results
+            else:
+                return reconstruction
+    
+    
+    def non_negative_tucker(self, tensor, rank, n_iter_max=10, init='svd', tol=0.0001, 
+                            random_state=None, verbose=False, return_errors=False, 
+                            normalize_factors=False, return_decomposition=False, unfold_domain=None,
+                            implementation = 'tensorly',):
+        """Non-negative Tucker decomposition
+        
+        Iterative multiplicative update.
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : None, int or int list
+            Size of the core tensor, (len(ranks) == tensor.ndim) if int, the same rank is used for all modes.
+        
+        n_iter_max : int, optional, default is 10
+            Maximum number of iterations.
+        
+        init : {'svd', 'random'}, optional, default is 'svd'
+            Method to initialize the decomposition.
+        
+        tol : float, optional, default is 0.0001
+            Tolerance: the algorithm stops when the variation in the reconstruction error is less than the tolerance.
+        
+        random_state : {None, int, np.random.RandomState}, optional
+            Random seed or state to initialize the random number generator.
+        
+        verbose : int, optional
+            Level of verbosity.
+        
+        return_errors : bool, optional, default is False
+            Indicates whether to return all reconstruction errors and computation time of each iteration.
+        
+        normalize_factors : bool, optional, default is False
+            If True, aggregates the norms of the factors in the core.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+        
+        Returns
+        -------
+        core : ndarray
+            Positive core of the Tucker decomposition, has shape ranks.
+        
+        factors : ndarray list
+            List of factors of the Tucker decomposition, element i is of shape (tensor.shape[i], rank).
+        
+        Notes
+        -----
+        Non-negative Tucker decomposition decomposes the input tensor into a core tensor and factor matrices,
+        ensuring all elements are non-negative.
+        """
+        
+        if implementation == 'tensorly':
+    
+            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+            if unfold_domain is not None:
+                original_shape = tensor.shape
+                tensor = unfold_tensor(tensor, unfold_domain)
+            
+            # Non-negative Tucker decomposition
+            core, factors, errors = nnt(tensor, rank=rank, n_iter_max=n_iter_max, init=init, tol=tol,
+                                                                               random_state=random_state, verbose=verbose, return_errors=return_errors,
+                                                                               normalize_factors=normalize_factors)
+            
+            # Reconstruct the tensor from Tucker factors and core
+            reconstruction = tl.tucker_to_tensor((core, factors))
+            
+            # Re-fold the tensor if it was unfolded
+            if unfold_domain is not None:
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            
+            if return_decomposition:
+                results = [core, factors, reconstruction]
+                if return_errors:
+                    results.append(errors)
+                return results
+            else:
+                return reconstruction
+
+    def partial_tucker(self, tensor, rank, modes=None, n_iter_max=100, 
+                       init='svd', tol=0.0001, svd='truncated_svd', random_state=None, 
+                       erbose=False, mask=None, svd_mask_repeats=5, 
+                       return_decomposition=False, unfold_domain=None, implementation='tensorly'):
+        """Partial Tucker decomposition via Higher Order Orthogonal Iteration (HOI)
+        
+        Decomposes tensor into a Tucker decomposition exclusively along the provided modes.
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : None, int or int list
+            Size of the core tensor, (len(ranks) == tensor.ndim) if int, the same rank is used for all modes.
+        
+        modes : None, int list, optional
+            List of the modes on which to perform the decomposition.
+        
+        n_iter_max : int, optional, default is 100
+            Maximum number of iterations.
+        
+        init : {'svd', 'random'}, or TuckerTensor, optional, default is 'svd'
+            Method to initialize the decomposition. If a TuckerTensor is provided, this is used for initialization.
+        
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.tenalg.svd.SVD_FUNS.
+        
+        tol : float, optional, default is 0.0001
+            Tolerance: the algorithm stops when the variation in the reconstruction error is less than the tolerance.
+        
+        random_state : {None, int, np.random.RandomState}, optional
+            Random seed or state to initialize the random number generator.
+        
+        verbose : int, optional
+            Level of verbosity.
+        
+        mask : ndarray, optional
+            Array of booleans with the same shape as tensor. Should be 0 where the values are missing and 1 everywhere else.
+            Note: if tensor is sparse, then mask should also be sparse with a fill value of 1 (or True).
+        
+        svd_mask_repeats : int, optional, default is 5
+            Number of repetitions for the SVD in case of masking.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+        
+        Returns
+        -------
+        core : ndarray
+            Core tensor of the Tucker decomposition.
+        
+        factors : ndarray list
+            List of factors of the Tucker decomposition, with core.shape[i] == (tensor.shape[i], ranks[i]) for i in modes.
+        
+        Notes
+        -----
+        Partial Tucker decomposition decomposes the input tensor into a core tensor and factor matrices
+        along the specified modes.
+        """
+        
+        if implementation == 'tensorly':
+            
+            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+            if unfold_domain is not None:
+                original_shape = tensor.shape
+                tensor = unfold_tensor(tensor, unfold_domain)
+            
+            # Partial Tucker decomposition
+            core, factors = partial_tuck(tensor, rank=rank, modes=modes, n_iter_max=n_iter_max, init=init, tol=tol,
+                                                                  svd=svd, random_state=random_state, verbose=verbose, mask=mask,
+                                                                  svd_mask_repeats=svd_mask_repeats)
+            
+            # Reconstruct the tensor from Tucker factors and core
+            reconstruction = tl.tucker_tensor.tucker_to_tensor((core, factors))
+            
+            # Re-fold the tensor if it was unfolded
+            if unfold_domain is not None:
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            
+            if return_decomposition:
+                return core, factors, reconstruction
+            else:
+                return reconstruction
+
+    def tucker(self, tensor, rank, fixed_factors=None, n_iter_max=100, init='svd', 
+               return_errors=False, svd='truncated_svd', tol=0.0001, random_state=None, 
+               mask=None, verbose=False, return_decomposition=False, unfold_domain=None,
+               implementation='tensorly',):
+        
+        """Tucker decomposition via Higher Order Orthogonal Iteration (HOI)
+        
+        Decomposes tensor into a Tucker decomposition: tensor = [| core; factors[0], ...factors[-1] |]
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input tensor to decompose.
+        
+        rank : None, int or int list
+            Size of the core tensor, (len(ranks) == tensor.ndim) if int, the same rank is used for all modes.
+        
+        fixed_factors : int list or None, optional, default is None
+            If not None, list of modes for which to keep the factors fixed. Only valid if a Tucker tensor is provided as init.
+        
+        n_iter_max : int, optional, default is 100
+            Maximum number of iterations.
+        
+        init : {'svd', 'random'}, optional, default is 'svd'
+            Method to initialize the decomposition.
+        
+        return_errors : bool, optional, default is False
+            Indicates whether to return all reconstruction errors and computation time of each iteration.
+        
+        svd : str, optional, default is 'truncated_svd'
+            Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
+        
+        tol : float, optional, default is 0.0001
+            Tolerance: the algorithm stops when the variation in the reconstruction error is less than the tolerance.
+        
+        random_state : {None, int, np.random.RandomState}, optional
+            Random seed or state to initialize the random number generator.
+        
+        mask : ndarray, optional
+            Array of booleans with the same shape as tensor. Should be 0 where the values are missing and 1 everywhere else.
+            Note: if tensor is sparse, then mask should also be sparse with a fill value of 1 (or True).
+        
+        verbose : int, optional
+            Level of verbosity.
+        
+        return_decomposition : bool, optional
+            Whether to return the decomposition along with the reconstruction.
+        
+        unfold_domain : any, optional
+            Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+            
+        implementation : string, optional
+            'tensorly' to use Tensorly package implementation or 
+            'zhang' to use that in Zhang et al. (2020), see 'Notes' below.
+        
+        Returns
+        -------
+        core : ndarray
+            Core tensor of the Tucker decomposition.
+        
+        factors : ndarray list
+            List of factors of the Tucker decomposition. Its i-th element is of shape (tensor.shape[i], ranks[i]).
+        
+        Notes
+        -----
+        Tucker decomposition decomposes the input tensor into a core tensor and factor matrices.
+        
+        The "zhang" implementation is based on that in Zhang et al. (2020):
+            Zhang, C., Han, R., Zhang, A. R., & Voyles, P. M. (2020). 
+            "Denoising atomic resolution 4D scanning transmission electron 
+            microscopy data with tensor singular value decomposition." 
+            Ultramicroscopy, 219, 113123.
+        """
+        
+        if implementation == 'tensorly':
+            
+            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+            if unfold_domain is not None:
+                original_shape = tensor.shape
+                tensor = unfold_tensor(tensor, unfold_domain)
+            
+            # Tucker decomposition
+            core, factors, errors = tuck(tensor, rank=rank, fixed_factors=fixed_factors, n_iter_max=n_iter_max, init=init,
+                                                                  return_errors=return_errors, svd=svd, tol=tol, random_state=random_state,
+                                                                  mask=mask, verbose=verbose)
+            
+            # Reconstruct the tensor from Tucker factors and core
+            reconstruction = tl.tucker_tensor.tucker_to_tensor((core, factors))
+            
+            # Re-fold the tensor if it was unfolded
+            if unfold_domain is not None:
+                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            
+            if return_decomposition:
+                results = [core, factors, reconstruction]
+                if return_errors:
+                    results.append(errors)
+                return results
+            else:
+                return reconstruction
+
     
     # # =============================================================================
     # # Transform Domain Filtering
     # # =============================================================================
+        
+    def fourier_filter(self, target_data, mode='pass', r_inner=0, r_outer=None, sigma=10):
+        """
+        Apply a Fourier filter with Gaussian smoothing to an image using simpler logic.
+        
+        Parameters:
+        image : numpy.ndarray
+            The input image to filter.
+        mode : str
+            'pass' for passing the frequencies within the radius, 'cut' for cutting them out.
+        r_inner : int
+            The radius for the simple pass/cut or inner radius for band filters.
+        r_outer : int, optional
+            The outer radius for band filters. If provided, implies a band filter.
+        sigma : float
+            The standard deviation for the Gaussian used to smooth the filter edges.
+        
+        Returns:
+        numpy.ndarray
+            The filtered image.
+        """
+        
+        # Compute the Fourier transform of the image
+        f_transform = (fftshift(fft2(target_data)))
+        
+        rows, cols = target_data.shape
+        cy, cx = rows // 2, cols // 2
+        x = np.arange(cols) - cx
+        y = np.arange(rows) - cy
+        X, Y = np.meshgrid(x, y)
+        R = np.sqrt(X**2 + Y**2)
     
+        # Initialize the filter mask
+        mask = np.zeros_like(target_data, dtype=float)
     
-    # #
-    # def fourier_filt(self, other):
-    #     """
-    #     Fourier filtering.
+        if r_outer and r_outer > r_inner:
+            # Band filter
+            band_mask = np.logical_and(R >= r_inner, R <= r_outer)
+            if mode == 'pass':
+                mask[band_mask] = 1
+            elif mode == 'cut':
+                mask[band_mask] = 0
+                mask = 1 - mask
+        else:
+            # Simple pass/cut with Gaussian falloff
+            if mode == 'pass':
+                mask = np.exp(-((R - r_inner) ** 2) / (2 * sigma ** 2))
+            elif mode == 'cut':
+                mask = 1 - np.exp(-((R - r_inner) ** 2) / (2 * sigma ** 2))
+    
+        # Smooth the mask edges using a Gaussian filter
+        mask = gaussian_filter(mask, sigma=sigma)
+    
+        # Apply the filter to the Fourier transform
+        f_transform_filtered = f_transform * mask
+    
+        # Inverse Fourier transform to get the filtered image
+        filtered_image = np.abs(np.fft.ifft2(f_transform_filtered))
+
+        return filtered_image
         
-    #     If 'apply_log' is True, we obtain the exit wave power cepstrum (EWPC)
-    #     discussed in [reference].
-    #     """
-        
-        
-    #     return rem_negs(filtered_data) 
+        # return clip_values(filtered_data) 
     
     # #
     # def wavelet_thresholding(self, other):
     #     """
     #     Fourier filtering.
         
-    #     If 'apply_log' is True, we obtain the exit wave power cepstrum (EWPC)
     #     discussed in [reference].
     #     """
         
         
-    #     return rem_negs(filtered_data) 
+    #     return clip_values(filtered_data) 
     
     # #
     # def curvelet(self, other):
@@ -714,7 +2711,7 @@ class DenoisingMethods:
         
     #     """
         
-    #     return rem_negs(filtered_data) 
+    #     return clip_values(filtered_data) 
     
     # # 
     # def block_matching(self, other):
@@ -728,7 +2725,8 @@ class DenoisingMethods:
         
     #     return filtered_data
         
-    
+#%%
+
 class Denoiser:
     """
     The Denoiser class is designed to apply various denoising techniques to 4D-STEM data. It manages
@@ -769,13 +2767,21 @@ class Denoiser:
     """
     
     def __init__(self, target_data):
-        self.target_data = target_data
+        
+        if type(target_data) == np.ndarray:        
+            self.array = target_data
+            self.ndim = target_data.ndim
+
         self.methods = DenoisingMethods()
+        
+        # Make a list of available denoising methods accessible (exclude helper functions starting with "_")
+        available_methods = [m for m, v in inspect.getmembers(self.methods, predicate=inspect.ismethod) if not m.startswith('_')]
+        self.available_methods = available_methods
 
     def denoise(self, method_name, target_data=None, **kwargs):
-        
+                
         if target_data is None:
-            target_data = self.target_data    
+            target_data = self.array    
 
         method = getattr(self.methods, method_name, None)
 
@@ -790,34 +2796,47 @@ class Denoiser:
                 raise TypeError(f"{str(e)}. Valid arguments are: {param_names}")
 
         else:
-            available_methods = [m for m, v in inspect.getmembers(self.methods, predicate=inspect.ismethod) if not m.startswith('__')]
-            raise ValueError(f"No such method '{method_name}'. Available methods are: {', '.join(available_methods)}")
-
+            raise ValueError(f"No such method '{method_name}'. Available methods are: {', '.join(self.available_methods)}")
+    
+    # @jit(nopython=True, parallel=True)
     def apply_denoising(self, real_space_method=None, real_space_kwargs=None, 
-                        reciprocal_space_method=None, reciprocal_space_kwargs=None, **kwargs):
+                        reciprocal_space_method=None, reciprocal_space_kwargs=None, 
+                        advanced_method=None, advanced_kwargs=None, **kwargs):
         
-        # =============================================================================
-        # Spatial Domain Filtering
-        # =============================================================================
+        #TODO: add a way to return possible inputs for each function
         
-        if real_space_method is None and reciprocal_space_method is None:
-            
-            # TODO: Will need to assume here that method could be non-spatial
-            raise ValueError("No denoising method provided.")
-                
         if real_space_kwargs is None:
             real_space_kwargs = {}
         if reciprocal_space_kwargs is None:
             reciprocal_space_kwargs = {}
+        if advanced_kwargs is None:
+            advanced_kwargs = {}
+            
         if real_space_method:
             real_space_kwargs.update(kwargs)
         if reciprocal_space_method:
             reciprocal_space_kwargs.update(kwargs)
+        if advanced_method:
+            advanced_kwargs.update(kwargs)
         
-        dims = self.target_data.ndim
+        if real_space_method is None and reciprocal_space_method is None:
+                      
+            if advanced_method:
+                
+                #TODO: assert the method is a string and is within the list of methods
+                return self.denoise(advanced_method, **advanced_kwargs)
+            
+            elif advanced_method is not None:
+                raise ValueError("The input method is undefined.")
+            
+            else:
+                raise ValueError("No denoising method provided.")
+                
+ 
+        
+        dims = self.ndim
 
         # Below, we handle different dimensions accordingly
-        
         if dims == 2:
             if real_space_method and not reciprocal_space_method:
                 return self.denoise(real_space_method, **real_space_kwargs)
@@ -828,25 +2847,25 @@ class Denoiser:
 
         elif dims == 3:
             if real_space_method and not reciprocal_space_method:
-                return np.array([self.denoise(real_space_method, target_data=slice, **real_space_kwargs) for slice in self.target_data])
+                return np.array([self.denoise(real_space_method, target_data=slice, **real_space_kwargs) for slice in self.array])
             elif reciprocal_space_method and not real_space_method:
-                return np.array([self.denoise(reciprocal_space_method, target_data=slice, **reciprocal_space_kwargs) for slice in self.target_data])
+                return np.array([self.denoise(reciprocal_space_method, target_data=slice, **reciprocal_space_kwargs) for slice in self.array])
             elif real_space_method and reciprocal_space_method:
                 raise ValueError("Cannot handle both real space and reciprocal space methods simultaneously for 3D data.")
 
         elif dims == 4:
-            ry, rx, ky, kx = self.target_data.shape
-            processed_data = np.zeros_like(self.target_data)
+            ry, rx, ky, kx = self.array.shape
+            processed_data = np.zeros_like(self.array)
 
             if real_space_method:
-                for i in range(ky):
+                for i in tqdm(range(ky), desc = 'Filtering real-space images'):
                     for j in range(kx):
-                        processed_data[:, :, i, j] = self.denoise(real_space_method, target_data=self.target_data[:, :, i, j], **real_space_kwargs)
+                        processed_data[:, :, i, j] = self.denoise(real_space_method, target_data=self.array[:, :, i, j], **real_space_kwargs)
 
             if reciprocal_space_method:
-                for i in range(ry):
+                for i in tqdm(range(ry), desc = 'Filtering on reciprocal-space'):
                     for j in range(rx):
-                        processed_data[i, j, :, :] = self.denoise(reciprocal_space_method, target_data=self.target_data[i, j, :, :], **reciprocal_space_kwargs)
+                        processed_data[i, j, :, :] = self.denoise(reciprocal_space_method, target_data=self.array[i, j, :, :], **reciprocal_space_kwargs)
 
             return HyperData(processed_data)
 
@@ -858,8 +2877,11 @@ class Denoiser:
 class HyperData:
     
     def __init__(self, data):
-        self.data = data
-        self.denoiser = Denoiser(data)
+        self.array = data
+        self.ndim = data.ndim
+        self.shape = data.shape
+        self.dtype = data.dtype
+        self.denoiser = Denoiser(self.array)
 
     def swap_coordinates(self):
         """
@@ -872,7 +2894,7 @@ class HyperData:
         """
         
         # The original order is (0, 1, 2, 3) and we want to change to (2, 3, 0, 1)
-        swapped_data = np.transpose(self.data, (2, 3, 0, 1))
+        swapped_data = np.transpose(self.array, (2, 3, 0, 1))
         
         return HyperData(swapped_data)
     
@@ -887,16 +2909,15 @@ class HyperData:
         - Reordered dimensions (x, y) to (y, x)
         """
 
-        y, x, ky, kx = np.shape(self.data)
-        data_type = self.data.dtype  # Store the original data type
+        y, x, ky, kx = self.shape
         com_y, com_x = self._quickCOM(r_mask=r_mask) 
-        cbed_tran = np.zeros((y, x, ky, kx), dtype=data_type)
+        cbed_tran = np.zeros((y, x, ky, kx), dtype=self.dtype)
         
         print(f'Processing {y} by {x} real-space positions...')        
         for i in tqdm(range(y), desc = 'Alignment Progress'):
             for j in range(x):
                 afine_tf = transform.AffineTransform(translation=(-ky//2+com_y[i,j], -kx//2+com_x[i,j]))
-                cbed_tran[i,j,:,:] = transform.warp(self.data[i,j,:,:], inverse_map=afine_tf)
+                cbed_tran[i,j,:,:] = transform.warp(self.array[i,j,:,:], inverse_map=afine_tf)
                 # sys.stdout.write('\r %d,%d' % (i+1, j+1) + ' '*10)
         
         cbed_tran_Obj = HyperData(cbed_tran)
@@ -909,6 +2930,77 @@ class HyperData:
         print(f'COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
         
         return cbed_tran_Obj, mean_com, std_com
+    
+    def rotate_dps(self, angle, units='deg'):
+        """
+        Rotate clockwise all diffraction patterns by angle in degrees
+        """
+        
+        if units == 'rad':
+            angle = np.degrees(angle)
+        
+        if self.ndim == 4:
+            y, x, ky, kx = self.shape
+            
+            new_data = np.zeros((y, x, ky, kx), dtype=self.dtype)
+            
+            for y_idx in tqdm(range(y), desc = 'Rotating Diffraction Patterns'):
+                for x_idx in range(x):
+                    new_data[y_idx, x_idx] = rotate(self.array[y_idx, x_idx], angle)
+    
+    def standardize(self):
+        """
+        Standardize a 4D dataset using NumPy.
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input 4D tensor to standardize.
+        
+        Returns
+        -------
+        standardized_tensor : ndarray
+            The standardized 4D tensor with zero mean and unit variance.
+        """
+        # Calculate the mean and standard deviation along the last dimension
+        mean = np.mean(self.array, keepdims=True)
+        std = np.std(self.array, keepdims=True)
+        
+        # Standardize the tensor
+        standardized_tensor = (self.array - mean) / std
+        
+        return HyperData(standardized_tensor)
+        
+    def normalize(self):
+        """
+        Normalize a 4D dataset to the range [0, 1] using NumPy.
+        
+        Parameters
+        ----------
+        tensor : ndarray
+            The input 4D tensor to normalize.
+        
+        Returns
+        -------
+        normalized_tensor : ndarray
+            The normalized 4D tensor with values in the range [0, 1].
+        """
+        # Calculate the minimum and maximum values along the last dimension
+        min_val = np.min(self.array, keepdims=True)
+        max_val = np.max(self.array, keepdims=True)
+        
+        # Normalize the tensor
+        normalized_tensor = (self.array - min_val) / (max_val - min_val)
+        
+        return HyperData(normalized_tensor)
+    
+    def clip(self, a_min=1, a_max=None):
+        """
+        
+        """
+        
+        return clip_values(self.data, a_min, a_max)
+        
     
     # Private method: helper function for the 'alignment' method
     def _quickCOM(self, r_mask=5):
@@ -927,7 +3019,7 @@ class HyperData:
             centers of mass for each position in the real-space grid.
         """
         
-        y, x, ky, kx = np.shape(self.data)
+        y, x, ky, kx = np.shape(self.array)
         center_x = kx // 2
         center_y = ky // 2
 
@@ -941,7 +3033,7 @@ class HyperData:
 
         for i in tqdm(range(y), desc = 'Computing centers of mass'):
             for j in range(x):
-                cbed = np.squeeze(self.data[i, j, :, :] * mask)
+                cbed = np.squeeze(self.array[i, j, :, :] * mask)
                 pnorm = np.sum(cbed)
                 if pnorm != 0:
                     ap2_y[i, j] = np.sum(vy * np.sum(cbed, axis=0)) / pnorm
@@ -950,7 +3042,7 @@ class HyperData:
         return ap2_y, ap2_x
     
     # Must add type of interpolation
-    def fix_elliptical_distortions(self, r=None, R=None, interp_method='linear', return_fix=True):
+    def fix_elliptical_distortions(self, r=None, R=None, interp_method='linear', show_ellipse=False, return_fix=True, **kwargs):
         """
         Corrects elliptical distortions across all diffraction patterns in the dataset.
     
@@ -966,7 +3058,10 @@ class HyperData:
             Outer radius of the annular mask. Defaults to two fifths of the diffraction pattern's horizontal dimension if not specified.
         interp_method : str, optional
             Interpolation method to use during affine transformations. Can be 'linear' or 'cubic'.
-    
+        show_ellipse : bool, optional
+            Plots the mean diffraction pattern in the dataset with an overlaid ring of inner radius r and outer radius R. If return_fix 
+            is False, it plots the ring in the non-corrected pattern. Otherwise, it plots it in the corrected pattern.
+        
         Returns
         -------
         HyperData
@@ -982,25 +3077,28 @@ class HyperData:
         This method must be applied after applying the 'alignment' method for better accuracy.
         """
         
-        A, B, C, D = self.data.shape
+        A, B, C, D = self.array.shape
         
         if not r:
             r = C//5 
         if not R:
             R = 2*C//5
         
-        mean_pattern = self.get_dp(special = 'mean').data
+        mean_pattern = self.get_dp(special = 'mean').array
         params = self._extract_ellipse(mean_pattern, C//2, D//2, r, R)
-        corrected_data = np.empty_like(self.data)
+        corrected_data = np.empty_like(self.array)
         
         Ang, a, b = params 
         print(f"Ellipse rotation = {np.degrees(Ang)} degrees \nMajor axis 'a' = {a} px \nMinor axis 'b' = {b} px")
+        
+        if show_ellipse:
+            self._plot_with_ring(np.log(mean_pattern), r, R, **kwargs)
         
         if return_fix:
         
             for i in range(A):
                 for j in range(B):
-                    corrected_data[i, j] = self._apply_affine_transformation(self.data[i, j], *params, interp_method)
+                    corrected_data[i, j] = self._apply_affine_transformation(self.array[i, j], *params, interp_method)
     
             return HyperData(corrected_data)
 
@@ -1100,6 +3198,48 @@ class HyperData:
 
         return transformed_image
     
+    def _plot_with_ring(self, data, inner_radius, outer_radius, **kwargs):
+        """
+        Plots a 2D array with an overlaid red ring directly on the same figure.
+        
+        Parameters
+        ----------
+        data : numpy.ndarray
+            The 2D array to plot.
+        inner_radius : float
+            The inner radius of the ring.
+        outer_radius : float
+            The outer radius of the ring.
+        """
+        # Create a figure and axis
+        fig, ax = plt.subplots()
+        
+        # Generate a grid of points
+        y, x = np.indices(data.shape)
+        center_x, center_y = np.array(data.shape) // 2
+        
+        # Calculate the radius for each point in the grid
+        radius = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+        
+        # Create a mask for the ring
+        ring_mask = (radius >= inner_radius) & (radius <= outer_radius)
+        
+        # Create a colored overlay where the ring is red
+        ring_overlay = np.zeros(data.shape + (4,), dtype=np.float32)  # Adding a new dimension for RGBA
+        ring_overlay[..., 0] = 1  # Red channel
+        ring_overlay[..., 3] = ring_mask * 1.0  # Alpha channel only set where the ring is
+        
+        # Display the image
+        ax.imshow(data, **kwargs)
+        ax.imshow(ring_overlay, cmap='hot', alpha=0.5) 
+        
+        # Set plot details
+        ax.set_title('Mean diffraciton with Red Ring Overlay')
+        ax.axis('off')
+        
+        plt.show()
+    
+
     def centerBeam_Stats(self, square_side=8):
         """
         Analyze diffraction patterns to find the mean and standard deviation of the center of mass.
@@ -1111,7 +3251,7 @@ class HyperData:
         Returns:
         tuple: Mean and standard deviation of the center of mass coordinates.
         """
-        A, B, C, D = self.data.shape
+        A, B, C, D = self.array.shape
         com_coordinates = []
     
         # Define the region for center of mass calculation
@@ -1122,7 +3262,7 @@ class HyperData:
         # Calculate center of mass for each BxB image
         for i in range(A):
             for j in range(B):
-                region = self.data[i, j, min_coord:max_coord, min_coord:max_coord]
+                region = self.array[i, j, min_coord:max_coord, min_coord:max_coord]
                 com = center_of_mass(region)
                 com_coordinates.append((com[0] + min_coord, com[1] + min_coord))
     
@@ -1150,40 +3290,51 @@ class HyperData:
         numpy array: 2D mask of standard deviations with same shape as diffraction pattern.
         """
         # Validate the shape of the data
-        if len(self.data.shape) != 4:
+        if len(self.array.shape) != 4:
             raise ValueError("Data must be a 4D array")
                 
         if space == 'reciprocal':
             # Calculate the standard deviation for each pixel across all diffraction patterns
-            std_dev = np.std(self.data, axis=(0, 1))
+            std_dev = np.std(self.array, axis=(0, 1))
         elif space == 'real':
             # Calculate the standard deviation for each pixel across all scanning positions
-            std_dev = np.std(self.data, axis=(2, 3))
+            std_dev = np.std(self.array, axis=(2, 3))
         else:
             raise ValueError("'space' must be 'reciprocal' or 'real'")
             
-        return std_dev
+        return ReciprocalSpace(std_dev)
     
-    def get_dp(self, y=None, x=None, special=None):
+    def get_dp(self, y=None, x=None, real_mask=None, reciprocal_mask=None):
         """
         Obtain a diffraction pattern from a specific 4D dataset, either at a 
         specific point, averaged over a specified region, or a special diffraction
         such as the dataset's 'mean', 'median', 'max', etc..
         
         Inputs:
-            y: (tuple of int or int, optional) If tuple (ymin, ymax), it 
+            y: (tuple of int, int, or string) If tuple (ymin, ymax), it 
                specifies the vertical coordinate range to average over. If int,
-               it specifies a specific vertical coordinate.
+               it specifies a specific vertical coordinate. If string, 'y' must 
+               be one of the operations in 'operations' and returns the corresponding
+               special diffraction pattern such as the 'mean', 'median', etc.
             x: (tuple of int or int, optional) If tuple (xmin, xmax), it 
                specifies the horizontal coordinate range to average over. If 
                int, it specifies a specific horizontal coordinate.
         
         Returns: 
-            dp: (numpy array) Diffraction pattern, either at a specific point or averaged over a region.
+            dp: (numpy array) Diffraction pattern, either at a specific point, 
+            averaged over a region, or some other special diffraction.
         
         Raises:
             ValueError: If inputs are improperly specified or not provided.
         """
+        
+        if real_mask is not None or reciprocal_mask is not None:
+            if real_mask is not None:
+                if real_mask.shape == (self.shape[0], self.shape[1]):
+                    return ReciprocalSpace(np.mean(self.array[real_mask]), axis=(0))
+            else:
+                if reciprocal_mask.shape == (self.shape[2], self.shape[3]):
+                    return np.mean(self.array[:,:,reciprocal_mask], axis=(2))
         
         operations = {
             'mean': np.mean,
@@ -1193,36 +3344,50 @@ class HyperData:
             'random': np.random.random,
         }
 
-        if special:
-            if special in operations:
-                if special == 'random':
-                    ky = round(self.data.shape[0]*operations[special]())
-                    kx = round(self.data.shape[1]*operations[special]())
-                    result = self.data[ky, kx]
+        if isinstance(y, str):
+            if y in operations:
+                if y == 'random':
+                    ky = int(self.shape[0]*operations[y]())
+                    kx = int(self.shape[1]*operations[y]())
+                    result = self.array[ky, kx]
                 else:
-                    result = operations[special](self.data, axis=(0, 1))
-                return ReciprocalSection(result)
+                    result = operations[y](self.array, axis=(0, 1))
+                return ReciprocalSpace(result)
             else:
                 valid_operations = ', '.join(f"'{op}'" for op in operations.keys())
-                raise ValueError(f"'special' must be a string: {valid_operations}.")
+                raise ValueError(f"'y' must be an integer, tuple of integers, or string: {valid_operations}.")
        
-        if y or x:
+        elif y is not None or x is not None:
             
             if isinstance(y, tuple) and isinstance(x, tuple):
                 ymin, ymax = y
                 xmin, xmax = x
-                return ReciprocalSection(np.mean(self.data[ymin:ymax, xmin:xmax, :, :], axis=(0, 1)))
+                return ReciprocalSpace(np.mean(self.array[ymin:ymax, xmin:xmax, :, :], axis=(0, 1)))
             
             elif isinstance(y, tuple) and isinstance(x, int):
                 ymin, ymax = y
-                return ReciprocalSection(np.mean(self.data[ymin:ymax, x, :, :], axis=0))
+                return ReciprocalSpace(np.mean(self.array[ymin:ymax, x, :, :], axis=0))
             
             elif isinstance(y, int) and isinstance(x, tuple):
                 xmin, xmax = x
-                return ReciprocalSection(np.mean(self.data[y, xmin:xmax, :, :], axis=0))
+                return ReciprocalSpace(np.mean(self.array[y, xmin:xmax, :, :], axis=0))
             
             elif isinstance(y, int) and isinstance(x, int):
-                return ReciprocalSection(self.data[y, x])
+                return ReciprocalSpace(self.array[y, x])
+           
+            elif isinstance(y, tuple) and x is None:
+               ymin, ymax = y
+               return ReciprocalSpace(np.mean(self.array[ymin:ymax, :, :, :], axis=(0,1)))
+           
+            elif isinstance(y, int) and x is None:
+               return ReciprocalSpace(np.mean(self.array[y, :, :, :], axis=0))
+
+            elif y is None and isinstance(x, tuple):
+               xmin, xmax = x
+               return ReciprocalSpace(np.mean(self.array[:, xmin:xmax, :, :], axis=(0,1)))
+
+            elif y is None and isinstance(x, int):
+               return ReciprocalSpace(np.mean(self.array[:, x, :, :], axis=0))
             
             else:
                 raise ValueError("y and x must be either both tuples, both integers, or one tuple and one integer.")
@@ -1230,25 +3395,73 @@ class HyperData:
         else:
             raise ValueError("No parameters specified.")
 
-    def bin4D(self):
+    # def bin_data(self, bin_domain='real', iterations=1):
+    #     """
+    #     Bin 4D dataset by averaging over the first two dimensions.
+    #     """
+        
+    #     assert len(self.shape) == 4, "'dataset' must be four-dimensional"
+    #     assert type(iterations) == int, "'iterations must be an integer >= 1"
+        
+    #     bin_factor = 2**iterations
+        
+    #     if bin_domain == 'real':
+    #         A, B, C, D = self.shape[0] // bin_factor, self.shape[1] // bin_factor, self.shape[2], self.shape[3]
+    #         binned_dataset = np.zeros((A, B, C, D))
+            
+    #     elif bin_domain == 'reciprocal':
+    #         C, D, A, B = self.shape[0], self.shape[1], self.shape[2] // bin_factor, self.shape[3] // bin_factor
+    #         binned_dataset = np.zeros((C, D, A, B))
+        
+        
+    #     for i in range(A):
+    #         for j in range(B):
+    #             # Average over the first two dimensions
+    #             for q in range(iterations):
+    #                 if bin_domain == 'real':
+    #                     binned_dataset[i, j] = np.mean(self.array[bin_factor*i:bin_factor*i+bin_factor, bin_factor*j:bin_factor*j+bin_factor], axis=(0, 1))
+    #                 else:
+    #                     binned_dataset[:, :, i, j] = np.mean(self.array[:,:, bin_factor*i:bin_factor*i+bin_factor, bin_factor*j:bin_factor*j+bin_factor], axis=(2, 3))
+
+
+    #     return HyperData(binned_dataset)
+    
+    def bin_data(self, bin_domain='real', iterations=1):
         """
-        Bin 4D dataset by averaging over the first two dimensions.
+        Bin 4D dataset by averaging over either the first two dimensions (real space) or the last two dimensions (reciprocal space).
         """
         
-        assert len(self.data.shape) == 4, "'dataset' must be four-dimensional"
+        assert len(self.shape) == 4, "'dataset' must be four-dimensional"
+        assert isinstance(iterations, int) and iterations >= 1, "'iterations' must be an integer >= 1"
         
-        A, B, C, D = self.data.shape[0] // 2, self.data.shape[1] // 2, self.data.shape[2], self.data.shape[3]
-        binned_dataset = np.zeros((A, B, C, D))
-
-        for i in range(A):
-            for j in range(B):
-                # Average over the first two dimensions
-                binned_dataset[i, j] = np.mean(self.data[2*i:2*i+2, 2*j:2*j+2], axis=(0, 1))
-
+        bin_factor = 2 ** iterations
+        
+        if bin_domain == 'real':
+            A, B, C, D = self.shape[0] // bin_factor, self.shape[1] // bin_factor, self.shape[2], self.shape[3]
+            binned_dataset = np.zeros((A, B, C, D))
+            
+            for i in range(A):
+                for j in range(B):
+                    # Average over the first two dimensions (real space)
+                    binned_dataset[i, j] = np.mean(self.array[bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(0, 1))
+    
+        elif bin_domain == 'reciprocal':
+            A, B, C, D = self.shape[0], self.shape[1], self.shape[2] // bin_factor, self.shape[3] // bin_factor
+            binned_dataset = np.zeros((A, B, C, D))
+            
+            for i in range(C):
+                for j in range(D):
+                    # Average over the last two dimensions (reciprocal space)
+                    binned_dataset[:, :, i, j] = np.mean(self.array[:, :, bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(2, 3))
+    
+        else:
+            raise ValueError("Invalid bin_domain. Choose 'real' or 'reciprocal'.")
+    
         return HyperData(binned_dataset)
     
+    
     def plotVirtualImage(self, r_minor, r_major, vmin=None, vmax=None, 
-                         grid=True, num_div=10,plotMask=False,gridColor='black',
+                         grid=True, num_div=10,plotMask=False, gridColor='black',
                          plotAxes=True,bds=None, returnArrays = False):
         """
         Plot virtual detector image
@@ -1259,9 +3472,9 @@ class HyperData:
         returnArrays: if True, returns the virtual image and detector mask
         """
         
-        assert len(self.data.shape)==4, "Input dataset must be 4-dimensional"
+        assert len(self.shape)==4, "Input dataset must be 4-dimensional"
         
-        A,B,C,D = self.data.shape
+        A,B,C,D = self.shape
         detector_mask = np.zeros((C,D)) # Diffraction pattern mask
         
         # Identify reciprocal space pixels within desired ring-shaped region
@@ -1270,8 +3483,10 @@ class HyperData:
                 if r_minor<=np.sqrt((i-C/2)**2+(j-D/2)**2)<=r_major:
                     detector_mask[i,j] = 1
         
-        masked_image = np.sum(self.data*detector_mask,axis=(2,3))
+        masked_image = np.sum(self.array*detector_mask,axis=(2,3))
         
+        masked_image = np.sum(self.apply_annular_mask(r_minor, r_major, replacement_value=0).array, axis=(2,3))
+            
         if vmin:
             vmin = vmin
         else:
@@ -1296,39 +3511,36 @@ class HyperData:
         
         if plotMask:
             if bds is None:
-                plt.imshow(np.log(np.mean(self.data, axis=(0,1))*detector_mask), cmap='turbo', vmin=vmin, vmax=vmax)
+                plt.imshow(np.log(np.mean(self.array, axis=(0,1))*detector_mask), cmap='turbo', vmin=vmin, vmax=vmax)
                 plt.axis('off')
                 plt.show()
             else:
                 y1, y2, x1, x2 = bds
-                plt.imshow(np.log(np.mean(self.data[y1:y2, x1:x2], axis=(0,1))*detector_mask), 
+                plt.imshow(np.log(np.mean(self.array[y1:y2, x1:x2], axis=(0,1))*detector_mask), 
                            cmap='turbo', vmin=vmin, vmax=vmax)
                 plt.axis('off')
                 plt.show()
     
         if returnArrays:
-            return masked_image, np.mean(self.data, axis=(0,1))*detector_mask
+            return masked_image, np.mean(self.array, axis=(0,1))*detector_mask
     
-    def getAllCenters4Ddata(self, orders=[1,2,3], r=6.6,
-                            coords=coords, num_spots_per_order=6, iterations=1):
+    def getAllCenters(self, orders=[1,2,3], r=6.6,
+                            coords=None, num_spots_per_order=6, iterations=3):
         """
         Generate an array with all spot centers in 4D dataset
         """
         
-        assert len(self.data.shape) == 4, "Input dataset must be 4-dimensional"
-        Ny, Nx, _, _ = self.data.shape
+        assert len(self.shape) == 4, "Input dataset must be 4-dimensional"
+        Ny, Nx, _, _ = self.shape
         
         # Case 1: user wants to extract all centers of mass for a single order
         if isinstance(orders, int):       
             all_centers = np.zeros((Ny, Nx, num_spots_per_order, 2))
-            for i in range(Ny):
+            for i in tqdm(range(Ny), desc="Computing centers of mass"):
                 for j in range(Nx):
                     
-                    dp = ReciprocalSection(self.data[i][j])
-                    
-                    all_centers[i][j] = dp.getCenters(coords=coords,
-                                                      spots_order=orders, 
-                                                      r=r,iterations=iterations)
+                    all_centers[i, j] = self.get_dp(i, j).getCenters(order=orders, r=r,
+                                                                     coords=coords,iterations=iterations)
                     
         # Case 2: two or more spot orders are of interest
         else:    
@@ -1343,7 +3555,7 @@ class HyperData:
                     for i in range(Ny):
                         for j in range(Nx):
                             
-                            dp = ReciprocalSection(self.data[i][j])
+                            dp = self.get_dp(i, j)
                             
                             if isinstance(r, list):
                                 
@@ -1360,51 +3572,154 @@ class HyperData:
             
         return all_centers
 
-    def remove_center_beam(self, radius, replacement_value=1, outer_ring=None):
+    def apply_annular_mask(self, r_inner, r_outer=None, replacement_value=0):
         """
-        Apply a circular mask to the center of each 2D image in a 4D dataset.
+        Apply an annular mask to all images at the last two indices of an array.
     
-        Parameters:
-        radius (int or float): Radius of the circular mask.
-        replacement_value (int or float): number used as replacement for masked region
-        outer_ring (int or float): radius from the center beyond which all values will be replaced
-    
-        Returns:
-        numpy.ndarray: The modified dataset with masks applied.
+        ...
+        
         """
         
-        A1, A2, B1, B2 = self.data.shape
+        if self.ndim >= 2:
+            ky, kx = self.shape[self.ndim-2]-1, self.shape[self.ndim-1]-1
+            
+            bool_mask = make_mask((ky/2, kx/2), r_inner, mask_dim=(ky+1, kx+1), invert=True)
+            
+            if r_outer is not None:
+                outer_mask = make_mask((ky/2, kx/2), r_outer, mask_dim=(ky+1, kx+1),)
+                bool_mask = np.logical_and(bool_mask, outer_mask)
+            
+            if replacement_value:
+                replacement_values = np.logical_not(bool_mask) * replacement_value
+                return HyperData(self.array * bool_mask + replacement_values)
+            
+        return HyperData(self.array * bool_mask)
+
+    def get_clusters(self, n_PCAcomponents, n_clusters, r_centerBeam, std_Threshold = 0.2,
+                     plotStdMask=True, plotScree=True, plotClusterMap=True, plot3dClusterMap=False, 
+                     filter_size=3, cluster_cmap=None, filter_iterations=1,outer_ring=None, polar=False):
+        
+        """
+        Function that returns cluster dataset 
+        """
+        
+        assert len(self.shape)==4, "'dataset' must be 4-dimensional"
+        
+        # Remove center beam
+        A,B,C,D = self.shape
+        
+        if not polar:
+            dataset_noCenter = self.apply_annular_mask(r_centerBeam, r_outer=outer_ring).array
+        
+        else:
+            dataset_noCenter = np.zeros_like(dataset)
+            if outer_ring is not None:
+                dataset_noCenter[:,:,r_centerBeam:outer_ring] = dataset[:,:,r_centerBeam:outer_ring]
+            else:
+                dataset_noCenter[:,:,r_centerBeam:] = dataset[:,:,r_centerBeam:]
+        
+        # Find pixels of high variation
+        dataset_stdev = HyperData(dataset_noCenter**0.5).get_stdDev(space='reciprocal').array
+            
+        # Create a mask where True indicates standard deviation is below the threshold
+        low_std_dev_mask = dataset_stdev < std_Threshold*np.max(dataset_stdev)
+        
+        if plotStdMask:
+            plt.imshow(low_std_dev_mask, )
+            plt.title(f'High Std. Dev. Mask, std_threshold = {std_Threshold}')
+            plt.show()
+        
+        # Initialiaze high stdev data and modify its values
+        dataset_noCenter[:, :, low_std_dev_mask] = 0  
+        
+        dataset_noCenter = dataset_noCenter.reshape(-1, C*D)
+        
+        # PCA for dimensionality reduction
+        components = n_PCAcomponents
+        pca = PCA(n_components=components)
+        data_reduced = pca.fit_transform(np.log(clip_values(dataset_noCenter)))
+        
+        # Scree plot to find the optimal number of components
+        variance_ratios = pca.explained_variance_ratio_
+        
+        if plotScree:
+            plt.figure()
+            plt.plot(range(1, components+1), variance_ratios, marker='o')
+            plt.title("Scree Plot")
+            plt.xlabel("Principal Component")
+            plt.ylabel("Variance Explained")
+            plt.show()
+        
+        # K-means clustering
+        n_clusters = n_clusters
+        kmeans = KMeans(n_clusters=n_clusters, random_state=0,)
+        clusters = kmeans.fit_predict(data_reduced)
+        
+        if cluster_cmap is not None:
+            colormap = plt.cm.get_cmap(cluster_cmap, n_clusters) 
+        else:
+            colormap = plt.cm.get_cmap('gnuplot', n_clusters,)
+        
+        if plot3dClusterMap:
+            # Plotting 3D
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+            
+            for i in range(n_clusters):
+                # Get the color for the current cluster
+                color = colormap(i)
+            
+                # Scatter plot for each cluster
+                ax.scatter(data_reduced[clusters == i, 0],
+                           data_reduced[clusters == i, 1],
+                           data_reduced[clusters == i, 2],
+                           # data_reduced[clusters == i, 3],
+                           c=[color], label=f'Cluster {i+1}', s=2, alpha=0.5)
+            
+            ax.set_xticklabels([])
+            ax.set_yticklabels([])
+            ax.set_zticklabels([])
     
-        # Create a circular mask
-        Y, X = np.ogrid[:B1, :B2]
-        center = (B1 // 2, B2 // 2)
-        dist_from_center = np.sqrt((X - center[0])**2 + (Y - center[1])**2)
-        mask = dist_from_center <= radius
-    
-        if outer_ring:
-            mask_outer = dist_from_center >= outer_ring
-    
-        # Apply the mask to each 2D image
-        masked_data = self.data.copy()
-        for i in range(A1):
-            for j in range(A2):
-                masked_data[i, j][mask] = replacement_value
-    
-                if outer_ring:
-                    masked_data[i, j][mask_outer] = replacement_value
-    
-        return HyperData(masked_data)
+            plt.show()
+        
+        # Plotting 2D projection
+        # Mapping back to original dimensions
+        cluster_map = clusters.reshape(A, B)
+        
+        if filter_size is not None:
+            for i in range(filter_iterations):
+                cluster_map = apply_majority_filter(cluster_map,filter_size)
+        
+        # Creating a color-coded AxB map
+        cluster_map_colored = np.zeros((A, B, 3), dtype=np.uint8)
+            
+        # Iterate over each cluster to color
+        for i in range(n_clusters):
+            # Convert color to RGB format
+            color = (np.array(colormap(i)[:3]) * 255).astype(np.uint8)
+            # Ensure proper broadcasting by using np.where
+            indices = np.where(cluster_map == i)
+            cluster_map_colored[indices] = color
+        
+        plt.figure()
+        plt.imshow(cluster_map_colored)
+        plt.title(f"Cluster Map ({A}x{B}) with {n_clusters} Clusters")
+        plt.colorbar()
+        plt.show()
+        
+        return cluster_map
 
 #%%
 
-class ReciprocalSection:
+class ReciprocalSpace:
 
     def __init__(self, data):
-        self.data = data
+        self.array = data
+        self.shape = data.shape
         self.denoiser = Denoiser(data)
     
     def show(self, power=1, title='Diffraction Pattern', logScale=True, 
-             axes=True, vmin=None, vmax=None,figsize=(10,10), aspect=None,cmap='turbo'):
+             axes=True, vmin=None, vmax=None, figsize=(10,10), aspect=None, cmap='turbo'):
         """
         Visualize a desired diffraction pattern
         
@@ -1415,9 +3730,9 @@ class ReciprocalSection:
         plt.figure(figsize=figsize)
             
         if logScale:
-            processed_data = power * np.log(self.data)
+            processed_data = power * np.log(self.array)
         else:
-            processed_data = self.data ** power
+            processed_data = self.array ** power
         
         # Determine vmin and vmax if not provided
         if vmin is None:
@@ -1433,7 +3748,7 @@ class ReciprocalSection:
             
         if axes:
             
-            ky, kx = self.data.shape
+            ky, kx = self.shape
             
             plt.axis('on')
             plt.xticks(np.arange(0, kx, 5))
@@ -1455,6 +3770,13 @@ class ReciprocalSection:
     
         plt.show()
     
+    #TODO: how to call method from HyperData?
+    # def remove_center_beam(self):
+    #     """
+        
+    #     """
+    #     return ReciprocalSpace(annular)
+    
     def getSpotCenter(self, ky, kx, r, plotSpot=False, iterations=1):
         """
         Find the center of mass (of pixel intensities) of a diffraction spot, 
@@ -1463,7 +3785,7 @@ class ReciprocalSection:
         
         # Pad and round up to ensure the entire radius is accommodated
         pad_width = int(np.ceil(r))
-        padded_data = np.pad(self.data, pad_width=pad_width, mode='constant')
+        padded_data = np.pad(self.array, pad_width=pad_width, mode='constant')
     
         # Adjustment of padding coordinates
         ky_padded, kx_padded = ky + pad_width, kx + pad_width
@@ -1499,6 +3821,7 @@ class ReciprocalSection:
                                                              base_cmap(np.linspace(0, 1, 2**12))[1:]), axis=0))
                 plt.imshow(masked_spot_data, cmap=custom_cmap)
                 plt.colorbar()
+                plt.scatter(com_x, com_y, color='yellow', s=50, label='Subpixel CoM')
                 plt.show()
             
             ky_padded = com_y + ymin
@@ -1510,19 +3833,59 @@ class ReciprocalSection:
     
         return ky_CoM, kx_CoM
 
+    def getCenters(self, order=None, r=6, coords=coords, num_spots_per_order=6, 
+                   plotSpots=False, iterations=1):
+        """
+        Generate an array spot centers for any DP
+        
+        r : int, float or list
+            if list, its length must be the same as that of coords
+        """
+        
+        assert len(self.shape) == 2, "Input data must be of 2-dimensional"
+        
+        if order is not None:
+            
+            # Define spot indeces to extract
+            spot_adder = (order - 1)*num_spots_per_order
+        
+            order_centers = np.zeros((num_spots_per_order, 2))
+            for j in range(num_spots_per_order):
+                order_centers[j] = self.getSpotCenter(coords[j + spot_adder][0],
+                                                 coords[j + spot_adder][1],
+                                                 r, plotSpots,iterations=iterations)
+                
+        else:
+            
+            order_centers = np.zeros((len(coords), 2))
+            
+            if isinstance(r, (int, float)):
+                for j in range(len(coords)):
+                    order_centers[j] = self.getSpotCenter(coords[j][0],
+                                                         coords[j][1],
+                                                         r, plotSpots,iterations=iterations)
+                
+            else:
+                for j in range(len(coords)):
+                    order_centers[j] = self.getSpotCenter(coords[j][0],
+                                                         coords[j][1],
+                                                         r[j], plotSpots,iterations=iterations)
+            
+        return order_centers
+
     # Needs update
-    def masked_DPs(data, mask_radius, coords, order=None, title=None, 
+    def masked_DPs(self, mask_radius, coords, order=None, title=None, 
                    plotSpots=False,return_mask=False,iterations=1,plot=True):
         """ 
         Generate masked diffraction plots for each order.
         Order = 1,2,3,4; Last option plots all.
         """
         
-        A,B = data.shape
+        A,B = self.shape
         compound_mask = np.zeros((A, B))
         
         # Obtain CoMs of interst
-        centers = getCenters(data, order, mask_radius, coords=coords, plotSpots=plotSpots,iterations=iterations)
+        centers = self.getCenters(spots_order=order, r=mask_radius, coords=coords, plotSpots=plotSpots, iterations=iterations)
     
         for mask_center in centers:
                     
@@ -1530,7 +3893,7 @@ class ReciprocalSection:
             compound_mask = compound_mask + mask_spot     
         
         # Apply compound mask
-        masked_data = data*compound_mask
+        masked_data = self.array*compound_mask
         
         if plot: 
             
@@ -1565,44 +3928,6 @@ class ReciprocalSection:
         
         if return_mask:
             return compound_mask
-    
-    def getCenters(self, spots_order=None, r=6, coords=coords, num_spots_per_order=6, 
-                   plotSpots=False, iterations=1):
-        """
-        Generate an array spot centers for any DP
-        """
-        
-        assert len(self.data.shape) == 2, "Input data must be of 2-dimensional"
-        
-        if spots_order is not None:
-            
-            # Define spot indeces to extract
-            spot_adder = (spots_order - 1)*num_spots_per_order
-        
-            order_centers = np.zeros((num_spots_per_order, 2))
-            for j in range(num_spots_per_order):
-                order_centers[j] = self.getSpotCenter(coords[j + spot_adder][0],
-                                                 coords[j + spot_adder][1],
-                                                 r, plotSpots,iterations=iterations)
-                
-        else:
-            
-            order_centers = np.zeros((len(coords), 2))
-            
-            if isinstance(r, (int, float)):
-                for j in range(len(coords)):
-                    order_centers[j] = self.getSpotCenter(coords[j][0],
-                                                         coords[j][1],
-                                                         r, plotSpots,iterations=iterations)
-                
-            else:
-                for j in range(len(coords)):
-                    order_centers[j] = self.getSpotCenter(coords[j][0],
-                                                         coords[j][1],
-                                                         r[j], plotSpots,iterations=iterations)
-            
-        return order_centers
-
 
     def getIntensities(self, spots_order=None, center=None, r=6, coords=None):
         """
@@ -1621,7 +3946,7 @@ class ReciprocalSection:
         
             for int_idx, intensity in enumerate(ints):
         
-                masked_data = self.data*make_mask(center[int_idx], r)
+                masked_data = self.array*make_mask(center[int_idx], r)
                 ints[int_idx] = np.sum(masked_data[int(center[int_idx][0]-(r+1)):int(center[int_idx][0]+(r+1)),
                                                    int(center[int_idx][1]-(r+1)):int(center[int_idx][1]+(r+1))])
     
@@ -1632,12 +3957,12 @@ class ReciprocalSection:
             
             if isinstance(r, (int, float)):
                 for int_idx in range(num_ints):
-                    masked_data = self.data*make_mask(center[int_idx], r)
+                    masked_data = self.array*make_mask(center[int_idx], r)
                     ints[int_idx] = np.sum(masked_data)            
                 
             else:
                 for int_idx in range(num_ints):
-                    masked_data = self.data*make_mask(center[int_idx], r[int_idx])
+                    masked_data = self.array*make_mask(center[int_idx], r[int_idx])
                     ints[int_idx] = np.sum(masked_data)
         
         return ints
@@ -1658,11 +3983,11 @@ class ReciprocalSection:
                       vmin=4,vmax=14, get_bg = True,
                       axes=False,plotInput=False,plotCenters=True,plotBg=False,plotResult=True,):
         
-        A, B = self.data.shape
+        A, B = self.shape
         mask = make_mask((A//2,B//2), r_mask=(A+B)//4*mask_radial_frac) # Define region where spots are to be found
         
         # Extract centers and radii automatically
-        blobs_log = feature.blob_log(self.data*mask, min_sigma=min_sigma, 
+        blobs_log = feature.blob_log(self.array*mask, min_sigma=min_sigma, 
                                      max_sigma=max_sigma, 
                                      num_sigma=num_sigma, 
                                      threshold=threshold)
@@ -1695,7 +4020,7 @@ class ReciprocalSection:
         if plotCenters:
         
             plt.figure(figsize=(10, 10))
-            plt.imshow(np.log(self.data), cmap='turbo',vmin=vmin,vmax=vmax)
+            plt.imshow(np.log(self.array), cmap='turbo',vmin=vmin,vmax=vmax)
             plt.axis('off')
         
             # Circle around each blob
@@ -1715,17 +4040,17 @@ class ReciprocalSection:
         
         if get_bg:
             # Masks sizes are based on computed radius of spot and distance to center (center spots with greater radius than far spots)
-            dp_bg = predict_values(self.data,centers=peak_centers,radius=radii,
+            dp_bg = predict_values(self.array,centers=peak_centers,radius=radii,
                                    n_estimators=n_estimators,learning_rate=learning_rate, max_depth=max_depth)
     
         if plotInput:
             self.show(vmin=vmin,vmax=vmax,axes=axes, title="Input Diffraction Pattern")
         
         if plotBg and get_bg:
-            ReciprocalSection(dp_bg).show(vmin=vmin,vmax=vmax,axes=axes)
+            ReciprocalSpace(dp_bg).show(vmin=vmin,vmax=vmax,axes=axes)
     
         if plotResult:
-            ReciprocalSection(rem_negs(self.data-bg_frac*dp_bg)).show(vmin=vmin,vmax=vmax,axes=axes,
+            ReciprocalSpace(clip_values(self.array-bg_frac*dp_bg)).show(vmin=vmin,vmax=vmax,axes=axes,
                    title=f'ne={n_estimators},learning_rate={learning_rate}, max_depth={max_depth}')
         
         if get_bg:
@@ -1755,9 +4080,8 @@ if __name__ == '__main__':
     
     np.save('rawRippleData.npy', data)
     
-    # Load raw data (aligned)
-    rippleData = np.load('rawRippleData.npy')
-    
+    # Load raw data (aligned)   
+    rippleData = np.load('rawRippleData.npy')[92:184, 65:95]
     """
     Approximate center of first thru third order spots
     
@@ -1765,149 +4089,201 @@ if __name__ == '__main__':
     within average diffraction pattern. 
     """
     
-    #%%
+#%%
+
+    # Testing center beam removal
     
-    singleRipple = np.load('singleRipple.npy')
-    ripple_bg = np.load('ripple_bg.npy')
-    rippleData = HyperData(rem_negs(singleRipple - 0*ripple_bg))
+    ones = np.ones((7,7))
+    structured = HyperData(np.array([[ones, ones*2],
+                                     [ones*3, ones*4]]))
+    original_shape = structured.shape
+    print(structured.array)
+   
+    # From (0, 1, 2, 3, ...) we swap 1 and 2
+    tensor = np.transpose(structured.array, (2, 0, 3, 1 ))
+    
+    new_tensor_shape = (original_shape[2]*original_shape[0],) + (original_shape[3]*original_shape[1],)
+    tensor = tensor.reshape(new_tensor_shape) 
+
+    
+    intermediate_shape = (original_shape[2], original_shape[0], original_shape[3], original_shape[1],)
+    tensor = tensor.reshape(intermediate_shape)
+    # print(tensor)
+    tensor = np.transpose(tensor, (1, 3, 0, 2))
+    
+    
+    print(structured.apply_annular_mask(1., 2.5, 888).array)
+    
+    mask1 = make_mask((50//2,50//2), 10, mask_dim=(50,50), invert=True)
+    mask2 = make_mask((50//2,50//2), 20, mask_dim=(50,50), invert=False)
+    
+    plt.imshow(mask1)
+    plt.show()
+    
+    plt.imshow(mask2)
+    plt.show()
+    
+    plt.imshow(np.logical_and(mask1, mask2))
+    plt.show()
+    
+    unfolded_structured_Real = unfold_tensor(structured.array,'coordinate_aligned_real')
+    structured = unfold_tensor(unfolded_structured_Real,'coordinate_aligned_real', undo=True, original_shape=original_shape)
+    
+    unfolded_structured_Reciprocal = unfold_tensor(structured.array,'coordinate_aligned_reciprocal')
+    structured = unfold_tensor(unfolded_structured_Reciprocal,'coordinate_aligned_reciprocal', undo=True, original_shape=original_shape)
+
+    
+#%% Ripple Data Testing
+    
+    rippleData = np.load('rawRippleData.npy')[92:184, 65:95]
+    rippleData = HyperData(rippleData)
     rippleData = rippleData.alignment(7)[0]
-    # rippleData_noBg = HyperData(rem_negs(singleRipple - 0.9*ripple_bg))
+    rippleData.plotVirtualImage(30, 55, grid=False, plotAxes=False)
+    # rippleData.get_dp(special='random').show(vmin=4)
     
-    # Available methods are: anisotropic_diffusion (needs redefining), bilateral, gaussian, median, 
-    #                        non_local_means, total_variation
+
+    corrected_rippleData = rippleData.fix_elliptical_distortions(r=42,R=50, interp_method='linear', 
+                                                                 return_fix=True, show_ellipse=True)
     
-    # HyperData_denoised = HyperData.denoiser.apply_denoising(real_space_method='total_variation',
-    #                                                   real_space_kwargs={'weight':30, 'eps': 0.0001, 'max_num_iter': 100})
+#%%
     
-    # 46 +- 3
-    corrected_rippleData = rippleData.fix_elliptical_distortions(r=42,R=50, interp_method='linear')
+    transformed = unfold_tensor(rippleData, 'coordinate_aligned_reciprocal')
     
-    rippleData.get_dp(special='mean').show(vmin=4,vmax=14,title="Mean Diffraction Before Elliptical Distortion Correction")
-    corrected_rippleData.get_dp(special='mean').show(vmin=4,vmax=14,title="Mean Diffraction After Elliptical Distortion Correction")
-    plt.imshow(rippleData.get_dp(special='mean').data - corrected_rippleData.get_dp(special='mean').data,cmap='RdBu',vmin=-1000,vmax=1000)
+    resized = cv2.resize((transformed), (20000,20000))
+
+    plt.imshow(np.log(transformed), vmin=4, cmap='turbo',)
+    plt.show()
     
-    corrected_rippleData = corrected_rippleData.fix_elliptical_distortions(r=45,R=49,  interp_method='linear')
+    plt.imshow(np.log(resized), vmin=4, cmap='turbo',)
+    plt.show()
     
-    corrected_rippleData = HyperData(corrected_rippleData.data[35:75])
+    fourier_transformed = (fftshift(fft2(transformed)))#
+    fourier_transformed = np.log(np.abs(fourier_transformed))
     
-    # import time
-    # start = time.perf_counter()
-    # rippleData_denoised = rippleData.denoiser.apply_denoising(real_space_method='adaptive_median_filter',
-    #                                                   real_space_kwargs={'s':3, 'sMax': 7})
-    # end = time.perf_counter()
-    # print("It took ", end-start, " seconds." )
+    resized_ft = cv2.resize((fourier_transformed), (30,92))
+
     
-    # np.save('singleRipple_denoised_noBg.npy', rippleData_denoised.data)
+    plt.imshow(fftshift(fourier_transformed), cmap='gray_r',vmin=12, vmax=19)
+    plt.axis('off')
+    plt.show()
     
+    filtered = median_filter(fourier_transformed, 3)
+    transformed_back = np.abs(np.fft.ifft2(filtered))
+    
+    fourier_folded_back = unfold_tensor((fourier_transformed), 'coordinate_aligned_real',
+                                undo=True, original_shape=rippleData.shape)
+    
+    fourier_folded_back = HyperData(np.abs(fourier_folded_back))
+    
+    # Denoiser(transformed).denoise('fourier_filter', mode='pass', r_inner=0, r_outer=None, sigma=10)
+
+    #%%
+
+    denoised_ripple = corrected_rippleData.denoiser.apply_denoising(advanced_method='cp_constrained', 
+                                                                    rank=200, unfold_domain='real', n_iter_max=100, )
+    # denoised_ripple = corrected_rippleData.denoiser.apply_denoising(advanced_method='cp_constrained', rank=400,
+    #                                                                 unfold_domain='coordinate_aligned_real', n_iter_max=1000, )
+    # rank=5, n_iter_max=100, n_iter_max_inner=10,
+    denoised_ripple = HyperData(denoised_ripple)
+    corrected_rippleData.plotVirtualImage(45, 55, grid=False)
+    denoised_ripple.plotVirtualImage(45, 55, grid=False)
+    
+    idx1, idx2 = int(np.random.random()*corrected_rippleData.shape[0]), int(np.random.random()*corrected_rippleData.shape[1])
+    corrected_rippleData.get_dp(idx1, idx2).show(vmin=4)
+    denoised_ripple.get_dp(idx1, idx2).show(vmin=4)
     
     #%%
+    # corrected_rippleData.fix_elliptical_distortions(r=42,R=50, interp_method='linear', 
+    #                                                              return_fix=False, show_ellipse=True,)
+    
+    # rippleData.get_dp(special='mean').show(vmin=4,vmax=14,title="Mean Diffraction Before Elliptical Distortion Correction")
+    # corrected_rippleData.get_dp(special='mean').show(vmin=4,vmax=14,title="Mean Diffraction After Elliptical Distortion Correction")
+    # plt.imshow(rippleData.get_dp(special='mean').array - corrected_rippleData.get_dp(special='mean').array,cmap='RdBu',vmin=-1000,vmax=1000)
+       
+    # peak_centers, radii, dp_bg = corrected_rippleData.get_dp(special='mean').remove_bg(min_sigma=1, 
+    #                                                                         max_sigma=2, 
+    #                                                                         num_sigma=50, 
+    #                                                                         threshold=50,
+    #                                                                         bg_frac=0.99,
+    #                                                                         mask_radial_frac=1.2,
+    #                                                                         min_distance_factor=0.25,
+    #                                                                         max_distance_factor=10,
+    #                                                                         radii_multiplier=3,)
+    # ReciprocalSpace(dp_bg).show(vmin=4)
+    
+    rippleData_nobg = HyperData(clip_values(corrected_rippleData.array - 0.8*dp_bg))
+    
+    start = time.perf_counter()
+    rippleData_denoised = rippleData_nobg.denoiser.apply_denoising(real_space_method='adaptive_median_filter',
+                                                      real_space_kwargs={'s':3, 'sMax': 7})
+    end = time.perf_counter()
+    print("It took ", end-start, " seconds." )
+    
+    # np.save('singleRipple_denoised_noBg.npy', rippleData_denoised.array)
+    
+    sample = rippleData.get_dp(special='random')
+    sample.show(logScale=False, power=0.2, vmin=2.5)
+    
+    
+    denoised_sample = ReciprocalSpace(DenoisingMethods.fourier_filter(1,target_data=sample.array, 
+                                                                        r_inner=1.3, r_outer=75, mode='pass',sigma=2))
+    denoised_sample.show(logScale=False, power=0.2, vmin=2.5)
+
+    transformed = (fftshift(fft2(sample.array)))
+    plt.imshow(np.abs(transformed**0.5))
+    other_sample = ReciprocalSpace(np.abs((np.fft.ifft2(transformed))))
+    other_sample.show(logScale=False, power=0.2, vmin=2.5)
+
+    
     # HyperData_denoised = corrected_rippleData.denoiser.apply_denoising(real_space_method='anisotropic_diffusion',
     #                                                    real_space_kwargs={'niter':10, 'kappa': 30, 'gamma': 0.25, 'option': 2})
                                                       # niter=10, kappa=30, gamma=0.25, option=2)
     
-    HyperData_denoised = corrected_rippleData.denoiser.apply_denoising(reciprocal_space_method='bilateral',real_space_method='anisotropic_diffusion',
-                                                                       real_space_kwargs={'niter':10, 'kappa': 30, 'gamma': 0.25, 'option': 2},
-                                                                       reciprocal_space_kwargs={'d':5, 'sigma_color': 150, 'sigma_space': 100})
-    # (reciprocal_space_method='anisotropic_diffusion',
-    #                                                    reciprocal_space_kwargs={'niter':10, 'kappa': 30, 'gamma': 0.25, 'option': 2})
+    cropped_ripple = HyperData(rippleData_nobg.array[2:20, 2:-1])
+    cropped_ripple.plotVirtualImage(45,55, grid=False)
     
+    cropped_ripple_denoised = cropped_ripple.denoiser.apply_denoising(real_space_method='adaptive_median_filter',
+                                                                      real_space_kwargs={'s':3, 'sMax': 5})
+    cropped_ripple_denoised.plotVirtualImage(45,55, grid=False)
     
-    corrected_rippleData.plotVirtualImage(40,60,plotAxes=False)
-    HyperData_denoised.plotVirtualImage(40,60,plotAxes=False)
+    idx1, idx2 = int(np.random.random()*cropped_ripple.shape[0]), int(np.random.random()*cropped_ripple.shape[1])
     
-    corrected_rippleData.get_dp(20,20).show(vmin=4, axes=False, )
-    corrected_rippleData.get_dp((18,22),(18,22)).show(vmin=4, axes=False, )
+    cropped_ripple.get_dp(idx1,idx2).show(vmin=4)
+    cropped_ripple_denoised.get_dp(idx1,idx2).show(vmin=4)
 
-    HyperData_denoised.get_dp(20,20).show(vmin=4, axes=False, )
+    # Denoise corrected ripple
+    corrected_rippleData_denoised = corrected_rippleData.denoiser.apply_denoising('cp')
+    idx1, idx2 = int(np.random.random()*corrected_rippleData.shape[0]), int(np.random.random()*corrected_rippleData.shape[1])
+    corrected_rippleData.get_dp(idx1,idx2).show(vmin=4,vmax=14)
+    corrected_rippleData_denoised = HyperData(clip_values(corrected_rippleData_denoised.array))
+    corrected_rippleData_denoised.get_dp(idx1,idx2).show(logScale=True,vmin=4,vmax=14)
+    corrected_rippleData.plotVirtualImage(45, 55, grid=False)
+    corrected_rippleData_denoised.plotVirtualImage(45, 55, grid=False)
     
-    # HyperData_denoised = HyperData_denoised.denoiser.apply_denoising(reciprocal_space_method='bilateral',
-    #                                                   reciprocal_space_kwargs={'d':5, 'sigma_color': 60, 'sigma_space': 90})
     
-    
-    # HyperData.get_dp(50,20).show(vmin=4, axes=False, )
-    # HyperData_denoised.get_dp(50,20).show(vmin=4, axes=False,)
-    # HyperData_denoised.plotVirtualImage(40,60,plotAxes=False)
     
     #%%
     
     im, _ = rippleData.plotVirtualImage(20,40,plotAxes=False,returnArrays=True,)
-    # im2, _ = HyperData(rippleData_denoised.data[1:-1,1:-1]).plotVirtualImage(40,60,plotAxes=False,vmin=vmin, vmax=vmax, returnArrays=True)
+    # im2, _ = HyperData(rippleData_denoised.array[1:-1,1:-1]).plotVirtualImage(40,60,plotAxes=False,vmin=vmin, vmax=vmax, returnArrays=True)
     im2, _ = rippleData_denoised.plotVirtualImage(20,40,plotAxes=False,returnArrays=True)
     
     rippleData.get_dp(60,18).show(vmin=4)
     rippleData_denoised.get_dp(60,18).show(vmin=4)
     
-    
-    #%%
-    
-    
-    # target_data = im   # Random noise image
-    # target_data = rippleData.data[:,:,62,63]   # Random noise image
-    target_data = im
-    vmin = np.min(target_data)
-    vmax = np.max(target_data)
-    plt.imshow(target_data, )
-    plt.title('original')
-    plt.show()
-    denoiser = DenoisingMethods()
-    
-    filtered_target_data = denoiser.adaptive_median_filter(target_data, s=3, sMax=5)
-    plt.imshow(filtered_target_data, vmin=vmin,vmax=vmax)
-    plt.title('3,5')
-    plt.show()
-    
-    filtered_target_data = median_filter(target_data, 3)
-    plt.imshow(filtered_target_data, vmin=vmin,vmax=vmax)
-    plt.title('3')
-    plt.show()
-    
-    filtered_target_data1 = denoiser.adaptive_median_filter(target_data, s=3, sMax=3)
-    plt.imshow(filtered_target_data, vmin=vmin,vmax=vmax)
-    plt.title('3,3')
-    plt.show()
-    
-    filtered_target_data2 = denoiser.adaptive_median_filter(target_data, s=3, sMax=7)
-    plt.imshow(filtered_target_data2, vmin=vmin,vmax=vmax)
-    plt.title('3,7')
-    plt.show()
-    
-    filtered_target_data = denoiser.adaptive_median_filter(target_data, s=5, sMax=7)
-    plt.imshow(filtered_target_data, vmin=vmin,vmax=vmax)
-    plt.title('5,7')
-    plt.show()
-    
-    filtered_target_data = denoiser.adaptive_median_filter(target_data, s=5, sMax=9)
-    plt.imshow(filtered_target_data, vmin=vmin,vmax=vmax)
-    plt.title('5,9')
-    plt.show()
-    
-    
-    filtered_target_data = denoiser.adaptive_median_filter(target_data, s=7, sMax=9)
-    plt.imshow(filtered_target_data, vmin=vmin,vmax=vmax)
-    plt.title('7,9')
-    plt.show()
-    
-    filtered_target_data = denoiser.adaptive_median_filter(target_data, s=7, sMax=11)
-    plt.imshow(filtered_target_data, vmin=vmin,vmax=vmax)
-    plt.title('7,11')
-    plt.show()
-    
-    np.sum(filtered_target_data2 - filtered_target_data1)
+  
     
     #%% Anisotropic diffusion testing
-    
-    # Reciprocal space denoising is bad
-    # Real space denoising is very similar to full 4D denoising
-    
+       
     singleRipple = np.load('singleRipple.npy')
-    HyperData = HyperData(rem_negs(singleRipple))
+    HyperData = HyperData(clip_values(singleRipple))
     denoised_real = HyperData.denoiser.apply_denoising(real_space_method='anisotropic_diffusion',
                                                       real_space_kwargs={'niter':15, 'kappa': 25, 'gamma': 0.3, 'option': 2})
     
     denoised_reciprocal = HyperData.denoiser.apply_denoising(reciprocal_space_method='anisotropic_diffusion',
                                                       reciprocal_space_kwargs={'niter':15, 'kappa': 25, 'gamma': 0.3, 'option': 2})
     
-    data2denoise = Denoiser(HyperData.data)
+    data2denoise = Denoiser(HyperData.array)
     denoised_data = data2denoise.denoise(method_name='anisotropic_diffusion', niter=15, kappa=25, gamma=0.3, option=2)
     denoised_full4D = HyperData(denoised_data)
     
@@ -1924,7 +4300,6 @@ if __name__ == '__main__':
     
     #%% Atomic res data
     
-    import numpy as np
     import scipy.io
     
     def read_mat_file(filename):
@@ -2849,26 +5224,7 @@ if __name__ == '__main__':
         corrected_phiMap = np.rad2deg(phi_radians)
     
         return corrected_phiMap, correction_mask
-    
-    def max_dp(data):
-        """
-        Calculate a 2D diffraction of the overall maximum int per pixel.
-    
-        Parameters:
-        data (numpy.ndarray): 4D STEM dataset.
-    
-        Returns:
-        numpy.ndarray: 2D mask of standard deviations with same shape as diffraction pattern.
-        """
-        # Validate the shape of the data
-        if len(data.shape) != 4:
-            raise ValueError("Data must be a 4D array with shape (A, B, C, C)")
-    
-        # Calculate the standard deviation for each pixel across all diffraction patterns
-        max_dp = np.max(data, axis=(0, 1))
-    
-        return max_dp
-    
+   
     
     def plot_histograms(centers_data):
         """
@@ -2986,88 +5342,88 @@ if __name__ == '__main__':
     
         plt.show()
     
-    def plot_centers_of_mass_with_histograms(centers_data, colors, labels=None, drawConvexHull=True,
-                                             transparency=0.5, hist_height=0.16, bins=150,
-                                             alpha=0.5, density=True,):
-        """
-        Plots the centers of mass for all features from each dataset, centered at (0, 0),
-        with histograms of the x and y coordinates.
+    # def plot_centers_of_mass_with_histograms(centers_data, colors, labels=None, drawConvexHull=True,
+    #                                          transparency=0.5, hist_height=0.16, bins=150,
+    #                                          alpha=0.5, density=True,):
+    #     """
+    #     Plots the centers of mass for all features from each dataset, centered at (0, 0),
+    #     with histograms of the x and y coordinates.
     
-        centers_data: The dataset with shape (n_datasets, A1, A2, n_spots, 2)
-        hist_height: Height of the histograms as a fraction of total figure height
-        """
+    #     centers_data: The dataset with shape (n_datasets, A1, A2, n_spots, 2)
+    #     hist_height: Height of the histograms as a fraction of total figure height
+    #     """
         
-        # Check data compatibility
-        assert type(drawConvexHull) is bool, "'drawConvexHull' must be a boolean (True/False) variable"
-        assert type(density) is bool, "'density' must be a boolean  (True/False) variable"
-        assert len(colors) == centers_data.shape[0], "The number of colors must match the number of datasets to plot."
-        assert all(isinstance(item, str) for item in colors), "Not all elements are strings."
+    #     # Check data compatibility
+    #     assert type(drawConvexHull) is bool, "'drawConvexHull' must be a boolean (True/False) variable"
+    #     assert type(density) is bool, "'density' must be a boolean  (True/False) variable"
+    #     assert len(colors) == centers_data.shape[0], "The number of colors must match the number of datasets to plot."
+    #     assert all(isinstance(item, str) for item in colors), "Not all elements are strings."
     
-        n_datasets = centers_data.shape[0]
+    #     n_datasets = centers_data.shape[0]
     
-        # Create the main plot
-        fig = plt.figure(figsize=(10, 10))  
-        ax_scatter = plt.axes([0.1, 0.1, 0.65, 0.65])
-        ax_histx = plt.axes([0.1, 0.75, 0.65, hist_height], sharex=ax_scatter)
-        ax_histy = plt.axes([0.75, 0.1, hist_height, 0.65], sharey=ax_scatter)
+    #     # Create the main plot
+    #     fig = plt.figure(figsize=(10, 10))  
+    #     ax_scatter = plt.axes([0.1, 0.1, 0.65, 0.65])
+    #     ax_histx = plt.axes([0.1, 0.75, 0.65, hist_height], sharex=ax_scatter)
+    #     ax_histy = plt.axes([0.75, 0.1, hist_height, 0.65], sharey=ax_scatter)
     
-        # Disable labels on histogram to prevent overlap
-        plt.setp(ax_histx.get_xticklabels(), visible=False)
-        plt.setp(ax_histy.get_yticklabels(), visible=False)
+    #     # Disable labels on histogram to prevent overlap
+    #     plt.setp(ax_histx.get_xticklabels(), visible=False)
+    #     plt.setp(ax_histy.get_yticklabels(), visible=False)
     
-        # Initialize standard deviation lists
-        std_dev_y = np.zeros(n_datasets)
-        std_dev_x = np.zeros(n_datasets)
+    #     # Initialize standard deviation lists
+    #     std_dev_y = np.zeros(n_datasets)
+    #     std_dev_x = np.zeros(n_datasets)
     
-        for i in range(n_datasets):
-            all_x_coords = []
-            all_y_coords = []
+    #     for i in range(n_datasets):
+    #         all_x_coords = []
+    #         all_y_coords = []
     
-            # Collect all coordinates from all feature indices for the current dataset
-            for feature_index in range(centers_data.shape[3]):
-                y_coords = centers_data[i, :, :, feature_index, 0].flatten()
-                x_coords = centers_data[i, :, :, feature_index, 1].flatten()
-                y_mean, x_mean = np.mean(y_coords), np.mean(x_coords)
+    #         # Collect all coordinates from all feature indices for the current dataset
+    #         for feature_index in range(centers_data.shape[3]):
+    #             y_coords = centers_data[i, :, :, feature_index, 0].flatten()
+    #             x_coords = centers_data[i, :, :, feature_index, 1].flatten()
+    #             y_mean, x_mean = np.mean(y_coords), np.mean(x_coords)
     
-                all_y_coords.extend(y_coords - y_mean)
-                all_x_coords.extend(x_coords - x_mean)
+    #             all_y_coords.extend(y_coords - y_mean)
+    #             all_x_coords.extend(x_coords - x_mean)
     
-                # Scatter plot for each feature of the dataset
-                ax_scatter.scatter(x_coords - x_mean, y_coords - y_mean, color=colors[i], alpha=transparency)
+    #             # Scatter plot for each feature of the dataset
+    #             ax_scatter.scatter(x_coords - x_mean, y_coords - y_mean, color=colors[i], alpha=transparency)
                 
-            # Calculate and store standard deviations
-            std_dev_y.append(np.std(all_y_coords))
-            std_dev_x.append(np.std(all_x_coords))
+    #         # Calculate and store standard deviations
+    #         std_dev_y.append(np.std(all_y_coords))
+    #         std_dev_x.append(np.std(all_x_coords))
                 
-            # Combine all x and y coordinates
-            combined_coords = np.column_stack((all_x_coords, all_y_coords))
+    #         # Combine all x and y coordinates
+    #         combined_coords = np.column_stack((all_x_coords, all_y_coords))
     
-            # Draw convex hull for the combined coordinates of the dataset
-            if drawConvexHull and len(combined_coords) > 2:
-                hull = ConvexHull(combined_coords)
-                for simplex in hull.simplices:
-                    ax_scatter.plot(combined_coords[simplex, 0], combined_coords[simplex, 1], color=colors[i], linewidth=2)
+    #         # Draw convex hull for the combined coordinates of the dataset
+    #         if drawConvexHull and len(combined_coords) > 2:
+    #             hull = ConvexHull(combined_coords)
+    #             for simplex in hull.simplices:
+    #                 ax_scatter.plot(combined_coords[simplex, 0], combined_coords[simplex, 1], color=colors[i], linewidth=2)
     
-            # Add label for the dataset
-            if labels is not None:
-                ax_scatter.plot([], [], color=colors[i], label=labels[i])
-            else:
-                ax_scatter.plot([], [], color=colors[i], label=f'Dataset {i+1}')
+    #         # Add label for the dataset
+    #         if labels is not None:
+    #             ax_scatter.plot([], [], color=colors[i], label=labels[i])
+    #         else:
+    #             ax_scatter.plot([], [], color=colors[i], label=f'Dataset {i+1}')
     
-            # Plot histograms
-            ax_histx.hist(all_x_coords, bins=bins, color=colors[i], alpha=alpha, 
-                          density=density, label=rf'$\sigma$ = {std_dev_x[-1]:.2f}')
-            ax_histy.hist(all_y_coords, bins=bins, color=colors[i], alpha=alpha, orientation='horizontal', 
-                          density=density, label=rf'$\sigma$ = {std_dev_y[-1]:.2f}')
+    #         # Plot histograms
+    #         ax_histx.hist(all_x_coords, bins=bins, color=colors[i], alpha=alpha, 
+    #                       density=density, label=rf'$\sigma$ = {std_dev_x[-1]:.2f}')
+    #         ax_histy.hist(all_y_coords, bins=bins, color=colors[i], alpha=alpha, orientation='horizontal', 
+    #                       density=density, label=rf'$\sigma$ = {std_dev_y[-1]:.2f}')
     
     
-        # Set labels and title for the scatter plot
-        ax_scatter.set_xlabel('kx')
-        ax_scatter.set_ylabel('ky')
-        ax_scatter.set_title('Centers of Mass with Histograms')
-        ax_scatter.legend()
+    #     # Set labels and title for the scatter plot
+    #     ax_scatter.set_xlabel('kx')
+    #     ax_scatter.set_ylabel('ky')
+    #     ax_scatter.set_title('Centers of Mass with Histograms')
+    #     ax_scatter.legend()
     
-        plt.show()
+    #     plt.show()
     
     def apply_majority_filter(cluster_map, kernel_size=3, iterations=1):
         
@@ -3143,121 +5499,7 @@ if __name__ == '__main__':
                 plotDP(average_values[i],vmin=vmin,vmax=vmax)
         
         return average_values
-    
-    def get_clusters(dataset, n_PCAcomponents, n_clusters, r_centerBeam, std_Threshold = 0.2,
-                     plotStdMask=True, plotScree=True, plotClusterMap=True, plot3dClusterMap=False, 
-                     filter_size=3, cluster_cmap=None, filter_iterations=1,outer_ring=None, polar=False):
         
-        """
-        Function that returns cluster dataset 
-        """
-        
-        assert len(dataset.shape)==4, "'dataset' must be 4-dimensional"
-        
-        # Remove center beam
-        A,B,C,D = dataset.shape
-        
-        if not polar:
-            dataset_noCenter = remove_center_beam(dataset, r_centerBeam, outer_ring=outer_ring)
-        
-        else:
-            dataset_noCenter = np.zeros_like(dataset)
-            if outer_ring is not None:
-                dataset_noCenter[:,:,r_centerBeam:outer_ring] = dataset[:,:,r_centerBeam:outer_ring]
-            else:
-                dataset_noCenter[:,:,r_centerBeam:] = dataset[:,:,r_centerBeam:]
-        
-        # Find pixels of high variation
-        dataset_stdev = get_kspace_stdDev(dataset_noCenter)
-            
-        # Create a mask where True indicates standard deviation is below the threshold
-        low_std_dev_mask = dataset_stdev < std_Threshold*np.max(dataset_stdev)
-        
-        if plotStdMask:
-            plt.imshow(low_std_dev_mask, )
-            plt.title(f'High Std. Dev. Mask, std_threshold = {std_Threshold}')
-            plt.show()
-        
-        # Initialiaze high stdev data and modify its values
-        dataset_noCenter[:, :, low_std_dev_mask] = 0  
-        
-        dataset_noCenter = dataset_noCenter.reshape(-1, C*D)
-        
-        # PCA for dimensionality reduction
-        components = n_PCAcomponents
-        pca = PCA(n_components=components)
-        data_reduced = pca.fit_transform(np.log(rem_negs(dataset_noCenter)))
-        
-        # Scree plot to find the optimal number of components
-        variance_ratios = pca.explained_variance_ratio_
-        
-        if plotScree:
-            plt.figure()
-            plt.plot(range(1, components+1), variance_ratios, marker='o')
-            plt.title("Scree Plot")
-            plt.xlabel("Principal Component")
-            plt.ylabel("Variance Explained")
-            plt.show()
-        
-        # K-means clustering
-        n_clusters = n_clusters
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0,)
-        clusters = kmeans.fit_predict(data_reduced)
-        
-        if cluster_cmap is not None:
-            colormap = plt.cm.get_cmap(cluster_cmap, n_clusters) 
-        else:
-            colormap = plt.cm.get_cmap('gnuplot', n_clusters,)
-        
-        if plot3dClusterMap:
-            # Plotting 3D
-            fig = plt.figure()
-            ax = fig.add_subplot(111, projection='3d')
-            
-            for i in range(n_clusters):
-                # Get the color for the current cluster
-                color = colormap(i)
-            
-                # Scatter plot for each cluster
-                ax.scatter(data_reduced[clusters == i, 0],
-                           data_reduced[clusters == i, 1],
-                           data_reduced[clusters == i, 2],
-                           # data_reduced[clusters == i, 3],
-                           c=[color], label=f'Cluster {i+1}', s=2, alpha=0.5)
-            
-            ax.set_xticklabels([])
-            ax.set_yticklabels([])
-            ax.set_zticklabels([])
-    
-            plt.show()
-            
-        # Plotting 2D projection
-        # Mapping back to original dimensions
-        cluster_map = clusters.reshape(A, B)
-        
-        if filter_size is not None:
-            for i in range(filter_iterations):
-                cluster_map = apply_majority_filter(cluster_map,filter_size)
-        
-        # Creating a color-coded AxB map
-        cluster_map_colored = np.zeros((A, B, 3), dtype=np.uint8)
-            
-        # Iterate over each cluster to color
-        for i in range(n_clusters):
-            # Convert color to RGB format
-            color = (np.array(colormap(i)[:3]) * 255).astype(np.uint8)
-            # Ensure proper broadcasting by using np.where
-            indices = np.where(cluster_map == i)
-            cluster_map_colored[indices] = color
-        
-        plt.figure()
-        plt.imshow(cluster_map_colored)
-        plt.title(f"Cluster Map ({A}x{B}) with {n_clusters} Clusters")
-        plt.colorbar()
-        plt.show()
-        
-        return cluster_map
-    
     def getSNR(dataset, signalMask, resBgMask, noiseMask, returnArray=False):
         """
         Return a signal-to-noise ratio (SNR) measurement for the input 4D dataset or diffraction pattern
@@ -3340,98 +5582,7 @@ if __name__ == '__main__':
             meanNoise = np.mean(Noise)
             stdNoise = np.std(Noise)
             
-            return meanNoise, stdNoise
-    
-    def remove_bg(dp, min_sigma=0.85, 
-                      max_sigma=2.5, 
-                      num_sigma=100, 
-                      threshold=85,
-                      bg_frac=0.99,
-                      mask_radial_frac=0.9,
-                      min_distance_factor=0.8,
-                      max_distance_factor=1.5,
-                      search_radius_factor=2.5, # When refining centers of mass
-                      iterations=5,
-                      n_estimators = 60, learning_rate = 0.1, max_depth = 50, # Predictor model parameters
-                      radii_multiplier=1.5, radii_slope=1.38,
-                      vmin=5,vmax=16, get_bg = True,
-                      plotAxes=False,plotInput=False,plotCenters=True,plotBg=False,plotResult=True,):
-        
-        A, B = dp.shape
-        mask = make_mask((A//2,B//2), r=(A+B)//4*mask_radial_frac) # Define region where spots are to be found
-        
-        # Extract centers and radii automatically
-        blobs_log = feature.blob_log(dp*mask, min_sigma=min_sigma, 
-                                     max_sigma=max_sigma, 
-                                     num_sigma=num_sigma, 
-                                     threshold=threshold)
-        # Unpack values
-        r_vals = blobs_log[:,2]
-        blobs_array = np.array(blobs_log[:, :2])
-    
-        # Calculate pairwise distances between blobs. The result is a square matrix.
-        distances = cdist(blobs_array, blobs_array)
-        # Set diagonal to np.inf to ignore self-comparison.
-        np.fill_diagonal(distances, np.inf)
-        # Find the distance to the nearest neighbor for each blob.
-        nearest_neighbor_dist = distances.min(axis=1)
-    
-        # Define your distance thresholds.
-        min_threshold = np.mean(np.min(distances,axis=0))*min_distance_factor  # Minimum acceptable distance to the nearest neighbor.
-        max_threshold = np.mean(np.min(distances,axis=0))*max_distance_factor  # Maximum acceptable distance to the nearest neighbor.
-    
-        # Filter blobs. Keep a blob if its nearest neighbor is neither too close nor too far.
-        filtered_indices = np.where((nearest_neighbor_dist >= min_threshold) 
-                                    & (nearest_neighbor_dist <= max_threshold)
-                                    & (((blobs_array[:,0]-A//2)**2+(blobs_array[:,1]-B//2)**2)**.5 <= (A+B)//4*mask_radial_frac*(8/9)))[0]
-    
-        # Apply filter
-        blobs_log = np.zeros((len(filtered_indices), 3))
-        blobs_log[:, :2] = blobs_array[filtered_indices]
-        blobs_log[:, 2] = r_vals[filtered_indices]
-        
-        
-        if plotCenters:
-        
-            plt.figure(figsize=(10, 10))
-            plt.imshow(np.log(dp), cmap='turbo',vmin=5,vmax=16)
-            plt.axis('off')
-        
-            # Circle around each blob
-            for blob in blobs_log:
-                y, x, r = blob
-                c = plt.Circle((x, y), r, color='red', linewidth=2, fill=False)
-                plt.gca().add_patch(c)
-        
-            plt.show()
-        
-        # Refine peak centers using CoM
-        peak_centers = getCenters(dp,r=blobs_log[:,2]*search_radius_factor,
-                                  coords=blobs_log[:,:2], iterations=iterations)
-        
-        distance_to_center = np.linalg.norm(peak_centers-(A+B)//4,axis=1)
-        radii = blobs_log[:,2]*radii_multiplier + radii_slope*(1 - distance_to_center/np.max(distance_to_center))
-        
-        if get_bg:
-            # Masks sizes are based on computed radius of spot and distance to center (center spots with greater radius than far spots)
-            dp_bg = predict_values(dp,centers=peak_centers,radius=radii,
-                                   n_estimators=n_estimators,learning_rate=learning_rate, max_depth=max_depth)
-    
-        if plotInput:
-            plotDP(dp, vmin=vmin,vmax=vmax,plotAxes=plotAxes)
-        
-        if plotBg and get_bg:
-            plotDP(dp_bg, vmin=vmin,vmax=vmax,plotAxes=plotAxes)
-    
-        if plotResult:
-            plotDP(rem_negs(dp-bg_frac*dp_bg), vmin=vmin,vmax=vmax,plotAxes=plotAxes,
-                   title=f'ne={n_estimators},learning_rate={learning_rate}, max_depth={max_depth}')
-        
-        if get_bg:
-            return peak_centers, radii, dp_bg
-        else:
-            return peak_centers, radii
-    
+            return meanNoise, stdNoise    
     
     def get_full_r_theta_transform(diff, center=None):
         
@@ -3460,7 +5611,7 @@ if __name__ == '__main__':
         # polar_diff = griddata(points, values, (x_grid, y_grid), method='cubic').reshape(theta_grid.shape)
         polar_diff = griddata(points, values, (x_grid, y_grid), method='cubic').reshape((theta_grid.shape))
     
-        return rem_negs(polar_diff.T)
+        return clip_values(polar_diff.T)
     
     def get_polar_data(dataset, center=None):
        
