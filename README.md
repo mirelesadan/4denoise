@@ -1,2 +1,2 @@
 # 4denoise
-A Python package for denoising 4D-STEM datasets.
+A Python package for processing, visualizing, and **denoising** 4D-STEM datasets.
