@@ -569,6 +569,13 @@ def unfold_tensor(tensor, unfold_domain, undo=False, original_shape=None):
     
     elif unfold_domain == 'spiral_real':
         #TODO add spiral unfolding
+        
+        if not undo:
+            
+        
+        elif undo:
+            
+        
         pass
     
     elif unfold_domain == 'spiral_reciprocal':
@@ -886,6 +893,46 @@ def apply_majority_filter(cluster_map, kernel_size=3, iterations=1):
                 filtered_map, majority_filter, footprint=footprint, mode='constant', cval=0)
 
     return filtered_map
+
+#%%
+
+def spiral_matrix(matrix, indices=True):
+    result = []
+    while matrix.size > 0:
+        # Add the first row
+        result.append(matrix[0, :])
+        matrix = matrix[1:]  # Remove the first row
+        
+        if matrix.size == 0:
+            break
+        
+        # Add the last column
+        result.append(matrix[:, -1])
+        matrix = matrix[:, :-1]  # Remove the last column
+        
+        if matrix.size == 0:
+            break
+        
+        # Add the last row reversed
+        result.append(matrix[-1, ::-1])
+        matrix = matrix[:-1]  # Remove the last row
+        
+        if matrix.size == 0:
+            break
+        
+        # Add the first column reversed
+        result.append(matrix[::-1, 0])
+        matrix = matrix[:, 1:]  # Remove the first column
+
+    return np.concatenate(result)
+
+# Example usage
+matrix = np.linspace(0,7**2-1,7**2).reshape(4,4)
+matrix = (np.random.random((5,5))*100).astype(int)
+spiral = spiral_matrix(matrix)
+print(spiral)
+# print(spiral)
+
 
 #%% Denoising Functions and Classes
 
@@ -2907,6 +2954,7 @@ class HyperData:
         
         Modified by Adan J Mireles (April, 2024)
         - Reordered dimensions (x, y) to (y, x)
+        - Modified translation from 'ky//2 + com' to '(ky-1)//2 + com'
         """
 
         y, x, ky, kx = self.shape
@@ -2916,7 +2964,7 @@ class HyperData:
         print(f'Processing {y} by {x} real-space positions...')        
         for i in tqdm(range(y), desc = 'Alignment Progress'):
             for j in range(x):
-                afine_tf = transform.AffineTransform(translation=(-ky//2+com_y[i,j], -kx//2+com_x[i,j]))
+                afine_tf = transform.AffineTransform(translation=(-(ky-1)//2 + com_y[i,j], -(kx-1)//2 + com_x[i,j]))
                 cbed_tran[i,j,:,:] = transform.warp(self.array[i,j,:,:], inverse_map=afine_tf)
                 # sys.stdout.write('\r %d,%d' % (i+1, j+1) + ' '*10)
         
@@ -3020,11 +3068,19 @@ class HyperData:
         """
         
         y, x, ky, kx = np.shape(self.array)
-        center_x = kx // 2
-        center_y = ky // 2
+        center_x = (kx-1) // 2
+        center_y = (ky-1) // 2
 
         # Assuming make_mask function is defined elsewhere that creates a circular mask
-        mask = make_mask((center_y, center_x), r_mask, mask_dim=(ky, kx))
+        if type(r_mask) == tuple:
+            inner_mask = make_mask((center_y, center_x), r_mask[0], mask_dim=(ky, kx), invert=True)
+            outer_mask = make_mask((center_y, center_x), r_mask[1], mask_dim=(ky, kx))
+            mask = np.logical_and(inner_mask, outer_mask)
+            
+        else:
+            mask = make_mask((center_y, center_x), r_mask, mask_dim=(ky, kx))
+        
+        
         
         ap2_x = np.zeros((y, x))
         ap2_y = np.zeros_like(ap2_x)
@@ -3483,8 +3539,6 @@ class HyperData:
                 if r_minor<=np.sqrt((i-C/2)**2+(j-D/2)**2)<=r_major:
                     detector_mask[i,j] = 1
         
-        masked_image = np.sum(self.array*detector_mask,axis=(2,3))
-        
         masked_image = np.sum(self.apply_annular_mask(r_minor, r_major, replacement_value=0).array, axis=(2,3))
             
         if vmin:
@@ -3581,12 +3635,12 @@ class HyperData:
         """
         
         if self.ndim >= 2:
-            ky, kx = self.shape[self.ndim-2]-1, self.shape[self.ndim-1]-1
+            ky, kx = self.shape[self.ndim-2], self.shape[self.ndim-1]
             
-            bool_mask = make_mask((ky/2, kx/2), r_inner, mask_dim=(ky+1, kx+1), invert=True)
+            bool_mask = make_mask(((ky-1)/2, (kx-1)/2), r_inner, mask_dim=(ky, kx), invert=True)
             
             if r_outer is not None:
-                outer_mask = make_mask((ky/2, kx/2), r_outer, mask_dim=(ky+1, kx+1),)
+                outer_mask = make_mask(((ky-1)/2, (kx-1)/2), r_outer, mask_dim=(ky, kx),)
                 bool_mask = np.logical_and(bool_mask, outer_mask)
             
             if replacement_value:
