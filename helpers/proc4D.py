@@ -1,9 +1,19 @@
 """
-A set of functions to process and visualize 4D-STEM data
+The 4denoise data structures:
+    - HyperData
+    - ReciprocalSpace
+    - RealSpace
+    - DenoisingMethods
+    - Denoiser
 
-Author: Adan J Mireles
-Rice University
-April 2024
+Author: 
+    Adan J Mireles
+    Smalley Curl Insitute, Applied Physics
+    Department of Materials Science and Nanoengineering
+    Rice University; Houston, TX 
+
+Date:
+    April 2024
 """
 
 if __name__ == '__main__':
@@ -21,33 +31,31 @@ import h5py
 from scipy.stats import mode
 from scipy import ndimage
 from scipy.ndimage import rotate
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks as hist_peaks
 import scipy.stats
 from scipy.ndimage import center_of_mass
 from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter
 from scipy import io
 from scipy.linalg import polar
 from scipy.fft import fft2, fftshift
 from scipy.interpolate import griddata
 from scipy.spatial.distance import cdist
 from scipy.optimize import minimize
+from scipy.optimize import curve_fit
 from scipy.ndimage import affine_transform
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from matplotlib.cm import ScalarMappable
+
 plt.rcParams['font.family'] = 'Lato'
 plt.rcParams['figure.dpi'] = 300
 plt.rcParams['savefig.dpi'] = 300
 
-# from Node_class import *
-# import helper_function as hf
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from time import perf_counter
 from tqdm import tqdm
 import time
-import xgboost as xgb
-# from genData_Direct import VectorSol_all, VectorSol_matrix
 
 from skimage.measure import profile_line
 from skimage import transform
@@ -55,7 +63,6 @@ from skimage import feature
 from skimage.restoration import denoise_nl_means, estimate_sigma, denoise_tv_chambolle
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 
 import cv2
 import inspect
@@ -63,26 +70,26 @@ import inspect
 import numba #new
 from numba import jit, prange #new
 
-from scipy.ndimage import gaussian_filter
-import tensorly as tl
+from kin_diff_sim import generate_library, get_tilts
+# import tensorly as tl
 
-from tensorly.decomposition import constrained_parafac
-from tensorly.decomposition import parafac2 as par2
-from tensorly.decomposition import tensor_ring as t_ring
-from tensorly.decomposition import tensor_train_matrix as tt_mat
-from tensorly.decomposition import tensor_train as tt
-from tensorly.decomposition import non_negative_tucker_hals as nnth
-from tensorly.decomposition import non_negative_tucker as nnt
-from tensorly.decomposition import partial_tucker as partial_tuck
-from tensorly.decomposition import tucker as tuck
-from tensorly.decomposition import randomised_parafac as rand_parafac
-from tensorly.decomposition import non_negative_parafac_hals as nn_parafac_hals
-from tensorly.decomposition import non_negative_parafac as nn_parafac
-from tensorly.decomposition import parafac as par
+# from tensorly.decomposition import constrained_parafac
+# from tensorly.decomposition import parafac2 as par2
+# from tensorly.decomposition import tensor_ring as t_ring
+# from tensorly.decomposition import tensor_train_matrix as tt_mat
+# from tensorly.decomposition import tensor_train as tt
+# from tensorly.decomposition import non_negative_tucker_hals as nnth
+# from tensorly.decomposition import non_negative_tucker as nnt
+# from tensorly.decomposition import partial_tucker as partial_tuck
+# from tensorly.decomposition import tucker as tuck
+# from tensorly.decomposition import randomised_parafac as rand_parafac
+# from tensorly.decomposition import non_negative_parafac_hals as nn_parafac_hals
+# from tensorly.decomposition import non_negative_parafac as nn_parafac
+# from tensorly.decomposition import parafac as par
 
-from tensorly.decomposition import parafac_power_iteration as parafac_power_iter
-from tensorly.decomposition import symmetric_parafac_power_iteration as sym_parafac_power_iter
-
+# from tensorly.decomposition import parafac_power_iteration as parafac_power_iter
+# from tensorly.decomposition import symmetric_parafac_power_iteration as sym_parafac_power_iter
+    
 #%%
 
 coords = [
@@ -245,21 +252,57 @@ def circular_mask(center_y, center_x, radius):
     mask = x**2 + y**2 <= radius**2
     return mask
 
-def make_mask(center, r_mask, mask_dim=(128,128), invert=False):
+def make_mask(centers, r_mask, mask_dim=(128,128), invert=False,):
     """
-    Create a 2D mask of user-defined dimensions at a defined radius from a central point
+    Create a circular or annular mask around given center points.
+
+    Generates a boolean mask of specified dimensions, marking pixels
+    within a radius or between radii from the given center point(s).
+    Optionally inverts the mask.
+
+    Parameters
+    ----------
+    center : tuple or list of tuples
+        A tuple (y, x) representing the center of the mask, or a list of such 
+        tuples for multiple centers.
+    r_mask : float or tuple of floats
+        Radius of the mask. If a tuple (inner_radius, outer_radius) is provided, 
+        an annular mask is created.
+    mask_dim : tuple of ints, optional
+        Dimensions of the mask (height, width). Default is (128, 128).
+    invert : bool, optional
+        If True, inverts the mask. Default is False.
+
+    Returns
+    -------
+    mask : np.ndarray of bool
+        The generated boolean mask.
+
+    Notes
+    -----
+    The function assumes the origin (0, 0) is at the top-left corner.
     """
 
     mask = np.zeros(mask_dim, dtype=bool)
-    y, x = center
-    for i in range(mask_dim[0]):
-        for j in range(mask_dim[1]):
-            if (i-y)**2 + (j-x)**2 <= r_mask**2:
-                mask[i,j] = True
+    centers = np.atleast_2d(np.array(centers))
     
+    # Create vertical and horizontal vectors with indices
+    y_grid, x_grid = np.ogrid[:mask_dim[0], :mask_dim[1]] 
+    
+    for center in centers:
+        y, x = center
+        
+        # Get a 2D map of all combinations of distances
+        dist_sq = (y_grid - y) ** 2 + (x_grid - x) ** 2
+        
+        if isinstance(r_mask, tuple):
+            mask |= (r_mask[0]**2 <= dist_sq) & (dist_sq <= r_mask[1]**2)
+        else:
+            mask |= dist_sq <= r_mask**2
+
     if invert:
-        mask = np.logical_not(mask)
-    
+        mask = ~mask
+
     return mask
 
 def anscombe_transform(array, inverse=False):
@@ -571,12 +614,10 @@ def unfold_tensor(tensor, unfold_domain, undo=False, original_shape=None):
         #TODO add spiral unfolding
         
         if not undo:
-            
+            pass
         
         elif undo:
-            
-        
-        pass
+            pass
     
     elif unfold_domain == 'spiral_reciprocal':
         #TODO add spiral unfolding
@@ -707,7 +748,7 @@ def plot_centers_of_mass_with_histograms(centers_data, colors, labels=None, draw
     plt.show()
 
 # Function specific to simple monolayer data
-def getStrains(spots_order, centers_data, ref_centers=None, ang=49, gs=1, plot=True, order=False):
+def get_strains(spots_order, centers_data, ref_centers=None, ang=49, gs=1, plot=True, order=False):
     """
     spots_order = 1,2,3
     """
@@ -894,9 +935,401 @@ def apply_majority_filter(cluster_map, kernel_size=3, iterations=1):
 
     return filtered_map
 
+
+def inpaint_diffraction(image, centers, radius=6):
+    """
+    Use biharmonic equations to interpolate gap regions of a 2D array.
+
+    Parameters
+    ----------
+    image : ndarray
+        Input image.
+    centers : list of tuples
+        List of center coordinates for the circles to mask.
+    radius : int, optional
+        Radius of circular regions to mask.
+
+    Returns
+    -------
+    predicted_background : ndarray
+        Image with masked pixels inpainted.
+    """
+    from skimage.restoration import inpaint_biharmonic
+    
+    def create_circular_mask(h, w, centers, radius):
+        """
+        This function creates a circular mask for a 2D array.
+        """
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for center_idx, center in enumerate(centers):
+            
+            y, x = center
+            
+            if type(radius) == np.ndarray:
+                radius = radius[center_idx]
+                
+            for i in range(h):
+                for j in range(w):
+                    if np.sqrt((i - y)**2 + (j - x)**2) <= radius:
+                        mask[i, j] = 1
+        return mask
+
+    # Generate mask for the image
+    masked_image = image.copy()
+    h, w = image.shape[:2]
+    mask = create_circular_mask(h, w, centers, radius)
+
+    # Apply biharmonic inpainting
+    inpainted_image = inpaint_biharmonic(masked_image, mask, split_into_regions=False)
+
+    return inpainted_image
+
+def sort_peaks(peak_centers, center, order_length=None):
+    """
+    Sorts peak centers by distance from a center point and optionally resorts 
+    them by angle in groups.
+
+    Parameters
+    ----------
+    peak_centers : ndarray
+        Array of shape (A, 2) containing the coordinates of the peak centers.
+    center : tuple
+        Tuple (center_y, center_x) specifying the center point for distance calculation.
+    order_length : int, optional
+        The number of elements in each group to sort based on angle after initial distance sorting.
+        If None, no secondary sorting is performed.
+
+    Returns
+    -------
+    sorted_array : ndarray
+        Array of peak centers sorted by distance and optionally resorted by angle in groups.
+    """
+    center_y, center_x = center
+
+    # Calculate distances from the center point
+    distances = np.sqrt((peak_centers[:, 0] - center_y) ** 2 + (peak_centers[:, 1] - center_x) ** 2)
+    sorted_indices = np.argsort(distances)
+    sorted_peaks = peak_centers[sorted_indices]
+
+    if order_length is not None and order_length > 1:
+        # Secondary sorting by angle within groups defined by order_length
+        num_full_groups = len(sorted_peaks) // order_length
+        resorted_array = []
+
+        for i in range(num_full_groups):
+            start_idx = i * order_length
+            end_idx = start_idx + order_length
+            subgroup = sorted_peaks[start_idx:end_idx]
+            angles = np.arctan2(subgroup[:, 1] - center_x, subgroup[:, 0] - center_y)
+            angle_indices = np.argsort(angles)
+            resorted_array.append(subgroup[angle_indices])
+
+        # Process the remaining elements
+        if len(sorted_peaks) % order_length != 0:
+            start_idx = num_full_groups * order_length
+            remaining_group = sorted_peaks[start_idx:]
+            remaining_angles = np.arctan2(remaining_group[:, 1] - center_x, remaining_group[:, 0] - center_y)
+            remaining_angle_indices = np.argsort(remaining_angles)
+            resorted_array.append(remaining_group[remaining_angle_indices])
+
+        # Concatenate all the groups back into a single array
+        sorted_peaks = np.concatenate(resorted_array, axis=0)
+
+    return sorted_peaks
+
+    
+def iterative_reconstruction(xGrad, yGrad, y_bds_flat, x_bds_flat, iterations=10, threshold_percent=5, 
+                             box_size=(3, 3), plot=True):
+    
+    """
+    Make 3D reconstruction based on xGrad and yGrad information. For each 
+    iteration, the gradient sign (without changing its magnitude) is refined 
+    for surface continuity.
+    """
+    xCorr = fix_sign_errors(xGrad, (3, 3))
+    yCorr = fix_sign_errors(yGrad, (3, 3))
+
+    for i in range(iterations):
+        # Step 1: Obtain a height map "hmap_fixed" using xGrad and yGrad
+        
+        if plot and i == iterations-1:
+            
+            plotMap(xCorr, 'X')
+            plotMap(yCorr, 'Y')
+        
+        h_map = reconFromGradDir(yCorr, xCorr, plot=False)
+        hmap_fixed = fix_tilt_and_height(h_map, y_bds_flat, x_bds_flat)
+
+        if i < iterations - 1:
+            
+            # Step 2: Obtain the gradients from the reconstructed map
+            xGrad_recon, yGrad_recon = compute_gradients(hmap_fixed)
+
+            # Compare the original, modified gradients xCorr, yCorr with xGrad_recon, yGrad_recon
+            xDiff = np.abs(xCorr - xGrad_recon)
+            yDiff = np.abs(yCorr - yGrad_recon)
+
+            # Determine threshold based on percentile
+            xThreshold = np.percentile(xDiff, 100 - threshold_percent)
+            yThreshold = np.percentile(yDiff, 100 - threshold_percent)
+
+            # Flip signs where the difference exceeds the threshold
+            xCorr[xDiff > xThreshold] *= -1
+            yCorr[yDiff > yThreshold] *= -1
+            
+            # Step 3: Fix signs of gradients using the same function as before
+            xCorr = fix_sign_errors(xCorr, box_size)
+            yCorr = fix_sign_errors(yCorr, box_size)
+    
+    
+    if plot: 
+        # Finally, plot the resulting height map after all iterations
+        plotMap(hmap_fixed, title="Iterated Height Map",
+                legendtitle="Height \n (px)")
+        
+        return hmap_fixed, xCorr, yCorr
+        
+    else: 
+        
+        return hmap_fixed
+
+def fix_sign_errors(img, window_shape=(3, 3)):
+    
+    # Ensure both dimensions of window_shape are odd for center pixel calculation
+    if any(dim % 2 == 0 for dim in window_shape):
+        raise ValueError("Both dimensions of window_shape must be odd.")
+
+    # Create a copy of the original image to store the corrected values.
+    corrected_img = np.copy(img)
+
+    # Calculate the margins
+    margin_y = window_shape[0] // 2
+    margin_x = window_shape[1] // 2
+
+    # Get the dimensions of the image.
+    rows, cols = img.shape
+
+    # Slide through the image using the specified window.
+    for i in range(margin_y, rows-margin_y):
+        for j in range(margin_x, cols-margin_x):
+            
+            # Extract the neighborhood.
+            window = img[i-margin_y:i+margin_y+1, j-margin_x:j+margin_x+1]
+
+            # Check the sign of the center pixel.
+            center_val = img[i, j]
+
+            # If the sign of the sum of the window and the center pixel are different, flip the sign.
+            # if np.sign(np.sum(window)) != np.sign(center_val):
+            if np.sign(np.median(window)) != np.sign(center_val):
+                corrected_img[i, j] *= -1
+
+    return corrected_img
+
+def reconFromGradDir(grad_x, grad_y, im_height=None, plot=True):
+    
+    """
+    Function based on MATLAB code written by Colin Ophus (MM/YYYY)
+    """
+    
+    padding = 2  # padding of reconstruction space
+    qMin = 0.00  # min spatial frequency in 1/pixels
+    qMax = 0.25  # max spatial frequency in 1/pixels
+    num_iter = 50
+    step_size = 0.99
+
+    # Coordinates
+    im_size = grad_x.shape
+    N = tuple(s * padding for s in im_size)
+    qxa, qya = makeFourierCoords(N, 1)
+    q2a = qxa**2 + qya**2
+
+    # Operators
+    q2inv = np.reciprocal(q2a)
+    q2inv[0, 0] = 0
+    qFilt = np.exp(q2a / (-2 * qMax**2))
+    if qMin > 0:
+        qFilt = qFilt * (1 - np.exp(q2a / (-2 * qMin**2)))
+    qxOp = (-1j / 4) * qxa * q2inv * qFilt
+    qyOp = (-1j / 4) * qya * q2inv * qFilt
+
+    # Normalize the gradients
+    grad_x = grad_x - np.median(grad_x)
+    grad_y = grad_y - np.median(grad_y)
+
+    # Mask updates
+    vx = np.arange(im_size[0])
+    vy = np.arange(im_size[1])
+    mask = np.zeros(N, dtype=bool)
+    mask[np.ix_(vx, vy)] = True
+    mask_inv = ~mask
+
+    # Reconstruct height
+    recon_height = np.zeros(N)
+    for a0 in range(num_iter):
+        grad_x_recon = (np.roll(recon_height, shift=-1, axis=0) -
+                        np.roll(recon_height, shift=1, axis=0)) / 2
+        grad_y_recon = (np.roll(recon_height, shift=-1, axis=1) -
+                        np.roll(recon_height, shift=1, axis=1)) / 2
+
+        # Difference and masking
+        grad_x_recon[mask] = grad_x_recon[mask] - grad_x.ravel()
+        grad_y_recon[mask] = grad_y_recon[mask] - grad_y.ravel()
+        grad_x_recon[mask_inv] = 0
+        grad_y_recon[mask_inv] = 0
+
+        recon_update = np.fft.ifft2(
+            np.fft.fft2(grad_x_recon) * qxOp +
+            np.fft.fft2(grad_y_recon) * qyOp
+        ).real
+
+        recon_height -= step_size * recon_update
+
+    # Crop
+    recon_height = recon_height[np.ix_(vx, vy)]
+
+    # Plotting
+    if plot:
+        plt.figure(11)
+        plt.clf()
+        ax = plt.gca()
+        Ip1 = recon_height - np.median(recon_height)
+        if im_height is None:
+            im = ax.imshow(Ip1, cmap='turbo')
+        else:
+            Ip2 = im_height - np.median(im_height)
+            im = ax.imshow(np.hstack((Ip1, Ip2)), cmap='turbo')
+
+        plt.axis('equal')
+        plt.axis('off')
+
+        # Adjust the colorbar to have the same height as the image
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        plt.colorbar(im, cax=cax)
+        plt.show()
+
+    return recon_height
+
+def makeFourierCoords(size, spacing):
+    """
+    This function is based on MATLAB code written by Colin Ophus (MM/YYYY).
+    """
+    nx, ny = size
+    qx = np.fft.fftfreq(nx, spacing)
+    qy = np.fft.fftfreq(ny, spacing)
+    qxa, qya = np.meshgrid(qx, qy, indexing='ij')
+    return qxa, qya
+
+def fix_tilt_and_height(height_map, y_bds, x_bds):
+    """
+    Helper function to perform linear regression and return the slope
+    """
+    def get_slope(ave_height):
+        x = np.arange(ave_height.size)
+        A = np.vstack([x, np.ones_like(x)]).T
+        slope, _ = np.linalg.lstsq(A, ave_height, rcond=None)[0]
+        return slope
+
+    # 1. Linear regression for x-axis and adjust tilt
+    ave_height_x = np.mean(height_map, axis=0)
+    slope_x = get_slope(ave_height_x)
+    height_map = rotate_height(
+        height_map, np.arctan(slope_x) * 180 / np.pi, axis='x')
+
+    # 2. Linear regression for y-axis and adjust tilt
+    ave_height_y = np.mean(height_map, axis=1)
+    slope_y = get_slope(ave_height_y)
+    height_map = rotate_height(
+        height_map, np.arctan(slope_y) * 180 / np.pi, axis='y')
+
+    # 3. Adjust the average height based on a chosen region
+    height_map = height_map - np.mean(height_map[y_bds[0]:y_bds[1], x_bds[0]:x_bds[1]])
+
+    return height_map
+
+def compute_gradients(height_map):
+    """
+    Compute gradients given a 3D map
+    """
+    assert len(height_map.shape) == 2,'The height map must be 2-dimensional'
+    
+    # Initialize the gradient maps with zeros
+    xGrad_recon = np.zeros_like(height_map)
+    yGrad_recon = np.zeros_like(height_map)
+
+    # Compute x-gradient using center pixel (exclude 1st and last columns)
+    xGrad_recon[:, 1:-1] = (height_map[:, 2:] - height_map[:, :-2]) / 2
+    # Copy the gradient for the edge columns
+    xGrad_recon[:, 0] = xGrad_recon[:, 1]
+    xGrad_recon[:, -1] = xGrad_recon[:, -2]
+
+    # Compute y-gradient using center pixel (exclude 1st and last rows)
+    yGrad_recon[1:-1, :] = (height_map[2:, :] - height_map[:-2, :]) / 2
+    # Copy the gradient for the edge rows
+    yGrad_recon[0, :] = yGrad_recon[1, :]
+    yGrad_recon[-1, :] = yGrad_recon[-2, :]
+
+    return xGrad_recon, yGrad_recon  
+
+def rotate_height(height, angle, axis='x'):
+    """Rotate the height map based on the specified axis and angle.
+
+    Parameters:
+    - height: 2D numpy array representing the height map.
+    - angle: float, rotation angle in degrees.
+    - axis: str, 'x' for x-axis rotation, 'y' for y-axis rotation.
+
+    Returns:
+    - 2D numpy array representing the rotated height map.
+    """
+
+    shape_array = np.shape(height)
+
+    if axis == 'x':
+        i_values = np.arange(shape_array[1])
+        adjustment = i_values * np.tan(angle * np.pi / 180)
+        height_rot = height[:, :shape_array[1]] - adjustment
+    elif axis == 'y':
+        i_values = np.arange(shape_array[0])
+        adjustment = i_values * np.tan(angle * np.pi / 180)
+        height_rot = height[:shape_array[0], :] - adjustment[:, np.newaxis]
+
+    return height_rot
+
 #%%
 
-def spiral_matrix(matrix, indices=True):
+def spiral_matrix(matrix, return_indices=True):
+    """
+    Extract elements from a 2D NumPy array in a spiral order or returns the flat indices of the spiral order.
+    
+    Parameters
+    ----------
+    matrix : numpy.ndarray
+        The 2D array from which to extract elements in a spiral order.
+    indices : bool, optional
+        If True, returns the flat indices of the elements in spiral order.
+        If False, returns the elements themselves.
+    
+    Returns
+    -------
+    numpy.ndarray
+        An array of values or indices in spiral order.
+    
+    Examples
+    --------
+    >>> matrix = np.array([[10, 20], [30, 40]])
+    >>> spiral_matrix(matrix, indices=False)
+    array([10, 20, 40, 30])
+    >>> spiral_matrix(matrix, indices=True)
+    array([0, 1, 3, 2])
+    
+    Notes
+    -----
+    This function assumes the input matrix is 2D and at least 1x1 in size. The indices are computed relative to the flattened matrix.
+    """
+    
+    
     result = []
     while matrix.size > 0:
         # Add the first row
@@ -926,13 +1359,1606 @@ def spiral_matrix(matrix, indices=True):
 
     return np.concatenate(result)
 
-# Example usage
-matrix = np.linspace(0,7**2-1,7**2).reshape(4,4)
-matrix = (np.random.random((5,5))*100).astype(int)
-spiral = spiral_matrix(matrix)
-print(spiral)
+# # Example usage
+# matrix = np.linspace(0,7**2-1,7**2).reshape(7,7)
+# # matrix = (np.random.random((5,5))*100).astype(int)
+# spiral = spiral_matrix(matrix)
 # print(spiral)
+# # print(spiral)
 
+def gradient_ascent(data, start, learning_rate=0.1, max_iters=100):
+    y, x = start
+    for i in range(max_iters):
+        grad_y, grad_x = np.gradient(data)
+        y += learning_rate * grad_y[int(y), int(x)]
+        x += learning_rate * grad_x[int(y), int(x)]
+        if grad_y[int(y), int(x)] == 0 and grad_x[int(y), int(x)] == 0:
+            break
+    return y, x
+
+# Gaussian fitting
+def gaussian_2d(xdata, y0, x0, yalpha, xalpha, amplitude, offset):
+    y, x = xdata
+    return offset + amplitude * np.exp(
+        -(((y - y0) ** 2 / (2 * yalpha ** 2)) + ((x - x0) ** 2 / (2 * xalpha ** 2)))
+    )
+
+def fit_gaussian_2d(data):
+    x = np.arange(data.shape[1])
+    y = np.arange(data.shape[0])
+    x, y = np.meshgrid(x, y)
+    xdata = np.vstack((y.ravel(), x.ravel()))
+    initial_guess = (data.shape[0]//2, data.shape[1]//2, 1, 1, data.max(), 0)
+    popt, _ = curve_fit(gaussian_2d, xdata, data.ravel(), p0=initial_guess)
+    return popt[0], popt[1]
+
+# Elliptical Gaussian fitting
+def elliptical_gaussian_2d(xdata, y0, x0, yalpha, xalpha, theta, amplitude, offset):
+    y, x = xdata
+    a = (np.cos(theta)**2 / (2 * xalpha**2)) + (np.sin(theta)**2 / (2 * yalpha**2))
+    b = -(np.sin(2*theta) / (4 * xalpha**2)) + (np.sin(2*theta) / (4 * yalpha**2))
+    c = (np.sin(theta)**2 / (2 * xalpha**2)) + (np.cos(theta)**2 / (2 * yalpha**2))
+    return offset + amplitude * np.exp(-(a * ((x - x0)**2) + 2 * b * (x - x0) * (y - y0) + c * ((y - y0)**2)))
+
+def fit_elliptical_gaussian_2d(data):
+    x = np.arange(data.shape[1])
+    y = np.arange(data.shape[0])
+    x, y = np.meshgrid(x, y)
+    xdata = np.vstack((y.ravel(), x.ravel()))
+    initial_guess = (data.shape[0]//2, data.shape[1]//2, 1, 1, 0, data.max(), 0)
+    popt, _ = curve_fit(elliptical_gaussian_2d, xdata, data.ravel(), p0=initial_guess)
+    return popt[0], popt[1]
+
+def mask_corrupted_pixels(arr, threshold=3, window_size=3):
+    """
+    Identify and mask corrupted pixels in a 2D array based on a threshold difference
+    from the neighboring area, which is defined by the window size.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        The input 2D array.
+    threshold : float, optional
+        The threshold difference to identify corrupted pixels. A pixel is considered
+        corrupted if its value differs from the mean of its neighbors by more than
+        this threshold. Default is 3.
+    window_size : int, optional
+        The size of the window used to define the neighboring area around each pixel.
+        Must be an odd integer. Default is 3.
+
+    Returns
+    -------
+    mask : np.ndarray
+        A 2D boolean array where `True` indicates a corrupted pixel.
+    """
+    if window_size % 2 == 0:
+        raise ValueError("window_size must be an odd integer.")
+    
+    # Initialize the mask with False
+    mask = np.zeros_like(arr, dtype=bool)
+    
+    # Calculate the offset based on the window size
+    offset = window_size // 2
+    
+    # Get the dimensions of the array
+    rows, cols = arr.shape
+    
+    # Iterate over each pixel (excluding the border pixels)
+    for i in range(offset, rows - offset):
+        for j in range(offset, cols - offset):
+            # Extract the pixel's neighboring area based on the window size
+            neighbors = arr[i-offset:i+offset+1, j-offset:j+offset+1]
+            neighbors_mean = np.std(neighbors)
+            
+            # Calculate the difference between the pixel and the mean of its neighbors
+            if np.abs(arr[i, j] - neighbors_mean) > threshold:
+                mask[i, j] = True
+                
+    return mask
+
+def get_gradients(sol_array, rot_angle=0):
+    """
+    Get directional gradient from solution array (phi, theta). The function 
+    assumes the solution array is of shape (rows, cols, 2).
+    """
+
+    # Adjust phi by the rotation angle
+    phi = sol_array[:, :, 0] - rot_angle*np.pi/180
+    theta = sol_array[:, :, 1]
+
+    # Compute gradients
+    dzdy = np.tan(theta) * np.cos(phi)
+    dzdx = np.tan(theta) * np.sin(phi)
+
+    # Stack gradients
+    array_gradients = np.stack((dzdx, dzdy), axis=-1)
+
+    return array_gradients
+
+#%% The main 4D-STEM object
+
+class HyperData:
+    
+    def __init__(self, data):
+        
+        # Read dataset from file path if input object is string
+        if type(data) == str:
+            data = read_4D(data)
+        
+        self.array = data
+        self.ndim = data.ndim
+        self.shape = data.shape
+        self.real_shape = (data.shape[0], data.shape[1])
+        self.k_shape = (data.shape[2], data.shape[3])
+        self.dtype = data.dtype
+        self.denoiser = Denoiser(self.array)
+
+
+    def swap_domains(self):
+        """
+        Swap the real space and reciprocal space coordinates in the 4D dataset.
+        For a dataset with dimensions (A, B, C, D),
+        this method swaps them to (C, D, A, B).
+        
+        Returns:
+        - swapped_data (numpy.ndarray): The 4D dataset with swapped dimensions.
+        """
+        
+        # The original order is (0, 1, 2, 3) and we want to change to (2, 3, 0, 1)
+        swapped_data = np.transpose(self.array, (2, 3, 0, 1))
+        
+        return HyperData(swapped_data)
+    
+    
+    def alignment(self, r_mask=5, iterations=1, returnStats=False):
+        """
+        Align the diffraction patterns through the Center of mass of the center beam
+        
+        Function written by Chuqiao Shi (2022)
+        See on GitHub: Chuqiao2333/Hierarchical_Clustering
+        
+        Modified by Adan J Mireles (April, 2024)
+        - Reordered dimensions (x, y) to (y, x)
+        - Modified translation from 'ky//2 + com' to '(ky-1)//2 + com'
+        """
+
+        y, x, ky, kx = self.shape
+        com_y, com_x = self._quickCOM(r_mask=r_mask) 
+        cbed_tran = np.copy(self.array)
+        std_com = (np.std(com_y), np.std(com_x))
+        mean_com = (np.mean(com_y), np.mean(com_x))
+        
+        print(f'Initial standard deviation statistics (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
+        print(f'Initial COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
+        
+        for idx in range(iterations):
+            print()
+            print(f'Processing {y} by {x} real-space positions. Iteration ({idx+1}/{iterations})...')        
+            for i in tqdm(range(y), desc = 'Alignment Progress'):
+                for j in range(x):
+                    afine_tf = transform.AffineTransform(translation=(-(ky-1)//2 + com_y[i,j], -(kx-1)//2 + com_x[i,j]))
+                    cbed_tran[i,j,:,:] = transform.warp(cbed_tran[i,j,:,:], inverse_map=afine_tf)
+        
+            cbed_tran_Obj = HyperData(cbed_tran)
+            com_y, com_x = cbed_tran_Obj._quickCOM()
+            std_com = (np.std(com_y), np.std(com_x))
+            mean_com = (np.mean(com_y), np.mean(com_x))
+            
+            print(f'Standard deviation statistics (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
+            print(f'COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
+        
+        if returnStats:
+            return cbed_tran_Obj, mean_com, std_com
+        else:
+            return cbed_tran_Obj
+    
+    
+    def rotate_dps(self, angle, units='deg'):
+        """
+        Rotate clockwise all diffraction patterns by angle in degrees
+        """
+        
+        if units == 'rad':
+            angle = np.degrees(angle)
+        
+        if self.ndim == 4:
+            y, x, ky, kx = self.shape
+            
+            new_data = np.zeros((y, x, ky, kx), dtype=self.dtype)
+            
+            for y_idx in tqdm(range(y), desc = 'Rotating Diffraction Patterns'):
+                for x_idx in range(x):
+                    new_data[y_idx, x_idx] = rotate(self.array[y_idx, x_idx], angle)
+    
+    
+    def standardize(self):
+        """
+        Standardize a 4D dataset using NumPy.
+                
+        Returns
+        -------
+        standardized_tensor : ndarray
+            The standardized 4D tensor with zero mean and unit variance.
+        """
+        # Calculate the mean and standard deviation along the last dimension
+        mean = np.mean(self.array, keepdims=True)
+        std = np.std(self.array, keepdims=True)
+        
+        # Standardize the tensor
+        standardized_tensor = (self.array - mean) / std
+        
+        return HyperData(standardized_tensor)
+        
+    
+    def normalize(self):
+        """
+        Normalize a 4D dataset to the range [0, 1] using NumPy.
+                
+        Returns
+        -------
+        normalized_tensor : ndarray
+            The normalized 4D tensor with values in the range [0, 1].
+        """
+        # Calculate the minimum and maximum values along the last dimension
+        min_val = np.min(self.array, keepdims=True)
+        max_val = np.max(self.array, keepdims=True)
+        
+        # Normalize the tensor
+        normalized_tensor = (self.array - min_val) / (max_val - min_val)
+        
+        return HyperData(normalized_tensor)
+    
+    
+    def clip(self, a_min=1, a_max=None):
+        """
+        
+        """
+        
+        return HyperData(clip_values(self.array, a_min, a_max))
+    
+        
+    def crop(self, ylim=None, xlim=None, kylim=None, kxlim=None):
+        """
+        Crop a 4D dataset either in the real or the reciprocal domain.
+    
+        Parameters
+        ----------
+        ylim : int or tuple, optional
+            The vertical real-space limits to be used for cropping. If int, a single row at that index;
+            if tuple, defines the start and end indices (inclusive); if None, all rows are included.
+        xlim : int or tuple, optional
+            The horizontal real-space limits to be used for cropping. If int, a single column at that index;
+            if tuple, defines the start and end indices (inclusive); if None, all columns are included.
+        kylim : int or tuple, optional
+            The vertical reciprocal-space limits to be used for cropping. If int, a single row at that index;
+            if tuple, defines the start and end indices (inclusive); if None, all rows are included.
+        kxlim : int or tuple, optional
+            The horizontal reciprocal-space limits to be used for cropping. If int, a single column at that index;
+            if tuple, defines the start and end indices (inclusive); if None, all columns are included.
+        """
+        
+        # Helper function to parse limits
+        def parse_limits(limits, max_length):
+            if limits is None:
+                return slice(None)  # all elements
+            elif isinstance(limits, int):
+                if limits < 0 or limits >= max_length:
+                    raise ValueError("Index out of bounds")
+                return slice(limits, limits + 1)  # single element to a slice
+            elif isinstance(limits, tuple):
+                start, end = limits
+                if start < 0 or end >= max_length or start > end:
+                    raise ValueError("Invalid slice range or out of bounds")
+                return slice(start, end + 1)  # add 1 because the end is exclusive
+            else:
+                raise ValueError("Limits should be either int or tuple of two ints")
+    
+        # Parse each set of limits
+        ylim_slice = parse_limits(ylim, self.shape[0])
+        xlim_slice = parse_limits(xlim, self.shape[1])
+        kylim_slice = parse_limits(kylim, self.shape[2])
+        kxlim_slice = parse_limits(kxlim, self.shape[3])
+    
+        return HyperData(self.array[ylim_slice, xlim_slice, kylim_slice, kxlim_slice])
+        
+    
+    # Private method: helper function for the 'alignment' method
+    def _quickCOM(self, r_mask=5):
+        """
+        Compute the center of mass (COM) of electron diffraction patterns within a 
+        4D-STEM dataset.
+        
+        Function based on that written by Chuqiao Shi (2022)
+        See on GitHub: Chuqiao2333/Hierarchical_Clustering
+        
+        Inputs:
+            cbed_data: 4D numpy array
+            r_mask   : radius of mask used for COM calculation (int or float) 
+        Outputs:
+            ap2_y, ap2_x : numpy arrays containing the x and y coordinates of the 
+            centers of mass for each position in the real-space grid.
+        """
+        
+        y, x, ky, kx = np.shape(self.array)
+        center_x = (kx-1) // 2
+        center_y = (ky-1) // 2
+
+        # Assuming make_mask function is defined elsewhere that creates a circular mask
+        if type(r_mask) == tuple:
+            inner_mask = make_mask((center_y, center_x), r_mask[0], mask_dim=(ky, kx), invert=True)
+            outer_mask = make_mask((center_y, center_x), r_mask[1], mask_dim=(ky, kx))
+            mask = np.logical_and(inner_mask, outer_mask)
+            
+        else:
+            mask = make_mask((center_y, center_x), r_mask, mask_dim=(ky, kx))
+        
+        ap2_x = np.zeros((y, x))
+        ap2_y = np.zeros_like(ap2_x)
+        vx = np.arange(kx)
+        vy = np.arange(ky)
+
+        for i in tqdm(range(y), desc = 'Computing centers of mass'):
+            for j in range(x):
+                cbed = np.squeeze(self.array[i, j, :, :] * mask)
+                pnorm = np.sum(cbed)
+                if pnorm != 0:
+                    ap2_y[i, j] = np.sum(vy * np.sum(cbed, axis=0)) / pnorm
+                    ap2_x[i, j] = np.sum(vx * np.sum(cbed, axis=1)) / pnorm
+
+        return ap2_y, ap2_x
+    
+    # Must add type of interpolation
+    def fix_elliptical_distortions(self, r=None, R=None, interp_method='linear', 
+                                   show_ellipse=False, return_fix=True, **kwargs):
+        """
+        Corrects elliptical distortions across all diffraction patterns in the dataset.
+    
+        This function computes the average diffraction pattern, fits an ellipse to this average,
+        and applies an affine transformation to each diffraction pattern (by transforming the 
+        ellipse into a circle) to correct the elliptical distortion.
+        
+        Parameters
+        ----------
+        r : int, optional
+            Inner radius of the annular mask. Defaults to one fifth of the diffraction pattern's horizontal dimension if not specified.
+        R : int, optional
+            Outer radius of the annular mask. Defaults to two fifths of the diffraction pattern's horizontal dimension if not specified.
+        interp_method : str, optional
+            Interpolation method to use during affine transformations. Can be 'linear' or 'cubic'.
+        show_ellipse : bool, optional
+            Plots the mean diffraction pattern in the dataset with an overlaid ring of inner radius r and outer radius R. If return_fix 
+            is False, it plots the ring in the non-corrected pattern. Otherwise, it plots it in the corrected pattern.
+        
+        Returns
+        -------
+        HyperData
+            A new instance of HyperData containing the corrected data.
+    
+        Example
+        --------
+        >>> hyperdata_instance = HyperData(data)
+        >>> corrected_data_instance = hyperdata_instance.fix_elliptical_distortions(r=20, R=40, interp_method='cubic')
+        
+        Notes
+        -----
+        This method must be applied after applying the 'alignment' method for better accuracy.
+        """
+        
+        A, B, C, D = self.shape
+        
+        if not r:
+            r = C//5 
+        if not R:
+            R = 2*C//5
+        
+        mean_pattern = self.get_dp('mean').array
+        params = self._extract_ellipse(mean_pattern, C//2, D//2, r, R)
+        corrected_data = np.empty_like(self.array)
+        
+        Ang, a, b = params 
+        print("Ellptical statistics before correction:")
+        print(f"Ellipse rotation = {np.degrees(Ang)} degrees \nMajor axis 'a' = {a} px \nMinor axis 'b' = {b} px \n")
+        
+        if show_ellipse:
+            self._plot_with_ring(np.log(mean_pattern), r, R, **kwargs)
+        
+        # Perform Correction
+        for i in range(A):
+            for j in range(B):
+                corrected_data[i, j] = self._apply_affine_transformation(self.array[i, j], *params, interp_method)
+        
+        corrected_data = HyperData(corrected_data)
+        
+        mean_pattern = corrected_data.get_dp('mean').array
+        params = corrected_data._extract_ellipse(mean_pattern, C//2, D//2, r, R)
+        
+        Ang, a, b = params 
+        print("Ellptical statistics after correction:")
+        print(f"Ellipse rotation = {np.degrees(Ang)} degrees \nMajor axis 'a' = {a} px \nMinor axis 'b' = {b} px \n")
+        
+        if show_ellipse:
+            self._plot_with_ring(np.log(mean_pattern), r, R, **kwargs)
+        
+        return corrected_data
+
+
+    def _extract_ellipse(self, image, cy, cx, r, R):
+        """
+        Fit an ellipse to an annular region of an image (diffraction pattern).
+    
+        The function calculates parameters for the ellipse that best fits the specified annular region
+        of the mean diffraction pattern. These parameters are optimized to minimize the defined cost function.
+    
+        Parameters
+        ----------
+        image : numpy.ndarray
+            The mean diffraction pattern as a 2D numpy array.
+        cy : int
+            The y-coordinate of the center of the diffraction pattern.
+        cx : int
+            The x-coordinate of the center of the diffraction pattern.
+        r : int
+            Inner radius for the annular mask.
+        R : int
+            Outer radius for the annular mask.
+    
+        Returns
+        -------
+        tuple
+            A tuple of fitted ellipse parameters (A, a, b), where A is the rotation angle,
+            a is the length of the major axis, and b is the length of the minor axis.
+        """
+        y, x = np.indices(image.shape)  # Get array indices for the entire image
+        mask = ((x - cx)**2 + (y - cy)**2 >= r**2) & ((x - cx)**2 + (y - cy)**2 <= R**2)
+        x_vals, y_vals = x[mask], y[mask]  # Get the coordinates within the mask
+        intensities = image[mask]  # Get the intensities at these coordinates
+
+        def ellipse_cost(params):
+            A, a, b = params
+            cost = intensities**4 * (((x_vals - cx) * np.cos(A) + (y_vals - cy) * np.sin(A))**2 / a**2 +
+                                  ((y_vals - cy) * np.cos(A) - (x_vals - cx) * np.sin(A))**2 / b**2 - 1)**2
+            return np.sum(cost)
+
+        initial_guess = [0, (R-r)/2 + 1, (R-r)/2 - 1]  # Initial guess for A, a, b
+        result = minimize(ellipse_cost, initial_guess, method='L-BFGS-B')
+        return result.x
+
+
+    def _apply_affine_transformation(self, image, A, a, b, interp_method):
+        """
+        Apply an affine transformation to make the fitted ellipse a circle.
+
+        Parameters
+        ----------
+        image : numpy.ndarray
+            The 2D diffraction pattern to correct.
+        A : float
+            The angle of rotation of the ellipse.
+        a : float
+            The length of the major axis.
+        b : float
+            The length of the minor axis.
+
+        Returns
+        -------
+        numpy.ndarray
+            The corrected diffraction pattern.
+        """
+        cols, rows = image.shape
+        
+        # Points in the original image
+        p1 = np.float32([
+            [a * np.cos(A) + cols//2, a * np.sin(A) + rows//2],
+            [-a * np.cos(A) + cols//2, -a * np.sin(A) + rows//2],
+            [b * np.sin(A) + cols//2, -b * np.cos(A) + rows//2]
+        ])
+        
+        # Depending on whether a or b is larger, set the corresponding points in the corrected image
+        # This ensures that the affine transformation results in expansion rather than shrinkage of the
+        # transformed diffraction pattern.
+        if a < b:
+            p2 = np.float32([
+                [b * np.cos(A) + cols//2, b * np.sin(A) + rows//2],
+                [-b * np.cos(A) + cols//2, -b * np.sin(A) + rows//2],
+                [b * np.sin(A) + cols//2, -b * np.cos(A) + rows//2]
+            ])
+        else:
+            p2 = np.float32([
+                [a * np.cos(A) + cols//2, a * np.sin(A) + rows//2],
+                [-a * np.cos(A) + cols//2, -a * np.sin(A) + rows//2],
+                [a * np.sin(A) + cols//2, -a * np.cos(A) + rows//2]
+            ])
+            
+        M = cv2.getAffineTransform(p1, p2)
+        
+        if interp_method == 'cubic':
+            transformed_image = cv2.warpAffine(image, M, (cols, rows), flags=cv2.INTER_CUBIC)
+            
+        if interp_method == 'linear':
+            transformed_image = cv2.warpAffine(image, M, (cols, rows), flags=cv2.INTER_LINEAR)
+
+        return transformed_image
+    
+    
+    def _plot_with_ring(self, data, inner_radius, outer_radius, **kwargs):
+        """
+        Plots a 2D array with an overlaid red ring directly on the same figure.
+        
+        Parameters
+        ----------
+        data : numpy.ndarray
+            The 2D array to plot.
+        inner_radius : float
+            The inner radius of the ring.
+        outer_radius : float
+            The outer radius of the ring.
+        """
+        # Create a figure and axis
+        fig, ax = plt.subplots()
+        
+        # Generate a grid of points
+        y, x = np.indices(data.shape)
+        center_x, center_y = np.array(data.shape) // 2
+        
+        # Calculate the radius for each point in the grid
+        radius = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+        
+        # Create a mask for the ring
+        ring_mask = (radius >= inner_radius) & (radius <= outer_radius)
+        
+        # Create a colored overlay where the ring is red
+        ring_overlay = np.zeros(data.shape + (4,), dtype=np.float32)  # Adding a new dimension for RGBA
+        ring_overlay[..., 0] = 1  # Red channel
+        ring_overlay[..., 3] = ring_mask * 1.0  # Alpha channel only set where the ring is
+        
+        # Display the image
+        ax.imshow(data, **kwargs)
+        ax.imshow(ring_overlay, cmap='hot', alpha=0.5) 
+        
+        # Set plot details
+        ax.set_title('Mean diffraciton with annular overlay')
+        ax.axis('off')
+        
+        plt.show()
+    
+
+    def centerBeam_Stats(self, square_side=8):
+        """
+        Analyze diffraction patterns to find the mean and standard deviation of 
+        the center of mass.
+    
+        Parameters:
+        data (numpy.ndarray): 4D dataset of shape (A, B, C, D).
+        square_side (int): Side length of the square used to calculate the 
+        center of mass.
+    
+        Returns:
+        tuple: Mean and standard deviation of the center of mass coordinates.
+        """
+        A, B, C, D = self.shape
+        com_coordinates = []
+    
+        # Define the region for center of mass calculation
+        half_side = square_side // 2
+        center = C//2
+        min_coord, max_coord = center - half_side, center + half_side
+    
+        # Calculate center of mass for each BxB image
+        for i in range(A):
+            for j in range(B):
+                region = self.array[i, j, min_coord:max_coord, min_coord:max_coord]
+                com = center_of_mass(region)
+                com_coordinates.append((com[0] + min_coord, com[1] + min_coord))
+    
+        # Convert to numpy array for ease of calculation
+        com_coordinates = np.array(com_coordinates)
+    
+        # Calculate mean and standard deviation
+        mean_com = np.mean(com_coordinates, axis=0)
+        std_dev_com = np.std(com_coordinates, axis=0)
+    
+        print(f"Mean CoM Coordinate (ky, kx): {mean_com}")
+        print(f"Standard Deviation of CoM Coordinates (ky, kx): {std_dev_com} px")
+    
+        return mean_com, std_dev_com
+    
+    
+    def get_stdDev(self, domain='reciprocal'):
+        """
+        Calculate a 2D mask of the standard deviation of each pixel across the
+        specified domain (real or reciprocal).
+
+        Parameters:
+        domain (string): the domain for which the standard deviation will be
+        computer for each position.
+
+        Returns:
+        numpy array: 2D mask of standard deviations with same shape as specified domain.
+        """
+        # Validate the shape of the data
+        if len(self.array.shape) != 4:
+            raise ValueError("Data must be a 4D array")
+                
+        if domain == 'reciprocal':
+            # Calculate the standard deviation for each pixel across all diffraction patterns
+            std_dev = np.std(self.array, axis=(0, 1))
+        elif domain == 'real':
+            # Calculate the standard deviation for each pixel across all scanning positions
+            std_dev = np.std(self.array, axis=(2, 3))
+        else:
+            raise ValueError("'domain' must be 'reciprocal' or 'real'")
+            
+        return ReciprocalSpace(std_dev)
+    
+    
+    def get_dp(self, y=None, x=None, real_mask=None, reciprocal_mask=None):
+        """
+        Obtain a diffraction pattern from a specific 4D dataset, either at a 
+        specific point, averaged over a specified region, or a special diffraction
+        such as the dataset's 'mean', 'median', 'max', etc..
+        
+        Inputs:
+            y: (tuple of int, int, or string) If tuple (ymin, ymax), it 
+               specifies the vertical coordinate range to average over. If int,
+               it specifies a specific vertical coordinate. If string, 'y' must 
+               be one of the operations in 'operations' and returns the corresponding
+               special diffraction pattern such as the 'mean', 'median', etc.
+            x: (tuple of int or int, optional) If tuple (xmin, xmax), it 
+               specifies the horizontal coordinate range to average over. If 
+               int, it specifies a specific horizontal coordinate.
+        
+        Returns: 
+            dp: (numpy array) Diffraction pattern, either at a specific point, 
+            averaged over a region, or some other special diffraction.
+        
+        Raises:
+            ValueError: If inputs are improperly specified or not provided.
+        """
+        
+        if real_mask is not None or reciprocal_mask is not None:
+            if real_mask is not None:
+                if real_mask.shape == (self.shape[0], self.shape[1]):
+                    return ReciprocalSpace(np.mean(self.array[real_mask]), axis=(0))
+            else:
+                if reciprocal_mask.shape == (self.shape[2], self.shape[3]):
+                    return np.mean(self.array[:,:,reciprocal_mask], axis=(2))
+        
+        operations = {
+            'mean': np.mean,
+            'median': np.median,
+            'max': np.max,
+            'min': np.min,
+            'random': np.random.random,
+        }
+
+        if isinstance(y, str):
+            if y in operations:
+                if y == 'random':
+                    y_pos = int(self.shape[0]*operations[y]())
+                    x_pos = int(self.shape[1]*operations[y]())
+                    print(f"Displaying diffraction pattern at position ({y_pos}, {x_pos})...\n")
+                    result = self.array[y_pos, x_pos]
+                else:
+                    result = operations[y](self.array, axis=(0, 1))
+                return ReciprocalSpace(result)
+            else:
+                valid_operations = ', '.join(f"'{op}'" for op in operations.keys())
+                raise ValueError(f"'y' must be an integer, tuple of integers, or string: {valid_operations}.")
+       
+        elif y is not None or x is not None:
+            
+            if isinstance(y, tuple) and isinstance(x, tuple):
+                ymin, ymax = y
+                xmin, xmax = x
+                return ReciprocalSpace(np.mean(self.array[ymin:ymax, xmin:xmax, :, :], axis=(0, 1)))
+            
+            elif isinstance(y, tuple) and isinstance(x, int):
+                ymin, ymax = y
+                return ReciprocalSpace(np.mean(self.array[ymin:ymax, x, :, :], axis=0))
+            
+            elif isinstance(y, int) and isinstance(x, tuple):
+                xmin, xmax = x
+                return ReciprocalSpace(np.mean(self.array[y, xmin:xmax, :, :], axis=0))
+            
+            elif isinstance(y, int) and isinstance(x, int):
+                return ReciprocalSpace(self.array[y, x])
+           
+            elif isinstance(y, tuple) and x is None:
+               ymin, ymax = y
+               return ReciprocalSpace(np.mean(self.array[ymin:ymax, :, :, :], axis=(0,1)))
+           
+            elif isinstance(y, int) and x is None:
+               return ReciprocalSpace(np.mean(self.array[y, :, :, :], axis=0))
+
+            elif y is None and isinstance(x, tuple):
+               xmin, xmax = x
+               return ReciprocalSpace(np.mean(self.array[:, xmin:xmax, :, :], axis=(0,1)))
+
+            elif y is None and isinstance(x, int):
+               return ReciprocalSpace(np.mean(self.array[:, x, :, :], axis=0))
+            
+            else:
+                raise ValueError("y and x must be either both tuples, both integers, or one tuple and one integer.")
+    
+        else:
+            raise ValueError("No parameters specified.")
+    
+    
+    def bin_data(self, bin_domain='real', iterations=1):
+        """
+        Bin 4D dataset by averaging over either the first two dimensions (real space) or the last two dimensions (reciprocal space).
+        """
+        
+        assert len(self.shape) == 4, "'dataset' must be four-dimensional"
+        assert isinstance(iterations, int) and iterations >= 1, "'iterations' must be an integer >= 1"
+        
+        bin_factor = 2 ** iterations
+        
+        if bin_domain == 'real':
+            A, B, C, D = self.shape[0] // bin_factor, self.shape[1] // bin_factor, self.shape[2], self.shape[3]
+            binned_dataset = np.zeros((A, B, C, D))
+            
+            for i in range(A):
+                for j in range(B):
+                    # Average over the first two dimensions (real space)
+                    binned_dataset[i, j] = np.mean(self.array[bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(0, 1))
+    
+        elif bin_domain == 'reciprocal':
+            A, B, C, D = self.shape[0], self.shape[1], self.shape[2] // bin_factor, self.shape[3] // bin_factor
+            binned_dataset = np.zeros((A, B, C, D))
+            
+            for i in range(C):
+                for j in range(D):
+                    # Average over the last two dimensions (reciprocal space)
+                    binned_dataset[:, :, i, j] = np.mean(self.array[:, :, bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(2, 3))
+    
+        else:
+            raise ValueError("Invalid bin_domain. Choose 'real' or 'reciprocal'.")
+    
+        return HyperData(binned_dataset)
+    
+    
+    def get_virtualImage(self, r_minor, r_major, vmin=None, vmax=None, 
+                         grid=True, num_div=10,plotMask=False, gridColor='black',
+                         plotAxes=True, returnDetector = False):
+        """
+        Plot virtual detector image
+        - r_minor, r_major specify the dimensions of the annular ring over which to integrate
+        - vmin, vmax specify the limiting pixel values to be plotted
+        
+        returnArrays: if True, returns the virtual image and detector mask
+        """
+        
+        assert self.ndim == 4, "Input dataset must be 4-dimensional"
+        
+        A,B,C,D = self.shape
+        
+        # Virtual detector mask
+        detector_mask = np.zeros((C,D)) 
+        
+        # Identify reciprocal space pixels within desired ring-shaped region
+        for i in range(C):
+            for j in range(D):
+                if r_minor<=np.sqrt((i-C/2)**2+(j-D/2)**2)<=r_major:
+                    detector_mask[i,j] = 1
+        
+        masked_image = np.sum(self.apply_mask(r_minor, r_major, a_min=0).array, axis=(2,3))
+            
+        if vmin:
+            vmin = vmin
+        else:
+            vmin = np.min(masked_image[masked_image>0])
+        if vmax:
+            vmax = vmax
+        else:
+            vmax=np.max(masked_image)
+            
+        plt.imshow(masked_image, vmin=vmin, vmax=vmax, cmap='gray')
+        
+        if type(num_div) == tuple:
+            ydiv, xdiv = num_div
+        else:
+            ydiv = num_div
+            xdiv = num_div
+        
+        if plotAxes:
+            plt.axis('on')
+            plt.xticks(np.arange(0, B, B//xdiv))
+            plt.yticks(np.arange(0, A, A//ydiv))
+        else:
+            plt.axis('off')    
+    
+        if grid:
+            plt.grid(c=gridColor)
+        plt.show()
+        
+        if plotMask:
+            plt.imshow(np.log(np.mean(self.array, axis=(0,1))*detector_mask), cmap='turbo',)
+            plt.show()
+    
+        if returnDetector:
+            return masked_image, np.mean(self.array, axis=(0,1))*detector_mask
+        else:
+            return masked_image
+        
+        
+    def get_centers(self, r, ref_coords, plotSpots=False, method='CoM'):
+        
+        assert 2 < self.ndim < 5, "Input dataset must be 3- or 4-dimensional"
+        Ny, Nx, _, _ = self.shape
+        
+        all_centers = np.zeros((Ny, Nx, len(ref_coords), 2))
+        
+        for i in tqdm(range(Ny), desc="Computing centers of mass"):
+            for j in range(Nx):
+                
+                all_centers[i, j] = self.get_dp(i, j).get_centers(r=r, ref_coords=ref_coords, method='CoM')
+
+        return all_centers
+
+
+    def get_intensities(self, 
+                        r=6,
+                        centers=None,  
+                        ref_coords=None, 
+                        method='CoM',
+                        compute_resBg=False,
+                        residual_frac=0.9,
+                        **resBg_kwargs
+                        ):
+
+        """
+        Extract Bragg peak intensities from a single DP
+        """
+        
+        assert 2 < self.ndim < 5, "Input dataset must be 3- or 4-dimensional"
+        Ny, Nx, _, _ = self.shape
+        
+        if centers is None:
+            centers = self.get_centers(r, ref_coords=ref_coords, method=method)
+    
+        all_ints = np.zeros((Ny, Nx, centers.shape[-2],))
+        
+        for i in tqdm(range(Ny), desc="Calculating intensities"):
+            for j in range(Nx):
+                
+                dp = self.get_dp(i, j)
+                all_ints[i, j] = dp.get_intensities(r=r, centers=centers[i, j], 
+                                                    compute_resBg=compute_resBg, **resBg_kwargs)
+                
+                # if compute_resBg:
+                #     res_bg = dp.get_residualBg(centers=centers[i, j], **resBg_kwargs)
+                #     # if isinstance(r, (list, np.ndarray)):
+                #     all_ints[i,j] -= res_bg * (np.pi*r**2) * residual_frac
+                        
+        return all_ints
+
+
+    # def get_residualBg(self, centers_array, bg_method='grimm_ring', **resBg_kwargs):
+    #     """
+    #     Compute the residual background for every diffraction pattern in dataset.
+    #     """
+        
+    #     Ny, Nx, n, _ = centers_array.shape
+        
+    #     if bg_method == 'rings':
+    #         res_bgs = np.zeros((Ny, Nx, n))
+    #     else:
+    #         res_bgs = np.zeros((Ny, Nx))
+        
+    #     for i in tqdm(range(Ny), desc='Computing residual background values'):
+    #         for j in range(Nx):
+    #             centers = centers_array[i,j]
+    #             res_bgs[i,j] = self.get_dp(i, j).get_residualBg(centers, bg_method=bg_method, **resBg_kwargs)
+                
+    #     return res_bgs
+
+
+    def apply_mask(self, r_inner, r_outer=None, a_min=0, mask=None, domain=None):
+        """
+        Apply a mask to all diffraction patterns in HyperData object.
+    
+        ...
+        
+        """
+        
+        if self.ndim < 2:
+            raise ValueError("The data object must be of 2 or greater dimensions.")
+        
+        ky, kx = self.shape[-2], self.shape[-1]
+        
+        #TODO: add application of arbitrary mask
+        # if mask is not None:
+            
+        
+        if r_outer is not None:
+            bool_mask = make_mask(((ky-1)/2, (kx-1)/2), (r_inner, r_outer), mask_dim=(ky, kx),)
+
+        else:            
+            bool_mask = make_mask(((ky-1)/2, (kx-1)/2), r_inner, mask_dim=(ky, kx),)
+        
+        
+        return HyperData(self.array * bool_mask).clip(a_min=a_min)
+    
+    
+    def get_clusters(self, n_PCAcomponents, n_clusters, r_centerBeam, std_Threshold = 0.2,
+                     plotStdMask=True, plotScree=True, plotClusterMap=True, plot3dClusterMap=False, 
+                     filter_size=3, cluster_cmap=None, filter_iterations=1, outer_ring=None, polar=False):
+        
+        """
+        Function that returns cluster dataset 
+        """
+        
+        assert len(self.shape)==4, "'dataset' must be 4-dimensional"
+        
+        # Remove center beam
+        A,B,C,D = self.shape
+        
+        if not polar:
+            dataset_noCenter = self.apply_mask(r_inner=r_centerBeam, r_outer=outer_ring).array
+        
+        else:
+            dataset_noCenter = np.zeros_like(self.array)
+            if outer_ring is not None:
+                dataset_noCenter[:,:,r_centerBeam:outer_ring] = self.array[:,:,r_centerBeam:outer_ring]
+            else:
+                dataset_noCenter[:,:,r_centerBeam:] = self.array[:,:,r_centerBeam:]
+        
+        # Find pixels of high variation
+        dataset_stdev = HyperData(dataset_noCenter**0.5).get_stdDev(space='reciprocal').array
+            
+        # Create a mask where True indicates standard deviation is below the threshold
+        low_std_dev_mask = dataset_stdev < std_Threshold*np.max(dataset_stdev)
+        
+        if plotStdMask:
+            plt.imshow(low_std_dev_mask, )
+            plt.title(f'High Std. Dev. Mask, std_threshold = {std_Threshold}')
+            plt.show()
+        
+        # Initialiaze high stdev data and modify its values
+        dataset_noCenter[:, :, low_std_dev_mask] = 0  
+        
+        dataset_noCenter = dataset_noCenter.reshape(-1, C*D)
+        
+        # PCA for dimensionality reduction
+        components = n_PCAcomponents
+        pca = PCA(n_components=components)
+        data_reduced = pca.fit_transform(np.log(clip_values(dataset_noCenter)))
+        
+        # Scree plot to find the optimal number of components
+        variance_ratios = pca.explained_variance_ratio_
+        
+        if plotScree:
+            plt.figure()
+            plt.plot(range(1, components+1), variance_ratios, marker='o')
+            plt.title("Scree Plot")
+            plt.xlabel("Principal Component")
+            plt.ylabel("Variance Explained")
+            plt.show()
+        
+        # K-means clustering
+        n_clusters = n_clusters
+        kmeans = KMeans(n_clusters=n_clusters, random_state=0,)
+        clusters = kmeans.fit_predict(data_reduced)
+        
+        if cluster_cmap is not None:
+            colormap = plt.cm.get_cmap(cluster_cmap, n_clusters) 
+        else:
+            colormap = plt.cm.get_cmap('gnuplot', n_clusters,)
+        
+        if plot3dClusterMap:
+            # Plotting 3D
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+            
+            for i in range(n_clusters):
+                # Get the color for the current cluster
+                color = colormap(i)
+            
+                # Scatter plot for each cluster
+                ax.scatter(data_reduced[clusters == i, 0],
+                           data_reduced[clusters == i, 1],
+                           data_reduced[clusters == i, 2],
+                           # data_reduced[clusters == i, 3],
+                           c=[color], label=f'Cluster {i+1}', s=2, alpha=0.5)
+            
+            ax.set_xticklabels([])
+            ax.set_yticklabels([])
+            ax.set_zticklabels([])
+    
+            plt.show()
+        
+        # Plotting 2D projection
+        # Mapping back to original dimensions
+        cluster_map = clusters.reshape(A, B)
+        
+        if filter_size is not None:
+            for i in range(filter_iterations):
+                cluster_map = apply_majority_filter(cluster_map,filter_size)
+        
+        # Creating a color-coded AxB map
+        cluster_map_colored = np.zeros((A, B, 3), dtype=np.uint8)
+            
+        # Iterate over each cluster to color
+        for i in range(n_clusters):
+            # Convert color to RGB format
+            color = (np.array(colormap(i)[:3]) * 255).astype(np.uint8)
+            # Ensure proper broadcasting by using np.where
+            indices = np.where(cluster_map == i)
+            cluster_map_colored[indices] = color
+        
+        plt.figure()
+        plt.imshow(cluster_map_colored)
+        plt.title(f"Cluster Map ({A}x{B}) with {n_clusters} Clusters")
+        plt.colorbar()
+        plt.show()
+        
+        return cluster_map
+
+    def remove_bg(self, background, bg_frac=1,):
+        
+        """
+        Subtracts a fraction of the background from the dataset and clips the 
+        result to handle underflows.
+        
+        Parameters
+        ----------
+        background : ndarray
+            The background data array which must be of the same shape as self.array.
+        bg_frac : float, optional
+            The fraction of the background to be subtracted from the dataset. 
+            Must be between 0 and 1 (inclusive).
+        
+        Returns
+        -------
+        HyperData
+            A new instance of HyperData with the background subtracted.
+        
+        Raises
+        ------
+        ValueError
+            If 'bg_frac' is not within the required range [0, 1] or 'background' is 
+            not of the same shape as the diffraction patterns.
+        """
+        if not (0 <= bg_frac <= 1):
+            raise ValueError("'bg_frac' must be between 0 and 1, inclusive.")
+        
+        if background.shape != self.array.shape[-2:]:
+            raise ValueError("""'background' must match the shape of the last 
+                             two dimensions of the diffraction dataset.""")
+        
+        return HyperData(self.array[:,:] - background*bg_frac).clip()
+    
+#%%
+
+class ReciprocalSpace:
+
+    def __init__(self, data):
+        self.array = data
+        self.shape = data.shape
+        self.denoiser = Denoiser(data)
+    
+    def show(self, power=1, title='Diffraction Pattern', logScale=True, 
+             axes=True, vmin=None, vmax=None, figsize=(10,10), aspect=None, cmap='turbo'):
+        """
+        Visualize a desired diffraction pattern
+        
+        power: (int or float) 
+        """
+    
+        # Visualize
+        plt.figure(figsize=figsize)
+            
+        if logScale:
+            processed_data = power * np.log(self.array)
+        else:
+            processed_data = self.array ** power
+        
+        # Determine vmin and vmax if not provided
+        if vmin is None:
+            vmin = np.min(processed_data)
+        if vmax is None:
+            vmax = np.max(processed_data)
+        
+        # Display the image with the specified color mapping and value limits
+        im1 = plt.imshow(processed_data, vmin=vmin, vmax=vmax, cmap=cmap)
+        
+        if aspect is not None:
+            plt.gca().set_aspect(aspect)  
+            
+        if axes:
+            
+            ky, kx = self.shape
+            
+            plt.axis('on')
+            plt.xticks(np.arange(0, kx, 5))
+            plt.yticks(np.arange(0, ky, 5))
+    
+            ax = plt.gca()
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.05)
+    
+            cb = plt.colorbar(im1, cax=cax)
+            cb.ax.tick_params(labelsize=15)
+            ax.set_title(title, fontsize=18)
+                          
+            plt.title("Intensity", fontsize=14)
+    
+        else:
+    
+            plt.axis('off')
+    
+        plt.show()
+    
+    #TODO: how to call method from HyperData?
+    # def remove_center_beam(self):
+    #     """
+        
+    #     """
+    #     return ReciprocalSpace(annular)
+    
+    def get_spotCenter(self, ky, kx, r, method='CoM', plotSpot=False,):
+        """
+        Find the center of mass (of pixel intensities) of a diffraction spot, 
+        allowing for non-integer radii.
+        """
+        
+        # Pad and round up to ensure the entire radius is accommodated
+        pad_width = int(np.ceil(r))
+        padded_data = np.pad(self.array, pad_width=pad_width, mode='constant')
+    
+        # Adjustment of padding coordinates
+        ky_padded, kx_padded = ky + pad_width, kx + pad_width
+        
+        # Determine the size of the area to extract based on r, ensuring it matches the mask's dimensions
+        area_size = int(np.ceil(r * 2))
+        # if area_size % 2 == 0:
+        #     area_size += 1  # Ensure the area size is odd to match an odd-sized mask
+            
+        # Generate the circular mask with the correct dimensions
+        mask = circular_mask((area_size) // 2, area_size // 2, r)
+        
+        # Extract the region of interest from the padded data
+        ymin, ymax = int(ky_padded - (area_size // 2)), int(ky_padded + (area_size // 2)) + 1
+        xmin, xmax = int(kx_padded - (area_size // 2)), int(kx_padded + (area_size // 2)) + 1
+        spot_data = padded_data[ymin:ymax, xmin:xmax]
+    
+        # Check if shapes match, otherwise adjust
+        if spot_data.shape != mask.shape:
+            min_dim = min(spot_data.shape[0], mask.shape[0], spot_data.shape[1], mask.shape[1])
+            spot_data = spot_data[:min_dim, :min_dim]
+            mask = mask[:min_dim, :min_dim]
+    
+        # Apply mask and calculate its CoM
+        masked_spot_data = spot_data * mask
+        
+        # Find peak maximum using the chosen method
+        if method == 'CoM':
+            com_y, com_x = center_of_mass(masked_spot_data)
+            
+        # elif method == 'gradient_ascent':
+        #     y_len, x_len = masked_spot_data.shape
+        #     com_y, com_x = gradient_ascent(masked_spot_data, ((y_len-1)/2, (x_len-1)/2), learning_rate=0.1, max_iters=100)
+            
+        elif method == 'gaussian':
+            com_x, com_y = fit_gaussian_2d(masked_spot_data)
+            
+        elif method == 'elliptical_gaussian':
+            com_x, com_y = fit_gaussian_2d(masked_spot_data)    
+        
+        if plotSpot:
+            # Create turbo colormap with 0-values white
+            base_cmap = plt.cm.turbo
+            custom_cmap = ListedColormap(np.concatenate(([np.array([1, 1, 1, 1])], 
+                                                         base_cmap(np.linspace(0, 1, 2**12))[1:]), axis=0))
+            plt.imshow(masked_spot_data, cmap=custom_cmap)
+            plt.colorbar()
+            plt.scatter(com_x, com_y, color='yellow', s=50, label='Subpixel CoM')
+            plt.show()
+        
+        ky_padded = com_y + ymin
+        kx_padded = com_x + xmin
+                
+        # Adjust the CoM to account for padding
+        ky_CoM = ky_padded - pad_width
+        kx_CoM = kx_padded - pad_width
+    
+        return ky_CoM, kx_CoM
+    
+    # Updated code
+    def get_centers(self, r, ref_coords, plotSpots=False, method='CoM'):
+        """
+        Generate an array spot centers for any DP
+        
+        r : int, float or list
+            if list, its length must be the same as that of coords
+        """
+        
+        assert len(self.shape) == 2, "Input data must be of 2-dimensional"
+        
+        num_peaks = len(ref_coords)
+        
+        centers = np.zeros((num_peaks, 2))
+        for j in range(num_peaks):
+            
+            if isinstance(r, (np.ndarray, list)):
+                r = r[j]
+                
+            centers[j] = self.get_spotCenter(ref_coords[j, 0], ref_coords[j, 1],
+                                            r + 1e-10,  method, plotSpots,)
+                                       
+        return centers
+
+    # Needs update
+    def masked_DPs(self, mask_radius, centers=None, ref_coords=None, order=None, title=None, 
+                   return_mask=False, plot=True, method='CoM'):
+        """ 
+        Generate masked diffraction plots for each order.
+        Order = 1,2,3,4; Last option plots all.
+        """
+        
+        if centers is None and ref_coords is None:
+            raise ValueError("Either 'centers' is None or 'ref_coords' is None but not both.")
+        
+        A,B = self.shape
+        compound_mask = np.zeros((A, B))
+        
+        if centers is None:
+            centers = self.get_centers(r=mask_radius, ref_coords=ref_coords, method=method)
+    
+        for mask_center in centers:
+                    
+            mask_spot = make_mask(mask_center, mask_radius, mask_dim=(A,B))
+            compound_mask = compound_mask + mask_spot     
+        
+        # Apply compound mask
+        masked_data = self.array*compound_mask
+        
+        if plot: 
+            
+            plt.figure(figsize=(10, 10))
+            base_cmap = plt.cm.turbo
+        
+            # Create a new colormap from the existing colormap
+            # np.concatenate combines the arrays. The first array is just [1, 1, 1, 1] which corresponds to white in RGBA.
+            # We take the colormap 'turbo', convert it to an array, and exclude the first color to make room for white.
+            custom_cmap = ListedColormap(np.concatenate(([np.array([1, 1, 1, 1])], 
+                                                         base_cmap(np.linspace(0, 1, 2**12))[1:]), axis=0))
+        
+            # Plotting 
+            im1 = plt.imshow(masked_data, cmap=custom_cmap)
+            ax = plt.gca()
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.05)
+            
+            # Title settings based on 'spots_order'
+            if title:
+                assert type(title) == str, "The title of the plot must be a string."
+                ax.set_title(title, fontsize=18)
+            else:
+                ax.set_title('Masked Diffraction Pattern', fontsize=18)
+            
+            # Colorbar settings
+            cb = plt.colorbar(im1, cax=cax)
+            cb.ax.tick_params(labelsize=15)
+            plt.title("Intensity", fontsize=14, pad=20)  # Adjusted to avoid overlapping with the main title
+        
+            plt.show()
+        
+        if return_mask:
+            return compound_mask
+        
+    def get_intensities(self, 
+                        r,
+                        centers=None,  
+                        ref_coords=None, 
+                        method='CoM',
+                        compute_resBg=False,
+                        residual_frac=0.9,
+                        **resBg_kwargs):
+        """
+        Extract Bragg peak intensities from a single DP
+        
+        residual_pxBg is an integer, float, or 
+        """
+    
+        if centers is None:
+            centers = self.get_centers(r, ref_coords=ref_coords, method=method)
+    
+        ints = np.zeros(len(centers))
+        
+        for int_idx, intensity in enumerate(ints):
+    
+            if isinstance(r, (list, np.ndarray)):
+                r = r[int_idx]        
+    
+            masked_data = self.array*make_mask(centers[int_idx], r_mask=r+1e-10, mask_dim=self.shape)
+            ints[int_idx] = np.sum(masked_data[round(centers[int_idx][0]-(r+1)):round(centers[int_idx][0]+(r+1)),
+                                                round(centers[int_idx][1]-(r+1)):round(centers[int_idx][1]+(r+1))])
+        
+        if compute_resBg:
+            res_bg = self.get_residualBg(centers=centers, **resBg_kwargs)
+            ints -= res_bg * (np.pi*r**2) * residual_frac
+        
+        # if residual_pxBg is not None:
+            
+        #     # Compute the average number of pixels within masked spots 
+        #     if isinstance(r, (list, np.ndarray)):
+        #         if type(r) == list:
+        #             r = np.array(r)
+        #         A = np.pi*np.mean(r)**2
+        #     else:
+        #         A = np.pi*r**2
+            
+        #     # Subtract the corresponding mean value of the background from each intensity
+        #     residual_int = A*(residual_pxBg)
+        #     ints -= residual_frac*residual_int
+                
+        return ints
+    
+    
+    def get_residualBg(self, centers, r_spots, bg_method='rings', t_ring=None, show=False, **kwargs):
+        """
+        Calculate the residual background value around Bragg peaks.
+    
+        The function supports three methods to calculate the background:
+        
+        - The 'rings' method masks the immediate annular region around each Bragg peak 
+          at the positions in 'centers' and returns the mean background value 
+          surrounding each Bragg peak.
+        - The 'rings_mean' method creates a ring around each Bragg peak and returns 
+          the average background value per pixel for all the rings combined.
+        - The 'grimm_ring' method creates a large annular mask that ideally passes 
+          through the Bragg peaks located at 'centers'. It hollows out the circular 
+          regions enclosing the Bragg peaks, so only the space between the peaks is 
+          masked. This method assumes that the Bragg peaks at positions 'centers' fall 
+          within a common annular region.
+    
+        Parameters
+        ----------
+        centers : array-like
+            An array of shape (N, 2) containing the (ky, kx) positions of the Bragg peaks.
+        r_spots : float or tuple of floats
+            Radius of the spots to mask. If a tuple (inner_radius, outer_radius) 
+            is provided, an annular mask is created.
+        bg_method : str, optional
+            Method to use for calculating the background. Options are 'rings', 
+            'rings_mean', and 'grimm_ring'. Default is 'rings'.
+        t_ring : float, optional
+            Thickness of the ring for the 'grimm_ring' method. If not specified, 
+            it is set to 1.5 times the radius of the spots.
+        show : bool, optional
+            If True, display the masked data. Default is False.
+        **kwargs : dict
+            Additional keyword arguments to pass to the display function if `show` is True.
+    
+        Returns
+        -------
+        res_bgs : np.ndarray
+            The mean background value surrounding each Bragg peak (for 'rings' 
+            method) or the average background value per pixel (for 'rings_mean' 
+            and 'grimm_ring' methods).
+        """
+        
+        bg_methods = ['rings', 'rings_mean', 'grimm_ring']
+        assert bg_method in bg_methods, f"Input 'method' must be one of the follwing: {bg_method}"
+        
+        A, B = self.shape
+        dp_center = ((A-1)/2, (B-1)/2)
+        
+        if bg_method=='rings':
+            if not isinstance(r_spots, tuple):
+                raise ValueError(""""For the 'rings' method, the input parameter 
+                                     'r_spots' must be a tuple specifying the inner 
+                                     and outer radius of bg. region arounf each each spot""")
+            
+            res_bgs = np.zeros(len(centers))
+            dp_mask = np.zeros_like(self.array, dtype=bool)
+            # We collect multiple values for the intensities corresponding to each Bragg peak
+            for c_idx, center in enumerate(centers):
+                bool_mask = make_mask(center, r_spots, mask_dim=(A,B))
+                masked_dp = self.array * bool_mask
+                dp_mask += bool_mask
+                res_bgs[c_idx] = np.sum(masked_dp)/np.sum(bool_mask)
+            if show:
+                ReciprocalSpace(self.array * dp_mask).show(**kwargs)
+            return res_bgs
+     
+        if bg_method=='rings_mean':            
+            if not isinstance(r_spots, tuple):
+                raise ValueError(""""For the 'rings_mean' method, the input parameter 
+                                     'r_spots' must be a tuple specifying the inner 
+                                     and outer radius of bg. region arounf each each spot""")
+            # In this case, a ring is drawn araound every spot
+            bool_mask = make_mask(centers, r_spots, mask_dim=(A,B))
+        
+        if bg_method=='grimm_ring':
+            if isinstance(r_spots, tuple):
+                raise ValueError(""""For the 'grimm_ring' method, the input parameter 
+                                     'r_spots' must be an integer or float specifying 
+                                     the radius to blank each spot""")
+            
+            # If not defined, we define a ring thickness equal to 1.5 times the radii of the enclosed Bragg peaks
+            # Note that larger ring thickness may result in inaccurate results due to enclosing signal from other
+            # Bragg peaks
+            if isinstance(r_spots, (list, np.ndarray)):
+                r_mean = np.mean(np.array(r_spots))
+            else:
+                r_mean = r_spots
+            if t_ring is None:
+                t_ring = 1.5*r_mean
+            elif not isinstance(t_ring, (int, float)):
+                raise ValueError("'t_ring' must be an integer or float.")
+            elif t_ring > 3*r_mean or t_ring < 1.5:
+                raise ValueError("""The input parameter t_ring must be within the 
+                                    range [1.5, 3*r_spots]""")
+            
+            # We automatically define the mean radius of the ring based on Bragg peak positions
+            distances = np.sqrt((centers[:, 0] - dp_center[0]) ** 2 + (centers[:, 1] - dp_center[1]) ** 2)
+            r_ring = np.mean(distances)
+            
+            # We combine the masks enclosing the Bragg peaks and the annular region covering them
+            spots_mask = make_mask(centers, r_mean, mask_dim=(A,B), invert=True)
+            annular_mask = make_mask(dp_center, (r_ring - t_ring/2, r_ring + t_ring/2))
+            
+            bool_mask = np.logical_and(spots_mask, annular_mask)
+        
+        # Apply mask
+        masked_dp = self.array * bool_mask
+        
+        if show:
+            ReciprocalSpace(masked_dp).show(**kwargs)
+        
+        # Return the average background value per pixel
+        return np.sum(masked_dp)/np.sum(bool_mask)
+    
+    
+    def find_peaks(self,min_sigma=0.85, 
+                        max_sigma=2.5, 
+                        num_sigma=100, 
+                        threshold=85,
+                        mask_radial_frac=0.9,
+                        distance_factors=(0.8,1.5),
+                        search_radius_factor=2.5,
+                        radii_multiplier=1.5, 
+                        radii_slope=1.38,
+                        vmin=4,vmax=14, 
+                        return_radii=False,
+                        axes=False, plotCenters=True,
+                        power=1, order_length=None,
+                        method='CoM',
+                   ):
+        
+        A, B = self.shape
+        
+        # Define region where spots are to be found
+        if type(mask_radial_frac) == float:
+            mask = make_mask(((A-1)//2,(B-1)//2), r_mask=(A+B)//4*mask_radial_frac, mask_dim=self.shape) 
+        elif type(mask_radial_frac) == tuple:
+            mask = make_mask(((A-1)//2,(B-1)//2), 
+                             r_mask=((A+B)//4*mask_radial_frac[0], (A+B)//4*mask_radial_frac[1]),
+                             mask_dim=self.shape)
+            mask_radial_frac = mask_radial_frac[1]
+            
+        # Extract centers and radii automatically
+        blobs_log = feature.blob_log(self.array**power*mask, min_sigma=min_sigma, 
+                                     max_sigma=max_sigma, 
+                                     num_sigma=num_sigma, 
+                                     threshold=threshold)
+        # Unpack values
+        r_vals = blobs_log[:,2]
+        blobs_array = np.array(blobs_log[:, :2])
+    
+        # Calculate pairwise distances between blobs. The result is a square matrix.
+        distances = cdist(blobs_array, blobs_array)
+        # Set diagonal to np.inf to ignore self-comparison.
+        np.fill_diagonal(distances, np.inf)
+        # Find the distance to the nearest neighbor for each blob.
+        nearest_neighbor_dist = distances.min(axis=1)
+    
+        # Define your distance thresholds.
+        
+        min_distance_factor, max_distance_factor = distance_factors
+        min_threshold = np.mean(np.min(distances,axis=0))*min_distance_factor  # Minimum acceptable distance to the nearest neighbor.
+        max_threshold = np.mean(np.min(distances,axis=0))*max_distance_factor  # Maximum acceptable distance to the nearest neighbor.
+    
+        # Filter blobs. Keep a blob if its nearest neighbor is neither too close nor too far.
+        filtered_indices = np.where((nearest_neighbor_dist >= min_threshold) 
+                                    & (nearest_neighbor_dist <= max_threshold)
+                                    & (((blobs_array[:,0]-A//2)**2 + (blobs_array[:,1]-B//2)**2)**.5 <= (A+B)//4*mask_radial_frac*(8/9)))[0]
+    
+        # Apply filter
+        blobs_log = np.zeros((len(filtered_indices), 3))
+        blobs_log[:, :2] = blobs_array[filtered_indices]
+        blobs_log[:, 2] = r_vals[filtered_indices]
+
+        
+        # Refine peak centers using CoM
+        peak_centers = self.get_centers(r=blobs_log[:,2]*search_radius_factor,
+                                       ref_coords=blobs_log[:,:2], method=method)
+        
+        # Sort peaks by their distance to center beam and, optionally, by their 
+        # angular position for each Bragg peak order
+        peak_centers = sort_peaks(peak_centers, 
+                                    ((A-1)//2, (B-1)//2), 
+                                    order_length=order_length)
+        
+        distance_to_center = np.linalg.norm(peak_centers-(A+B)//4,axis=1)
+        radii = blobs_log[:,2]*radii_multiplier + radii_slope*(1 - distance_to_center/np.max(distance_to_center))
+        
+        blobs_log[:, :2] = peak_centers
+        blobs_log[:, 2] = radii
+        
+        if plotCenters:
+        
+            plt.figure(figsize=(10, 10))
+            plt.imshow(np.log(self.array), cmap='turbo',vmin=vmin,vmax=vmax)
+            
+            if not axes:
+                plt.axis('off')
+        
+            # Circle around each blob
+            for blob in blobs_log:
+                y, x, r = blob
+                c = plt.Circle((x, y), r, color='red', linewidth=2, fill=False)
+                plt.gca().add_patch(c)
+        
+            plt.show()
+        
+        if return_radii:            
+            return peak_centers, radii
+        else:
+            return peak_centers
+    
+    
+    def clip(self, a_min=1, a_max=None):
+        """
+        
+        """
+        
+        return ReciprocalSpace(clip_values(self.array, a_min, a_max))
+    
+    
+    def get_bg(self, centers, radius,):
+                           
+        return ReciprocalSpace(inpaint_diffraction(self.array, centers=centers, radius=radius,))
+    
+    
+    def remove_bg(self, background, bg_frac=1, a_min=1):
+        
+        """
+        Subtracts a fraction of the background from the dataset and clips the 
+        result to handle underflows.
+        
+        Parameters
+        ----------
+        background : ndarray
+            The background data array which must be of the same shape as self.array.
+        bg_frac : float, optional
+            The fraction of the background to be subtracted from the dataset. 
+            Must be between 0 and 1 (inclusive).
+        
+        Returns
+        -------
+        ReciprocalSpace
+            A new instance of ReciprocalSpace with the background subtracted 
+            diffraction pattern.
+        
+        Raises
+        ------
+        ValueError
+            If bg_frac is not within the required range [0, 1] or 
+        """
+        if not (0 <= bg_frac <= 1):
+            raise ValueError("'bg_frac' must be between 0 and 1, inclusive.")
+        
+        if background.shape != self.shape:
+            raise ValueError("""'background' must match the shape of the diffraction pattern.""")
+        
+        if type(background) != np.ndarray:
+            background = background.array
+        
+        return ReciprocalSpace(self.array - background*bg_frac).clip(a_min=a_min)
 
 #%% Denoising Functions and Classes
 
@@ -1399,11 +3425,9 @@ class DenoisingMethods:
                 cvg_criterion='abs_rec_error', fixed_modes=None, svd_mask_repeats=5, 
                 linesearch=False, callback=None, implementation='tensorly', 
                 return_decomposition=False, unfold_domain=None):
-        
         """CANDECOMP/PARAFAC decomposition via alternating least squares (ALS)
         
         Computes a rank-rank decomposition of tensor such that:
-        
         tensor = [|weights; factors[0], ..., factors[-1] |]
         
         Parameters
@@ -2878,9 +4902,7 @@ class Denoiser:
             
             else:
                 raise ValueError("No denoising method provided.")
-                
- 
-        
+                        
         dims = self.ndim
 
         # Below, we handle different dimensions accordingly
@@ -2910,7 +4932,7 @@ class Denoiser:
                         processed_data[:, :, i, j] = self.denoise(real_space_method, target_data=self.array[:, :, i, j], **real_space_kwargs)
 
             if reciprocal_space_method:
-                for i in tqdm(range(ry), desc = 'Filtering on reciprocal-space'):
+                for i in tqdm(range(ry), desc = 'Filtering diffraction patterns'):
                     for j in range(rx):
                         processed_data[i, j, :, :] = self.denoise(reciprocal_space_method, target_data=self.array[i, j, :, :], **reciprocal_space_kwargs)
 
@@ -2919,1201 +4941,8 @@ class Denoiser:
         else:
             raise ValueError("Unsupported image dimensionality")
 
-#%%
 
-class HyperData:
-    
-    def __init__(self, data):
-        self.array = data
-        self.ndim = data.ndim
-        self.shape = data.shape
-        self.dtype = data.dtype
-        self.denoiser = Denoiser(self.array)
-
-    def swap_coordinates(self):
-        """
-        Swap the real space and reciprocal space coordinates in the 4D dataset.
-        For a dataset with dimensions (A, B, C, D),
-        this method swaps them to (C, D, A, B).
-        
-        Returns:
-        - swapped_data (numpy.ndarray): The 4D dataset with swapped dimensions.
-        """
-        
-        # The original order is (0, 1, 2, 3) and we want to change to (2, 3, 0, 1)
-        swapped_data = np.transpose(self.array, (2, 3, 0, 1))
-        
-        return HyperData(swapped_data)
-    
-    def alignment(self, r_mask=5):
-        """
-        Align the diffraction patterns through the Center of mass of the center beam
-        
-        Function written by Chuqiao Shi (2022)
-        See on GitHub: Chuqiao2333/Hierarchical_Clustering
-        
-        Modified by Adan J Mireles (April, 2024)
-        - Reordered dimensions (x, y) to (y, x)
-        - Modified translation from 'ky//2 + com' to '(ky-1)//2 + com'
-        """
-
-        y, x, ky, kx = self.shape
-        com_y, com_x = self._quickCOM(r_mask=r_mask) 
-        cbed_tran = np.zeros((y, x, ky, kx), dtype=self.dtype)
-        
-        print(f'Processing {y} by {x} real-space positions...')        
-        for i in tqdm(range(y), desc = 'Alignment Progress'):
-            for j in range(x):
-                afine_tf = transform.AffineTransform(translation=(-(ky-1)//2 + com_y[i,j], -(kx-1)//2 + com_x[i,j]))
-                cbed_tran[i,j,:,:] = transform.warp(self.array[i,j,:,:], inverse_map=afine_tf)
-                # sys.stdout.write('\r %d,%d' % (i+1, j+1) + ' '*10)
-        
-        cbed_tran_Obj = HyperData(cbed_tran)
-        com_y2, com_x2 = cbed_tran_Obj._quickCOM()
-        std_com = (np.std(com_y2), np.std(com_x2))
-        mean_com = (np.mean(com_y2), np.mean(com_x2))
-        
-        print()
-        print(f'Standard deviation statistics (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
-        print(f'COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
-        
-        return cbed_tran_Obj, mean_com, std_com
-    
-    def rotate_dps(self, angle, units='deg'):
-        """
-        Rotate clockwise all diffraction patterns by angle in degrees
-        """
-        
-        if units == 'rad':
-            angle = np.degrees(angle)
-        
-        if self.ndim == 4:
-            y, x, ky, kx = self.shape
             
-            new_data = np.zeros((y, x, ky, kx), dtype=self.dtype)
-            
-            for y_idx in tqdm(range(y), desc = 'Rotating Diffraction Patterns'):
-                for x_idx in range(x):
-                    new_data[y_idx, x_idx] = rotate(self.array[y_idx, x_idx], angle)
-    
-    def standardize(self):
-        """
-        Standardize a 4D dataset using NumPy.
-        
-        Parameters
-        ----------
-        tensor : ndarray
-            The input 4D tensor to standardize.
-        
-        Returns
-        -------
-        standardized_tensor : ndarray
-            The standardized 4D tensor with zero mean and unit variance.
-        """
-        # Calculate the mean and standard deviation along the last dimension
-        mean = np.mean(self.array, keepdims=True)
-        std = np.std(self.array, keepdims=True)
-        
-        # Standardize the tensor
-        standardized_tensor = (self.array - mean) / std
-        
-        return HyperData(standardized_tensor)
-        
-    def normalize(self):
-        """
-        Normalize a 4D dataset to the range [0, 1] using NumPy.
-        
-        Parameters
-        ----------
-        tensor : ndarray
-            The input 4D tensor to normalize.
-        
-        Returns
-        -------
-        normalized_tensor : ndarray
-            The normalized 4D tensor with values in the range [0, 1].
-        """
-        # Calculate the minimum and maximum values along the last dimension
-        min_val = np.min(self.array, keepdims=True)
-        max_val = np.max(self.array, keepdims=True)
-        
-        # Normalize the tensor
-        normalized_tensor = (self.array - min_val) / (max_val - min_val)
-        
-        return HyperData(normalized_tensor)
-    
-    def clip(self, a_min=1, a_max=None):
-        """
-        
-        """
-        
-        return clip_values(self.data, a_min, a_max)
-        
-    
-    # Private method: helper function for the 'alignment' method
-    def _quickCOM(self, r_mask=5):
-        """
-        Compute the center of mass (COM) of electron diffraction patterns within a 
-        4D-STEM dataset.
-        
-        Function based on that written by Chuqiao Shi (2022)
-        See on GitHub: Chuqiao2333/Hierarchical_Clustering
-        
-        Inputs:
-            cbed_data: 4D numpy array
-            r_mask   : radius of mask used for COM calculation (int or float) 
-        Outputs:
-            ap2_y, ap2_x : numpy arrays containing the x and y coordinates of the 
-            centers of mass for each position in the real-space grid.
-        """
-        
-        y, x, ky, kx = np.shape(self.array)
-        center_x = (kx-1) // 2
-        center_y = (ky-1) // 2
-
-        # Assuming make_mask function is defined elsewhere that creates a circular mask
-        if type(r_mask) == tuple:
-            inner_mask = make_mask((center_y, center_x), r_mask[0], mask_dim=(ky, kx), invert=True)
-            outer_mask = make_mask((center_y, center_x), r_mask[1], mask_dim=(ky, kx))
-            mask = np.logical_and(inner_mask, outer_mask)
-            
-        else:
-            mask = make_mask((center_y, center_x), r_mask, mask_dim=(ky, kx))
-        
-        
-        
-        ap2_x = np.zeros((y, x))
-        ap2_y = np.zeros_like(ap2_x)
-        vx = np.arange(kx)
-        vy = np.arange(ky)
-
-        for i in tqdm(range(y), desc = 'Computing centers of mass'):
-            for j in range(x):
-                cbed = np.squeeze(self.array[i, j, :, :] * mask)
-                pnorm = np.sum(cbed)
-                if pnorm != 0:
-                    ap2_y[i, j] = np.sum(vy * np.sum(cbed, axis=0)) / pnorm
-                    ap2_x[i, j] = np.sum(vx * np.sum(cbed, axis=1)) / pnorm
-
-        return ap2_y, ap2_x
-    
-    # Must add type of interpolation
-    def fix_elliptical_distortions(self, r=None, R=None, interp_method='linear', show_ellipse=False, return_fix=True, **kwargs):
-        """
-        Corrects elliptical distortions across all diffraction patterns in the dataset.
-    
-        This function computes the average diffraction pattern, fits an ellipse to this average,
-        and applies an affine transformation to each diffraction pattern (by transforming the 
-        ellipse into a circle) to correct the elliptical distortion.
-        
-        Parameters
-        ----------
-        r : int, optional
-            Inner radius of the annular mask. Defaults to one fifth of the diffraction pattern's horizontal dimension if not specified.
-        R : int, optional
-            Outer radius of the annular mask. Defaults to two fifths of the diffraction pattern's horizontal dimension if not specified.
-        interp_method : str, optional
-            Interpolation method to use during affine transformations. Can be 'linear' or 'cubic'.
-        show_ellipse : bool, optional
-            Plots the mean diffraction pattern in the dataset with an overlaid ring of inner radius r and outer radius R. If return_fix 
-            is False, it plots the ring in the non-corrected pattern. Otherwise, it plots it in the corrected pattern.
-        
-        Returns
-        -------
-        HyperData
-            A new instance of HyperData containing the corrected data.
-    
-        Example
-        --------
-        >>> hyperdata_instance = HyperData(data)
-        >>> corrected_data_instance = hyperdata_instance.fix_elliptical_distortions(r=20, R=40, interp_method='cubic')
-        
-        Notes
-        -----
-        This method must be applied after applying the 'alignment' method for better accuracy.
-        """
-        
-        A, B, C, D = self.array.shape
-        
-        if not r:
-            r = C//5 
-        if not R:
-            R = 2*C//5
-        
-        mean_pattern = self.get_dp(special = 'mean').array
-        params = self._extract_ellipse(mean_pattern, C//2, D//2, r, R)
-        corrected_data = np.empty_like(self.array)
-        
-        Ang, a, b = params 
-        print(f"Ellipse rotation = {np.degrees(Ang)} degrees \nMajor axis 'a' = {a} px \nMinor axis 'b' = {b} px")
-        
-        if show_ellipse:
-            self._plot_with_ring(np.log(mean_pattern), r, R, **kwargs)
-        
-        if return_fix:
-        
-            for i in range(A):
-                for j in range(B):
-                    corrected_data[i, j] = self._apply_affine_transformation(self.array[i, j], *params, interp_method)
-    
-            return HyperData(corrected_data)
-
-    def _extract_ellipse(self, image, cy, cx, r, R):
-        """
-        Fit an ellipse to an annular region of an image (diffraction pattern).
-    
-        The function calculates parameters for the ellipse that best fits the specified annular region
-        of the mean diffraction pattern. These parameters are optimized to minimize the defined cost function.
-    
-        Parameters
-        ----------
-        image : numpy.ndarray
-            The mean diffraction pattern as a 2D numpy array.
-        cy : int
-            The y-coordinate of the center of the diffraction pattern.
-        cx : int
-            The x-coordinate of the center of the diffraction pattern.
-        r : int
-            Inner radius for the annular mask.
-        R : int
-            Outer radius for the annular mask.
-    
-        Returns
-        -------
-        tuple
-            A tuple of fitted ellipse parameters (A, a, b), where A is the rotation angle,
-            a is the length of the major axis, and b is the length of the minor axis.
-        """
-        y, x = np.indices(image.shape)  # Get array indices for the entire image
-        mask = ((x - cx)**2 + (y - cy)**2 >= r**2) & ((x - cx)**2 + (y - cy)**2 <= R**2)
-        x_vals, y_vals = x[mask], y[mask]  # Get the coordinates within the mask
-        intensities = image[mask]  # Get the intensities at these coordinates
-
-        def ellipse_cost(params):
-            A, a, b = params
-            cost = intensities**4 * (((x_vals - cx) * np.cos(A) + (y_vals - cy) * np.sin(A))**2 / a**2 +
-                                  ((y_vals - cy) * np.cos(A) - (x_vals - cx) * np.sin(A))**2 / b**2 - 1)**2
-            return np.sum(cost)
-
-        initial_guess = [0, (R-r)/2 + 1, (R-r)/2 - 1]  # Initial guess for A, a, b
-        result = minimize(ellipse_cost, initial_guess, method='L-BFGS-B')
-        return result.x
-
-    def _apply_affine_transformation(self, image, A, a, b, interp_method):
-        """
-        Apply an affine transformation to make the fitted ellipse a circle.
-
-        Parameters
-        ----------
-        image : numpy.ndarray
-            The 2D diffraction pattern to correct.
-        A : float
-            The angle of rotation of the ellipse.
-        a : float
-            The length of the major axis.
-        b : float
-            The length of the minor axis.
-
-        Returns
-        -------
-        numpy.ndarray
-            The corrected diffraction pattern.
-        """
-        cols, rows = image.shape
-        
-        # Points in the original image
-        p1 = np.float32([
-            [a * np.cos(A) + cols//2, a * np.sin(A) + rows//2],
-            [-a * np.cos(A) + cols//2, -a * np.sin(A) + rows//2],
-            [b * np.sin(A) + cols//2, -b * np.cos(A) + rows//2]
-        ])
-        
-        # Depending on whether a or b is larger, set the corresponding points in the corrected image
-        # This ensures that the affine transformation results in expansion rather than shrinkage of the
-        # transformed diffraction pattern.
-        if a < b:
-            p2 = np.float32([
-                [b * np.cos(A) + cols//2, b * np.sin(A) + rows//2],
-                [-b * np.cos(A) + cols//2, -b * np.sin(A) + rows//2],
-                [b * np.sin(A) + cols//2, -b * np.cos(A) + rows//2]
-            ])
-        else:
-            p2 = np.float32([
-                [a * np.cos(A) + cols//2, a * np.sin(A) + rows//2],
-                [-a * np.cos(A) + cols//2, -a * np.sin(A) + rows//2],
-                [a * np.sin(A) + cols//2, -a * np.cos(A) + rows//2]
-            ])
-            
-        M = cv2.getAffineTransform(p1, p2)
-        
-        if interp_method == 'cubic':
-            transformed_image = cv2.warpAffine(image, M, (cols, rows), flags=cv2.INTER_CUBIC)
-            
-        if interp_method == 'linear':
-            transformed_image = cv2.warpAffine(image, M, (cols, rows), flags=cv2.INTER_LINEAR)
-
-        return transformed_image
-    
-    def _plot_with_ring(self, data, inner_radius, outer_radius, **kwargs):
-        """
-        Plots a 2D array with an overlaid red ring directly on the same figure.
-        
-        Parameters
-        ----------
-        data : numpy.ndarray
-            The 2D array to plot.
-        inner_radius : float
-            The inner radius of the ring.
-        outer_radius : float
-            The outer radius of the ring.
-        """
-        # Create a figure and axis
-        fig, ax = plt.subplots()
-        
-        # Generate a grid of points
-        y, x = np.indices(data.shape)
-        center_x, center_y = np.array(data.shape) // 2
-        
-        # Calculate the radius for each point in the grid
-        radius = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-        
-        # Create a mask for the ring
-        ring_mask = (radius >= inner_radius) & (radius <= outer_radius)
-        
-        # Create a colored overlay where the ring is red
-        ring_overlay = np.zeros(data.shape + (4,), dtype=np.float32)  # Adding a new dimension for RGBA
-        ring_overlay[..., 0] = 1  # Red channel
-        ring_overlay[..., 3] = ring_mask * 1.0  # Alpha channel only set where the ring is
-        
-        # Display the image
-        ax.imshow(data, **kwargs)
-        ax.imshow(ring_overlay, cmap='hot', alpha=0.5) 
-        
-        # Set plot details
-        ax.set_title('Mean diffraciton with Red Ring Overlay')
-        ax.axis('off')
-        
-        plt.show()
-    
-
-    def centerBeam_Stats(self, square_side=8):
-        """
-        Analyze diffraction patterns to find the mean and standard deviation of the center of mass.
-    
-        Parameters:
-        data (numpy.ndarray): 4D dataset of shape (A, B, C, D).
-        square_side (int): Side length of the square used to calculate the center of mass.
-    
-        Returns:
-        tuple: Mean and standard deviation of the center of mass coordinates.
-        """
-        A, B, C, D = self.array.shape
-        com_coordinates = []
-    
-        # Define the region for center of mass calculation
-        half_side = square_side // 2
-        center = C//2
-        min_coord, max_coord = center - half_side, center + half_side
-    
-        # Calculate center of mass for each BxB image
-        for i in range(A):
-            for j in range(B):
-                region = self.array[i, j, min_coord:max_coord, min_coord:max_coord]
-                com = center_of_mass(region)
-                com_coordinates.append((com[0] + min_coord, com[1] + min_coord))
-    
-        # Convert to numpy array for ease of calculation
-        com_coordinates = np.array(com_coordinates)
-    
-        # Calculate mean and standard deviation
-        mean_com = np.mean(com_coordinates, axis=0)
-        std_dev_com = np.std(com_coordinates, axis=0)
-    
-        print(f"Mean CoM Coordinate (ky, kx): {mean_com}")
-        print(f"Standard Deviation of CoM Coordinates (ky, kx): {std_dev_com} px")
-    
-        return mean_com, std_dev_com
-    
-    def get_stdDev(self, space='reciprocal'):
-        """
-        Calculate a 2D mask of the standard deviation of each reciprocal space 
-        pixel across all diffraction patterns.
-
-        Parameters:
-        data (numpy.ndarray): 4D STEM dataset
-
-        Returns:
-        numpy array: 2D mask of standard deviations with same shape as diffraction pattern.
-        """
-        # Validate the shape of the data
-        if len(self.array.shape) != 4:
-            raise ValueError("Data must be a 4D array")
-                
-        if space == 'reciprocal':
-            # Calculate the standard deviation for each pixel across all diffraction patterns
-            std_dev = np.std(self.array, axis=(0, 1))
-        elif space == 'real':
-            # Calculate the standard deviation for each pixel across all scanning positions
-            std_dev = np.std(self.array, axis=(2, 3))
-        else:
-            raise ValueError("'space' must be 'reciprocal' or 'real'")
-            
-        return ReciprocalSpace(std_dev)
-    
-    def get_dp(self, y=None, x=None, real_mask=None, reciprocal_mask=None):
-        """
-        Obtain a diffraction pattern from a specific 4D dataset, either at a 
-        specific point, averaged over a specified region, or a special diffraction
-        such as the dataset's 'mean', 'median', 'max', etc..
-        
-        Inputs:
-            y: (tuple of int, int, or string) If tuple (ymin, ymax), it 
-               specifies the vertical coordinate range to average over. If int,
-               it specifies a specific vertical coordinate. If string, 'y' must 
-               be one of the operations in 'operations' and returns the corresponding
-               special diffraction pattern such as the 'mean', 'median', etc.
-            x: (tuple of int or int, optional) If tuple (xmin, xmax), it 
-               specifies the horizontal coordinate range to average over. If 
-               int, it specifies a specific horizontal coordinate.
-        
-        Returns: 
-            dp: (numpy array) Diffraction pattern, either at a specific point, 
-            averaged over a region, or some other special diffraction.
-        
-        Raises:
-            ValueError: If inputs are improperly specified or not provided.
-        """
-        
-        if real_mask is not None or reciprocal_mask is not None:
-            if real_mask is not None:
-                if real_mask.shape == (self.shape[0], self.shape[1]):
-                    return ReciprocalSpace(np.mean(self.array[real_mask]), axis=(0))
-            else:
-                if reciprocal_mask.shape == (self.shape[2], self.shape[3]):
-                    return np.mean(self.array[:,:,reciprocal_mask], axis=(2))
-        
-        operations = {
-            'mean': np.mean,
-            'median': np.median,
-            'max': np.max,
-            'min': np.min,
-            'random': np.random.random,
-        }
-
-        if isinstance(y, str):
-            if y in operations:
-                if y == 'random':
-                    ky = int(self.shape[0]*operations[y]())
-                    kx = int(self.shape[1]*operations[y]())
-                    result = self.array[ky, kx]
-                else:
-                    result = operations[y](self.array, axis=(0, 1))
-                return ReciprocalSpace(result)
-            else:
-                valid_operations = ', '.join(f"'{op}'" for op in operations.keys())
-                raise ValueError(f"'y' must be an integer, tuple of integers, or string: {valid_operations}.")
-       
-        elif y is not None or x is not None:
-            
-            if isinstance(y, tuple) and isinstance(x, tuple):
-                ymin, ymax = y
-                xmin, xmax = x
-                return ReciprocalSpace(np.mean(self.array[ymin:ymax, xmin:xmax, :, :], axis=(0, 1)))
-            
-            elif isinstance(y, tuple) and isinstance(x, int):
-                ymin, ymax = y
-                return ReciprocalSpace(np.mean(self.array[ymin:ymax, x, :, :], axis=0))
-            
-            elif isinstance(y, int) and isinstance(x, tuple):
-                xmin, xmax = x
-                return ReciprocalSpace(np.mean(self.array[y, xmin:xmax, :, :], axis=0))
-            
-            elif isinstance(y, int) and isinstance(x, int):
-                return ReciprocalSpace(self.array[y, x])
-           
-            elif isinstance(y, tuple) and x is None:
-               ymin, ymax = y
-               return ReciprocalSpace(np.mean(self.array[ymin:ymax, :, :, :], axis=(0,1)))
-           
-            elif isinstance(y, int) and x is None:
-               return ReciprocalSpace(np.mean(self.array[y, :, :, :], axis=0))
-
-            elif y is None and isinstance(x, tuple):
-               xmin, xmax = x
-               return ReciprocalSpace(np.mean(self.array[:, xmin:xmax, :, :], axis=(0,1)))
-
-            elif y is None and isinstance(x, int):
-               return ReciprocalSpace(np.mean(self.array[:, x, :, :], axis=0))
-            
-            else:
-                raise ValueError("y and x must be either both tuples, both integers, or one tuple and one integer.")
-    
-        else:
-            raise ValueError("No parameters specified.")
-
-    # def bin_data(self, bin_domain='real', iterations=1):
-    #     """
-    #     Bin 4D dataset by averaging over the first two dimensions.
-    #     """
-        
-    #     assert len(self.shape) == 4, "'dataset' must be four-dimensional"
-    #     assert type(iterations) == int, "'iterations must be an integer >= 1"
-        
-    #     bin_factor = 2**iterations
-        
-    #     if bin_domain == 'real':
-    #         A, B, C, D = self.shape[0] // bin_factor, self.shape[1] // bin_factor, self.shape[2], self.shape[3]
-    #         binned_dataset = np.zeros((A, B, C, D))
-            
-    #     elif bin_domain == 'reciprocal':
-    #         C, D, A, B = self.shape[0], self.shape[1], self.shape[2] // bin_factor, self.shape[3] // bin_factor
-    #         binned_dataset = np.zeros((C, D, A, B))
-        
-        
-    #     for i in range(A):
-    #         for j in range(B):
-    #             # Average over the first two dimensions
-    #             for q in range(iterations):
-    #                 if bin_domain == 'real':
-    #                     binned_dataset[i, j] = np.mean(self.array[bin_factor*i:bin_factor*i+bin_factor, bin_factor*j:bin_factor*j+bin_factor], axis=(0, 1))
-    #                 else:
-    #                     binned_dataset[:, :, i, j] = np.mean(self.array[:,:, bin_factor*i:bin_factor*i+bin_factor, bin_factor*j:bin_factor*j+bin_factor], axis=(2, 3))
-
-
-    #     return HyperData(binned_dataset)
-    
-    def bin_data(self, bin_domain='real', iterations=1):
-        """
-        Bin 4D dataset by averaging over either the first two dimensions (real space) or the last two dimensions (reciprocal space).
-        """
-        
-        assert len(self.shape) == 4, "'dataset' must be four-dimensional"
-        assert isinstance(iterations, int) and iterations >= 1, "'iterations' must be an integer >= 1"
-        
-        bin_factor = 2 ** iterations
-        
-        if bin_domain == 'real':
-            A, B, C, D = self.shape[0] // bin_factor, self.shape[1] // bin_factor, self.shape[2], self.shape[3]
-            binned_dataset = np.zeros((A, B, C, D))
-            
-            for i in range(A):
-                for j in range(B):
-                    # Average over the first two dimensions (real space)
-                    binned_dataset[i, j] = np.mean(self.array[bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(0, 1))
-    
-        elif bin_domain == 'reciprocal':
-            A, B, C, D = self.shape[0], self.shape[1], self.shape[2] // bin_factor, self.shape[3] // bin_factor
-            binned_dataset = np.zeros((A, B, C, D))
-            
-            for i in range(C):
-                for j in range(D):
-                    # Average over the last two dimensions (reciprocal space)
-                    binned_dataset[:, :, i, j] = np.mean(self.array[:, :, bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(2, 3))
-    
-        else:
-            raise ValueError("Invalid bin_domain. Choose 'real' or 'reciprocal'.")
-    
-        return HyperData(binned_dataset)
-    
-    
-    def plotVirtualImage(self, r_minor, r_major, vmin=None, vmax=None, 
-                         grid=True, num_div=10,plotMask=False, gridColor='black',
-                         plotAxes=True,bds=None, returnArrays = False):
-        """
-        Plot virtual detector image
-        - r_minor, r_major specify the dimensions of the annular ring over which to integrate
-        - vmin, vmax specify the limiting pixel values to be plotted
-        - bds is tuple (y1, y2, x1, x2) used to crop the real-space image
-        
-        returnArrays: if True, returns the virtual image and detector mask
-        """
-        
-        assert len(self.shape)==4, "Input dataset must be 4-dimensional"
-        
-        A,B,C,D = self.shape
-        detector_mask = np.zeros((C,D)) # Diffraction pattern mask
-        
-        # Identify reciprocal space pixels within desired ring-shaped region
-        for i in range(C):
-            for j in range(D):
-                if r_minor<=np.sqrt((i-C/2)**2+(j-D/2)**2)<=r_major:
-                    detector_mask[i,j] = 1
-        
-        masked_image = np.sum(self.apply_annular_mask(r_minor, r_major, replacement_value=0).array, axis=(2,3))
-            
-        if vmin:
-            vmin = vmin
-        else:
-            vmin = np.min(masked_image[masked_image>0])
-        if vmax:
-            vmax = vmax
-        else:
-            vmax=np.max(masked_image)
-            
-        plt.imshow(masked_image, vmin=vmin, vmax=vmax, cmap='gray')
-    
-        if plotAxes:
-            plt.axis('on')
-            plt.xticks(np.arange(0, B, B//(num_div+1)))
-            plt.yticks(np.arange(0, A, A//(num_div+1)))
-        else:
-            plt.axis('off')    
-    
-        if grid:
-            plt.grid(c=gridColor)
-        plt.show()
-        
-        if plotMask:
-            if bds is None:
-                plt.imshow(np.log(np.mean(self.array, axis=(0,1))*detector_mask), cmap='turbo', vmin=vmin, vmax=vmax)
-                plt.axis('off')
-                plt.show()
-            else:
-                y1, y2, x1, x2 = bds
-                plt.imshow(np.log(np.mean(self.array[y1:y2, x1:x2], axis=(0,1))*detector_mask), 
-                           cmap='turbo', vmin=vmin, vmax=vmax)
-                plt.axis('off')
-                plt.show()
-    
-        if returnArrays:
-            return masked_image, np.mean(self.array, axis=(0,1))*detector_mask
-    
-    def getAllCenters(self, orders=[1,2,3], r=6.6,
-                            coords=None, num_spots_per_order=6, iterations=3):
-        """
-        Generate an array with all spot centers in 4D dataset
-        """
-        
-        assert len(self.shape) == 4, "Input dataset must be 4-dimensional"
-        Ny, Nx, _, _ = self.shape
-        
-        # Case 1: user wants to extract all centers of mass for a single order
-        if isinstance(orders, int):       
-            all_centers = np.zeros((Ny, Nx, num_spots_per_order, 2))
-            for i in tqdm(range(Ny), desc="Computing centers of mass"):
-                for j in range(Nx):
-                    
-                    all_centers[i, j] = self.get_dp(i, j).getCenters(order=orders, r=r,
-                                                                     coords=coords,iterations=iterations)
-                    
-        # Case 2: two or more spot orders are of interest
-        else:    
-            if isinstance(orders, (list, np.ndarray, tuple)):
-                num_orders = len(orders)  
-                all_centers = np.zeros((num_orders, Ny, Nx, num_spots_per_order, 2))
-                
-                # Iterate over each spot order in the list, tuple, or array provided
-                for o_idx, order in enumerate(orders):
-                    centers = np.zeros((Ny, Nx, num_spots_per_order, 2))
-                    
-                    for i in range(Ny):
-                        for j in range(Nx):
-                            
-                            dp = self.get_dp(i, j)
-                            
-                            if isinstance(r, list):
-                                
-                                centers[i][j] = dp.getCenters(spots_order=order, 
-                                                              coords=coords, r=r[o_idx])
-                            else:
-                                
-                                centers[i][j] = dp.getCenters(spots_order=order, coords=coords,
-                                                           r=r)
-                            
-                    all_centers[order-1] = centers
-            else:
-                raise TypeError("'orders' must be a list, numpy array, tuple, or integer")
-            
-        return all_centers
-
-    def apply_annular_mask(self, r_inner, r_outer=None, replacement_value=0):
-        """
-        Apply an annular mask to all images at the last two indices of an array.
-    
-        ...
-        
-        """
-        
-        if self.ndim >= 2:
-            ky, kx = self.shape[self.ndim-2], self.shape[self.ndim-1]
-            
-            bool_mask = make_mask(((ky-1)/2, (kx-1)/2), r_inner, mask_dim=(ky, kx), invert=True)
-            
-            if r_outer is not None:
-                outer_mask = make_mask(((ky-1)/2, (kx-1)/2), r_outer, mask_dim=(ky, kx),)
-                bool_mask = np.logical_and(bool_mask, outer_mask)
-            
-            if replacement_value:
-                replacement_values = np.logical_not(bool_mask) * replacement_value
-                return HyperData(self.array * bool_mask + replacement_values)
-            
-        return HyperData(self.array * bool_mask)
-
-    def get_clusters(self, n_PCAcomponents, n_clusters, r_centerBeam, std_Threshold = 0.2,
-                     plotStdMask=True, plotScree=True, plotClusterMap=True, plot3dClusterMap=False, 
-                     filter_size=3, cluster_cmap=None, filter_iterations=1,outer_ring=None, polar=False):
-        
-        """
-        Function that returns cluster dataset 
-        """
-        
-        assert len(self.shape)==4, "'dataset' must be 4-dimensional"
-        
-        # Remove center beam
-        A,B,C,D = self.shape
-        
-        if not polar:
-            dataset_noCenter = self.apply_annular_mask(r_centerBeam, r_outer=outer_ring).array
-        
-        else:
-            dataset_noCenter = np.zeros_like(dataset)
-            if outer_ring is not None:
-                dataset_noCenter[:,:,r_centerBeam:outer_ring] = dataset[:,:,r_centerBeam:outer_ring]
-            else:
-                dataset_noCenter[:,:,r_centerBeam:] = dataset[:,:,r_centerBeam:]
-        
-        # Find pixels of high variation
-        dataset_stdev = HyperData(dataset_noCenter**0.5).get_stdDev(space='reciprocal').array
-            
-        # Create a mask where True indicates standard deviation is below the threshold
-        low_std_dev_mask = dataset_stdev < std_Threshold*np.max(dataset_stdev)
-        
-        if plotStdMask:
-            plt.imshow(low_std_dev_mask, )
-            plt.title(f'High Std. Dev. Mask, std_threshold = {std_Threshold}')
-            plt.show()
-        
-        # Initialiaze high stdev data and modify its values
-        dataset_noCenter[:, :, low_std_dev_mask] = 0  
-        
-        dataset_noCenter = dataset_noCenter.reshape(-1, C*D)
-        
-        # PCA for dimensionality reduction
-        components = n_PCAcomponents
-        pca = PCA(n_components=components)
-        data_reduced = pca.fit_transform(np.log(clip_values(dataset_noCenter)))
-        
-        # Scree plot to find the optimal number of components
-        variance_ratios = pca.explained_variance_ratio_
-        
-        if plotScree:
-            plt.figure()
-            plt.plot(range(1, components+1), variance_ratios, marker='o')
-            plt.title("Scree Plot")
-            plt.xlabel("Principal Component")
-            plt.ylabel("Variance Explained")
-            plt.show()
-        
-        # K-means clustering
-        n_clusters = n_clusters
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0,)
-        clusters = kmeans.fit_predict(data_reduced)
-        
-        if cluster_cmap is not None:
-            colormap = plt.cm.get_cmap(cluster_cmap, n_clusters) 
-        else:
-            colormap = plt.cm.get_cmap('gnuplot', n_clusters,)
-        
-        if plot3dClusterMap:
-            # Plotting 3D
-            fig = plt.figure()
-            ax = fig.add_subplot(111, projection='3d')
-            
-            for i in range(n_clusters):
-                # Get the color for the current cluster
-                color = colormap(i)
-            
-                # Scatter plot for each cluster
-                ax.scatter(data_reduced[clusters == i, 0],
-                           data_reduced[clusters == i, 1],
-                           data_reduced[clusters == i, 2],
-                           # data_reduced[clusters == i, 3],
-                           c=[color], label=f'Cluster {i+1}', s=2, alpha=0.5)
-            
-            ax.set_xticklabels([])
-            ax.set_yticklabels([])
-            ax.set_zticklabels([])
-    
-            plt.show()
-        
-        # Plotting 2D projection
-        # Mapping back to original dimensions
-        cluster_map = clusters.reshape(A, B)
-        
-        if filter_size is not None:
-            for i in range(filter_iterations):
-                cluster_map = apply_majority_filter(cluster_map,filter_size)
-        
-        # Creating a color-coded AxB map
-        cluster_map_colored = np.zeros((A, B, 3), dtype=np.uint8)
-            
-        # Iterate over each cluster to color
-        for i in range(n_clusters):
-            # Convert color to RGB format
-            color = (np.array(colormap(i)[:3]) * 255).astype(np.uint8)
-            # Ensure proper broadcasting by using np.where
-            indices = np.where(cluster_map == i)
-            cluster_map_colored[indices] = color
-        
-        plt.figure()
-        plt.imshow(cluster_map_colored)
-        plt.title(f"Cluster Map ({A}x{B}) with {n_clusters} Clusters")
-        plt.colorbar()
-        plt.show()
-        
-        return cluster_map
-
-#%%
-
-class ReciprocalSpace:
-
-    def __init__(self, data):
-        self.array = data
-        self.shape = data.shape
-        self.denoiser = Denoiser(data)
-    
-    def show(self, power=1, title='Diffraction Pattern', logScale=True, 
-             axes=True, vmin=None, vmax=None, figsize=(10,10), aspect=None, cmap='turbo'):
-        """
-        Visualize a desired diffraction pattern
-        
-        power: (int or float) 
-        """
-    
-        # Visualize
-        plt.figure(figsize=figsize)
-            
-        if logScale:
-            processed_data = power * np.log(self.array)
-        else:
-            processed_data = self.array ** power
-        
-        # Determine vmin and vmax if not provided
-        if vmin is None:
-            vmin = np.min(processed_data)
-        if vmax is None:
-            vmax = np.max(processed_data)
-        
-        # Display the image with the specified color mapping and value limits
-        im1 = plt.imshow(processed_data, vmin=vmin, vmax=vmax, cmap=cmap)
-        
-        if aspect is not None:
-            plt.gca().set_aspect(aspect)  
-            
-        if axes:
-            
-            ky, kx = self.shape
-            
-            plt.axis('on')
-            plt.xticks(np.arange(0, kx, 5))
-            plt.yticks(np.arange(0, ky, 5))
-    
-            ax = plt.gca()
-            divider = make_axes_locatable(ax)
-            cax = divider.append_axes("right", size="5%", pad=0.05)
-    
-            cb = plt.colorbar(im1, cax=cax)
-            cb.ax.tick_params(labelsize=15)
-            ax.set_title(title, fontsize=18)
-                          
-            plt.title("Intensity", fontsize=14)
-    
-        else:
-    
-            plt.axis('off')
-    
-        plt.show()
-    
-    #TODO: how to call method from HyperData?
-    # def remove_center_beam(self):
-    #     """
-        
-    #     """
-    #     return ReciprocalSpace(annular)
-    
-    def getSpotCenter(self, ky, kx, r, plotSpot=False, iterations=1):
-        """
-        Find the center of mass (of pixel intensities) of a diffraction spot, 
-        allowing for non-integer radii.
-        """
-        
-        # Pad and round up to ensure the entire radius is accommodated
-        pad_width = int(np.ceil(r))
-        padded_data = np.pad(self.array, pad_width=pad_width, mode='constant')
-    
-        # Adjustment of padding coordinates
-        ky_padded, kx_padded = ky + pad_width, kx + pad_width
-        
-        # Determine the size of the area to extract based on r, ensuring it matches the mask's dimensions
-        area_size = int(np.ceil(r * 2))
-        if area_size % 2 == 0:
-            area_size += 1  # Ensure the area size is odd to match an odd-sized mask
-            
-        for i in range(iterations):
-            # Generate the circular mask with the correct dimensions
-            mask = circular_mask(area_size // 2, area_size // 2, r)
-            
-            # Extract the region of interest from the padded data
-            ymin, ymax = int(ky_padded - (area_size // 2)), int(ky_padded + (area_size // 2))
-            xmin, xmax = int(kx_padded - (area_size // 2)), int(kx_padded + (area_size // 2))
-            spot_data = padded_data[ymin:ymax + 1, xmin:xmax + 1]
-        
-            # Check if shapes match, otherwise adjust
-            if spot_data.shape != mask.shape:
-                min_dim = min(spot_data.shape[0], mask.shape[0], spot_data.shape[1], mask.shape[1])
-                spot_data = spot_data[:min_dim, :min_dim]
-                mask = mask[:min_dim, :min_dim]
-        
-            # Apply mask and calculate its CoM
-            masked_spot_data = spot_data * mask
-            com_y, com_x = center_of_mass(masked_spot_data)
-            
-            if plotSpot:
-                # Create turbo colormap with 0-values white
-                base_cmap = plt.cm.turbo
-                custom_cmap = ListedColormap(np.concatenate(([np.array([1, 1, 1, 1])], 
-                                                             base_cmap(np.linspace(0, 1, 2**12))[1:]), axis=0))
-                plt.imshow(masked_spot_data, cmap=custom_cmap)
-                plt.colorbar()
-                plt.scatter(com_x, com_y, color='yellow', s=50, label='Subpixel CoM')
-                plt.show()
-            
-            ky_padded = com_y + ymin
-            kx_padded = com_x + xmin
-                
-        # Adjust the CoM to account for padding
-        ky_CoM = ky_padded - pad_width
-        kx_CoM = kx_padded - pad_width
-    
-        return ky_CoM, kx_CoM
-
-    def getCenters(self, order=None, r=6, coords=coords, num_spots_per_order=6, 
-                   plotSpots=False, iterations=1):
-        """
-        Generate an array spot centers for any DP
-        
-        r : int, float or list
-            if list, its length must be the same as that of coords
-        """
-        
-        assert len(self.shape) == 2, "Input data must be of 2-dimensional"
-        
-        if order is not None:
-            
-            # Define spot indeces to extract
-            spot_adder = (order - 1)*num_spots_per_order
-        
-            order_centers = np.zeros((num_spots_per_order, 2))
-            for j in range(num_spots_per_order):
-                order_centers[j] = self.getSpotCenter(coords[j + spot_adder][0],
-                                                 coords[j + spot_adder][1],
-                                                 r, plotSpots,iterations=iterations)
-                
-        else:
-            
-            order_centers = np.zeros((len(coords), 2))
-            
-            if isinstance(r, (int, float)):
-                for j in range(len(coords)):
-                    order_centers[j] = self.getSpotCenter(coords[j][0],
-                                                         coords[j][1],
-                                                         r, plotSpots,iterations=iterations)
-                
-            else:
-                for j in range(len(coords)):
-                    order_centers[j] = self.getSpotCenter(coords[j][0],
-                                                         coords[j][1],
-                                                         r[j], plotSpots,iterations=iterations)
-            
-        return order_centers
-
-    # Needs update
-    def masked_DPs(self, mask_radius, coords, order=None, title=None, 
-                   plotSpots=False,return_mask=False,iterations=1,plot=True):
-        """ 
-        Generate masked diffraction plots for each order.
-        Order = 1,2,3,4; Last option plots all.
-        """
-        
-        A,B = self.shape
-        compound_mask = np.zeros((A, B))
-        
-        # Obtain CoMs of interst
-        centers = self.getCenters(spots_order=order, r=mask_radius, coords=coords, plotSpots=plotSpots, iterations=iterations)
-    
-        for mask_center in centers:
-                    
-            mask_spot = make_mask(mask_center, mask_radius, mask_dim=(A,B))
-            compound_mask = compound_mask + mask_spot     
-        
-        # Apply compound mask
-        masked_data = self.array*compound_mask
-        
-        if plot: 
-            
-            plt.figure(figsize=(10, 10))
-            base_cmap = plt.cm.turbo
-        
-            # Create a new colormap from the existing colormap
-            # np.concatenate combines the arrays. The first array is just [1, 1, 1, 1] which corresponds to white in RGBA.
-            # We take the colormap 'turbo', convert it to an array, and exclude the first color to make room for white.
-            custom_cmap = ListedColormap(np.concatenate(([np.array([1, 1, 1, 1])], 
-                                                         base_cmap(np.linspace(0, 1, 2**12))[1:]), axis=0))
-        
-            # Plotting 
-            im1 = plt.imshow(masked_data, cmap=custom_cmap)
-            ax = plt.gca()
-            divider = make_axes_locatable(ax)
-            cax = divider.append_axes("right", size="5%", pad=0.05)
-            
-            # Title settings based on 'spots_order'
-            if title:
-                assert type(title) == str, "The title of the plot must be a string."
-                ax.set_title(title, fontsize=18)
-            else:
-                ax.set_title('Masked Diffraction Pattern', fontsize=18)
-            
-            # Colorbar settings
-            cb = plt.colorbar(im1, cax=cax)
-            cb.ax.tick_params(labelsize=15)
-            plt.title("Intensity", fontsize=14, pad=20)  # Adjusted to avoid overlapping with the main title
-        
-            plt.show()
-        
-        if return_mask:
-            return compound_mask
-
-    def getIntensities(self, spots_order=None, center=None, r=6, coords=None):
-        """
-        Extract Bragg peak intensities from a single DP
-        """
-    
-        # Determine how many intensities are to be extracted
-        if type(spots_order) == int:
-            if spots_order == 4:
-                ints = np.zeros(18)
-            elif spots_order < 4:
-                ints = np.zeros(6)
-        
-            if center is None:
-                center = self.getCenters(spots_order, r, coords)
-        
-            for int_idx, intensity in enumerate(ints):
-        
-                masked_data = self.array*make_mask(center[int_idx], r)
-                ints[int_idx] = np.sum(masked_data[int(center[int_idx][0]-(r+1)):int(center[int_idx][0]+(r+1)),
-                                                   int(center[int_idx][1]-(r+1)):int(center[int_idx][1]+(r+1))])
-    
-        elif spots_order is None:
-            
-            num_ints = len(center)
-            ints = np.zeros(num_ints)
-            
-            if isinstance(r, (int, float)):
-                for int_idx in range(num_ints):
-                    masked_data = self.array*make_mask(center[int_idx], r)
-                    ints[int_idx] = np.sum(masked_data)            
-                
-            else:
-                for int_idx in range(num_ints):
-                    masked_data = self.array*make_mask(center[int_idx], r[int_idx])
-                    ints[int_idx] = np.sum(masked_data)
-        
-        return ints
-    
-    
-    def remove_bg(self, min_sigma=0.85, 
-                      max_sigma=2.5, 
-                      num_sigma=100, 
-                      threshold=85,
-                      bg_frac=0.99,
-                      mask_radial_frac=0.9,
-                      min_distance_factor=0.8,
-                      max_distance_factor=1.5,
-                      search_radius_factor=2.5, # When refining centers of mass
-                      iterations=5,
-                      n_estimators = 60, learning_rate = 0.1, max_depth = 50, # Predictor model parameters
-                      radii_multiplier=1.5, radii_slope=1.38,
-                      vmin=4,vmax=14, get_bg = True,
-                      axes=False,plotInput=False,plotCenters=True,plotBg=False,plotResult=True,):
-        
-        A, B = self.shape
-        mask = make_mask((A//2,B//2), r_mask=(A+B)//4*mask_radial_frac) # Define region where spots are to be found
-        
-        # Extract centers and radii automatically
-        blobs_log = feature.blob_log(self.array*mask, min_sigma=min_sigma, 
-                                     max_sigma=max_sigma, 
-                                     num_sigma=num_sigma, 
-                                     threshold=threshold)
-        # Unpack values
-        r_vals = blobs_log[:,2]
-        blobs_array = np.array(blobs_log[:, :2])
-    
-        # Calculate pairwise distances between blobs. The result is a square matrix.
-        distances = cdist(blobs_array, blobs_array)
-        # Set diagonal to np.inf to ignore self-comparison.
-        np.fill_diagonal(distances, np.inf)
-        # Find the distance to the nearest neighbor for each blob.
-        nearest_neighbor_dist = distances.min(axis=1)
-    
-        # Define your distance thresholds.
-        min_threshold = np.mean(np.min(distances,axis=0))*min_distance_factor  # Minimum acceptable distance to the nearest neighbor.
-        max_threshold = np.mean(np.min(distances,axis=0))*max_distance_factor  # Maximum acceptable distance to the nearest neighbor.
-    
-        # Filter blobs. Keep a blob if its nearest neighbor is neither too close nor too far.
-        filtered_indices = np.where((nearest_neighbor_dist >= min_threshold) 
-                                    & (nearest_neighbor_dist <= max_threshold)
-                                    & (((blobs_array[:,0]-A//2)**2+(blobs_array[:,1]-B//2)**2)**.5 <= (A+B)//4*mask_radial_frac*(8/9)))[0]
-    
-        # Apply filter
-        blobs_log = np.zeros((len(filtered_indices), 3))
-        blobs_log[:, :2] = blobs_array[filtered_indices]
-        blobs_log[:, 2] = r_vals[filtered_indices]
-        
-        
-        if plotCenters:
-        
-            plt.figure(figsize=(10, 10))
-            plt.imshow(np.log(self.array), cmap='turbo',vmin=vmin,vmax=vmax)
-            plt.axis('off')
-        
-            # Circle around each blob
-            for blob in blobs_log:
-                y, x, r = blob
-                c = plt.Circle((x, y), r, color='red', linewidth=2, fill=False)
-                plt.gca().add_patch(c)
-        
-            plt.show()
-        
-        # Refine peak centers using CoM
-        peak_centers = self.getCenters(r=blobs_log[:,2]*search_radius_factor,
-                                       coords=blobs_log[:,:2], iterations=iterations)
-        
-        distance_to_center = np.linalg.norm(peak_centers-(A+B)//4,axis=1)
-        radii = blobs_log[:,2]*radii_multiplier + radii_slope*(1 - distance_to_center/np.max(distance_to_center))
-        
-        if get_bg:
-            # Masks sizes are based on computed radius of spot and distance to center (center spots with greater radius than far spots)
-            dp_bg = predict_values(self.array,centers=peak_centers,radius=radii,
-                                   n_estimators=n_estimators,learning_rate=learning_rate, max_depth=max_depth)
-    
-        if plotInput:
-            self.show(vmin=vmin,vmax=vmax,axes=axes, title="Input Diffraction Pattern")
-        
-        if plotBg and get_bg:
-            ReciprocalSpace(dp_bg).show(vmin=vmin,vmax=vmax,axes=axes)
-    
-        if plotResult:
-            ReciprocalSpace(clip_values(self.array-bg_frac*dp_bg)).show(vmin=vmin,vmax=vmax,axes=axes,
-                   title=f'ne={n_estimators},learning_rate={learning_rate}, max_depth={max_depth}')
-        
-        if get_bg:
-            return peak_centers, radii, dp_bg
-        
-        else:
-            return peak_centers, radii
-
-    
 # %% Load 4D data
 
 if __name__ == '__main__':
@@ -4166,7 +4995,7 @@ if __name__ == '__main__':
     tensor = np.transpose(tensor, (1, 3, 0, 2))
     
     
-    print(structured.apply_annular_mask(1., 2.5, 888).array)
+    print(structured.apply_mask(1., 2.5, 888).array)
     
     mask1 = make_mask((50//2,50//2), 10, mask_dim=(50,50), invert=True)
     mask2 = make_mask((50//2,50//2), 20, mask_dim=(50,50), invert=False)
@@ -4348,271 +5177,9 @@ if __name__ == '__main__':
     HyperData.plotVirtualImage(40,60,plotAxes=False)
     denoised_real.plotVirtualImage(40,60,plotAxes=False)
     denoised_reciprocal.plotVirtualImage(40,60,plotAxes=False)
-    denoised_full4D.plotVirtualImage(40,60,plotAxes=False)
+    denoised_full4D.plotVirtualImage(40,60,plotAxes=False)   
     
-    
-    
-    #%% Atomic res data
-    
-    import scipy.io
-    
-    def read_mat_file(filename):
-        try:
-            data = scipy.io.loadmat(filename)
-            # Assuming the variable inside .mat you want is named 'data'
-            # You need to replace 'data' with the actual variable name you want to extract.
-            # Usually, the variable names can be listed with data.keys()
-            if 'data' in data:
-                dp = data['data']
-                print("Data loaded successfully.")
-                return dp
-            else:
-                print("Data key not found in the .mat file.")
-                return data
-        except NotImplementedError:
-            print("This file may be in HDF5 format. Trying h5py to load.")
-            return read_mat_file_h5py(filename)
-        except Exception as e:
-            print(f"Failed to read the .mat file: {e}")
-            return None
-    
-    def read_mat_file_h5py(filename):
-        import h5py
-        try:
-            with h5py.File(filename, 'r') as file:
-                # List all groups
-                print("Keys: %s" % list(file.keys()))
-                # Let's assume data is the first key
-                first_key = list(file.keys())[0]
-                data = np.array(file[first_key])
-                return data
-        except Exception as e:
-            print(f"Error reading with h5py: {e}")
-            return None
-    
-    
-    file_path = 'C:/Users/haloe/Documents/CodeWriting/pythonCodes/HanLab/InverseFunction/cbed_atomic_res.mat'
-    
-    """Read the 4D dataset as a numpy array from .mat file.
-       the shape of the data is (x, y, kx, ky)."""
-    # data = read_4D(file_path)
-    
-    atomic_res_data = read_mat_file(file_path)
-    atomic_res_data = atomic_res_data['cbed']
-    
-    atomic_res_data = HyperData(atomic_res_data)
-    atomic_res_data = atomic_res_data.swap_coordinates()
-    atomic_res_data = atomic_res_data.alignment(r_mask=20)[0]
-    
-    
-    #%%
-    
-    def reconFromGradDir(grad_x, grad_y, im_height=None, plot=True):
-        
-        """
-        Function based on MATLAB code written by Colin Ophus (MM/YYYY)
-        """
-        
-        padding = 2  # padding of reconstruction space
-        qMin = 0.00  # min spatial frequency in 1/pixels
-        qMax = 0.25  # max spatial frequency in 1/pixels
-        num_iter = 50
-        step_size = 0.99
-    
-        # Coordinates
-        im_size = grad_x.shape
-        N = tuple(s * padding for s in im_size)
-        qxa, qya = makeFourierCoords(N, 1)
-        q2a = qxa**2 + qya**2
-    
-        # Operators
-        q2inv = np.reciprocal(q2a)
-        q2inv[0, 0] = 0
-        qFilt = np.exp(q2a / (-2 * qMax**2))
-        if qMin > 0:
-            qFilt = qFilt * (1 - np.exp(q2a / (-2 * qMin**2)))
-        qxOp = (-1j / 4) * qxa * q2inv * qFilt
-        qyOp = (-1j / 4) * qya * q2inv * qFilt
-    
-        # Normalize the gradients
-        grad_x = grad_x - np.median(grad_x)
-        grad_y = grad_y - np.median(grad_y)
-    
-        # Mask updates
-        vx = np.arange(im_size[0])
-        vy = np.arange(im_size[1])
-        mask = np.zeros(N, dtype=bool)
-        mask[np.ix_(vx, vy)] = True
-        mask_inv = ~mask
-    
-        # Reconstruct height
-        recon_height = np.zeros(N)
-        for a0 in range(num_iter):
-            grad_x_recon = (np.roll(recon_height, shift=-1, axis=0) -
-                            np.roll(recon_height, shift=1, axis=0)) / 2
-            grad_y_recon = (np.roll(recon_height, shift=-1, axis=1) -
-                            np.roll(recon_height, shift=1, axis=1)) / 2
-    
-            # Difference and masking
-            grad_x_recon[mask] = grad_x_recon[mask] - grad_x.ravel()
-            grad_y_recon[mask] = grad_y_recon[mask] - grad_y.ravel()
-            grad_x_recon[mask_inv] = 0
-            grad_y_recon[mask_inv] = 0
-    
-            recon_update = np.fft.ifft2(
-                np.fft.fft2(grad_x_recon) * qxOp +
-                np.fft.fft2(grad_y_recon) * qyOp
-            ).real
-    
-            recon_height -= step_size * recon_update
-    
-        # Crop
-        recon_height = recon_height[np.ix_(vx, vy)]
-    
-        # Plotting
-        if plot:
-            plt.figure(11)
-            plt.clf()
-            ax = plt.gca()
-            Ip1 = recon_height - np.median(recon_height)
-            if im_height is None:
-                im = ax.imshow(Ip1, cmap='turbo')
-            else:
-                Ip2 = im_height - np.median(im_height)
-                im = ax.imshow(np.hstack((Ip1, Ip2)), cmap='turbo')
-    
-            plt.axis('equal')
-            plt.axis('off')
-    
-            # Adjust the colorbar to have the same height as the image
-            divider = make_axes_locatable(ax)
-            cax = divider.append_axes("right", size="5%", pad=0.05)
-            plt.colorbar(im, cax=cax)
-            plt.show()
-    
-        return recon_height
-    
-    
-    def makeFourierCoords(size, spacing):
-        """
-        This function is based on MATLAB code written by Colin Ophus (MM/YYYY)."""
-        nx, ny = size
-        qx = np.fft.fftfreq(nx, spacing)
-        qy = np.fft.fftfreq(ny, spacing)
-        qxa, qya = np.meshgrid(qx, qy, indexing='ij')
-        return qxa, qya
-    
-    
-    def rotate_height(height, angle, axis='x'):
-        """Rotate the height map based on the specified axis and angle.
-    
-        Parameters:
-        - height: 2D numpy array representing the height map.
-        - angle: float, rotation angle in degrees.
-        - axis: str, 'x' for x-axis rotation, 'y' for y-axis rotation.
-    
-        Returns:
-        - 2D numpy array representing the rotated height map.
-        """
-    
-        shape_array = np.shape(height)
-    
-        if axis == 'x':
-            i_values = np.arange(shape_array[1])
-            adjustment = i_values * np.tan(angle * np.pi / 180)
-            height_rot = height[:, :shape_array[1]] - adjustment
-        elif axis == 'y':
-            i_values = np.arange(shape_array[0])
-            adjustment = i_values * np.tan(angle * np.pi / 180)
-            height_rot = height[:shape_array[0], :] - adjustment[:, np.newaxis]
-    
-        return height_rot
-    
-    
-    def fix_sign_errors(img, window_shape=(3, 3)):
-        
-        # Ensure both dimensions of window_shape are odd for center pixel calculation
-        if any(dim % 2 == 0 for dim in window_shape):
-            raise ValueError("Both dimensions of window_shape must be odd.")
-    
-        # Create a copy of the original image to store the corrected values.
-        corrected_img = np.copy(img)
-    
-        # Calculate the margins
-        margin_y = window_shape[0] // 2
-        margin_x = window_shape[1] // 2
-    
-        # Get the dimensions of the image.
-        rows, cols = img.shape
-    
-        # Slide through the image using the specified window.
-        for i in range(margin_y, rows-margin_y):
-            for j in range(margin_x, cols-margin_x):
-                # Extract the neighborhood.
-                window = img[i-margin_y:i+margin_y+1, j-margin_x:j+margin_x+1]
-    
-                # Check the sign of the center pixel.
-                center_val = img[i, j]
-    
-                # If the sign of the sum of the window and the center pixel are different, flip the sign.
-                if np.sign(np.sum(window)) != np.sign(center_val):
-                    corrected_img[i, j] *= -1
-    
-        return corrected_img
-    
-    
-    def compute_gradients(height_map):
-        """
-        Compute gradients given a 3D map
-        """
-        assert len(height_map.shape) == 2,'The height map must be 2-dimensional'
-        
-        # Initialize the gradient maps with zeros
-        xGrad_recon = np.zeros_like(height_map)
-        yGrad_recon = np.zeros_like(height_map)
-    
-        # Compute x-gradient using center pixel (exclude 1st and last columns)
-        xGrad_recon[:, 1:-1] = (height_map[:, 2:] - height_map[:, :-2]) / 2
-        # Copy the gradient for the edge columns
-        xGrad_recon[:, 0] = xGrad_recon[:, 1]
-        xGrad_recon[:, -1] = xGrad_recon[:, -2]
-    
-        # Compute y-gradient using center pixel (exclude 1st and last rows)
-        yGrad_recon[1:-1, :] = (height_map[2:, :] - height_map[:-2, :]) / 2
-        # Copy the gradient for the edge rows
-        yGrad_recon[0, :] = yGrad_recon[1, :]
-        yGrad_recon[-1, :] = yGrad_recon[-2, :]
-    
-        return xGrad_recon, yGrad_recon
-    
-    
-    def fix_tilt_and_height(height_map):
-        """
-        Helper function to perform linear regression and return the slope
-        """
-        def get_slope(ave_height):
-            x = np.arange(ave_height.size)
-            A = np.vstack([x, np.ones_like(x)]).T
-            slope, _ = np.linalg.lstsq(A, ave_height, rcond=None)[0]
-            return slope
-    
-        # 1. Linear regression for x-axis and adjust tilt
-        ave_height_x = np.mean(height_map, axis=0)
-        slope_x = get_slope(ave_height_x)
-        height_map = rotate_height(
-            height_map, np.arctan(slope_x) * 180 / np.pi, axis='x')
-    
-        # 2. Linear regression for y-axis and adjust tilt
-        ave_height_y = np.mean(height_map, axis=1)
-        slope_y = get_slope(ave_height_y)
-        height_map = rotate_height(
-            height_map, np.arctan(slope_y) * 180 / np.pi, axis='y')
-    
-        # 3. Adjust the average height based on a chosen region
-        height_map = height_map - np.mean(height_map[0:25, 20:256])
-    
-        return height_map
-    
+    #%%    
     
     def plot_regression_for_both_axes(height_map):
         
@@ -4645,61 +5212,7 @@ if __name__ == '__main__':
         ave_height_y = np.mean(height_map, axis=1)
         plot_regression(ave_height_y, 'Y')
     
-    
-    def iterative_reconstruction(xGrad, yGrad, iterations=10, threshold_percent=5, 
-                                 box_size=(3, 3), plot=True):
-        
-        """
-        Make 3D reconstruction based on xGrad and yGrad information. For each 
-        iteration, the gradient sign (without changing its magnitude) is refined 
-        for surface continuity.
-        """
-        xCorr = fix_sign_errors(xGrad, (3, 3))
-        yCorr = fix_sign_errors(yGrad, (3, 3))
-    
-        for i in range(iterations):
-            # Step 1: Obtain a height map "hmap_fixed" using xGrad and yGrad
-            
-            if plot and i == iterations-1:
-                
-                plotMap(xCorr, 'X')
-                plotMap(yCorr, 'Y')
-            
-            h_map = reconFromGradDir(yCorr, xCorr, plot=False)
-            hmap_fixed = fix_tilt_and_height(h_map)
-    
-            if i < iterations - 1:
-                
-                # Step 2: Obtain the gradients from the reconstructed map
-                xGrad_recon, yGrad_recon = compute_gradients(hmap_fixed)
-    
-                # Compare the original, modified gradients xCorr, yCorr with xGrad_recon, yGrad_recon
-                xDiff = np.abs(xCorr - xGrad_recon)
-                yDiff = np.abs(yCorr - yGrad_recon)
-    
-                # Determine threshold based on percentile
-                xThreshold = np.percentile(xDiff, 100 - threshold_percent)
-                yThreshold = np.percentile(yDiff, 100 - threshold_percent)
-    
-                # Flip signs where the difference exceeds the threshold
-                xCorr[xDiff > xThreshold] *= -1
-                yCorr[yDiff > yThreshold] *= -1
-                
-                # Step 3: Fix signs of gradients using the same function as before
-                xCorr = fix_sign_errors(xCorr, box_size)
-                yCorr = fix_sign_errors(yCorr, box_size)
-        
-        
-        if plot: 
-            # Finally, plot the resulting height map after all iterations
-            plotMap(hmap_fixed, title="Iterated Height Map",
-                    legendtitle="Height \n (px)")
-            
-            return hmap_fixed, xCorr, yCorr
-            
-        else: 
-            
-            return hmap_fixed
+
     
     
     def plotAllHeights(height_map):
@@ -4792,87 +5305,7 @@ if __name__ == '__main__':
         plt.colorbar(im1, cax=cax)
         cb = plt.colorbar(im1, cax=cax)
         cb.ax.tick_params(labelsize=10)
-        plt.show()
-    
-    
-    
-    def getStrains(spots_order, centers_data, ref_centers=None, ang=49, gs=1, plot=True, order=False):
-        """
-        spots_order = 1,2,3
-        """
-    
-        if order:
-            diff_pos = centers_data
-        else:
-            diff_pos = centers_data[spots_order-1]
-    
-        if ref_centers is None:
-            mean_pos = (np.mean(np.mean(diff_pos[40:60, 25:65], axis=0), axis=0)
-                        + np.mean(np.mean(diff_pos[40:60, 95:115], axis=0), axis=0)
-                        + np.mean(np.mean(diff_pos[40:60, 157:175], axis=0), axis=0)
-                        + np.mean(np.mean(diff_pos[40:60, 210:230], axis=0), axis=0))/4
-        else:
-            mean_pos = ref_centers
-    
-        """ g vectors """
-        g1 = diff_pos[:, :, gs-1, :] - diff_pos[:, :, gs+2, :]
-        g2 = (diff_pos[:, :, gs, :] + diff_pos[:, :, gs+1, :]) / 2 - \
-            (diff_pos[:, :, (gs+3) % 6, :] + diff_pos[:, :, (gs+4) % 6, :]) / 2
-        
-        print("g1: ", np.mean(g1,axis=(0,1)))
-        print("g2: ", np.mean(g2,axis=(0,1)))
-        
-        """ Reference g's """
-        ref_g1 = mean_pos[gs-1] - mean_pos[gs+2]
-        ref_g2 = (mean_pos[gs] + mean_pos[gs+1]) / 2 - \
-            (mean_pos[(gs+3) % 6] + mean_pos[(gs+4) % 6]) / 2
-    
-        """ G array """
-        G_ref = np.array([[ref_g2[0], ref_g1[0]],
-                          [ref_g2[1], ref_g1[1]]])
-            
-        """ R matrices """
-        ang = ang
-        R1 = np.array([[np.cos(ang/180*np.pi), np.sin(ang/180*np.pi)],
-                      [-np.sin(ang/180*np.pi), np.cos(ang/180*np.pi)]])
-    
-        
-        """ Strain arrays """
-        ydim = centers_data.shape[0]
-        xdim = centers_data.shape[1]
-    
-        exx1 = np.zeros((ydim, xdim))
-        eyy1 = np.zeros((ydim, xdim))
-        exy1 = np.zeros((ydim, xdim))
-        theta1 = np.zeros((ydim, xdim))
-    
-        """ Calculations """
-        for i in range(ydim):
-            for j in range(xdim):
-                G1 = np.array([[g2[i][j][0], g1[i][j][0]],
-                              [g2[i][j][1], g1[i][j][1]]])
-                T = R1@G1@np.linalg.inv(G_ref)@np.linalg.inv(R1)
-    
-                R, U = polar(T)
-    
-                # Uniaxial
-                eyy1[i][j] = 1-U[0, 0]
-                exx1[i][j] = 1-U[1, 1]
-    
-                # Shear
-                exy1[i][j] = U[1, 0]
-    
-                # Rotation
-                theta1[i][j] = np.arccos(R[0, 1])
-    
-        if plot:
-            # Plot uncorrected strain
-            plotStrain(exx1, 0.06)
-            plotStrain(eyy1, 0.03)
-            plotStrain(exy1, 0.06)
-            plotRot(theta1)
-    
-        return exx1, eyy1, exy1, theta1         
+        plt.show()    
     
     """Other functions"""
     
@@ -5060,7 +5493,7 @@ if __name__ == '__main__':
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     
         # Find peak of histogram
-        peak_idx, _ = find_peaks(counts)
+        peak_idx, _ = hist_peaks(counts)
         if peak_idx.size > 0:
             peak_height = counts[peak_idx[0]]
             half_max = peak_height / 2
@@ -5141,29 +5574,9 @@ if __name__ == '__main__':
         plt.show()
     
         # Print metrics
-        print(f"Metrics: Mean={mean}, Median={median}, Std Dev={std_dev}, Skewness={skewness}, Kurtosis={kurtosis}, Range={data_range}, FWHM={fwhm}")
+        print(f"Metrics: Mean={mean}, Median={median}, Std Dev={std_dev}, Skewness={skewness}, Kurtosis={kurtosis}, Range={data_range}, FWHM={fwhm}")   
     
-    
-    def getGradients(sol_array, rot_angle=0):
-        """
-        Get directional gradient from solution array (phi, theta). The function 
-        assumes the solution array is of shape (rows, cols, 2).
-        """
-    
-        # Adjust phi by the rotation angle
-        phi = sol_array[:, :, 0] - rot_angle*np.pi/180
-        theta = sol_array[:, :, 1]
-    
-        # Compute gradients
-        dzdy = np.tan(theta) * np.cos(phi)
-        dzdx = np.tan(theta) * np.sin(phi)
-    
-        # Stack gradients
-        array_gradients = np.stack((dzdx, dzdy), axis=-1)
-    
-        return array_gradients
-    
-    def getPhiMapFromGradients(Grad, component, thetaMap):
+    def get_phiMapFromGradients(Grad, component, thetaMap):
         
         if component == 'x' or 'X':
             
@@ -5181,58 +5594,7 @@ if __name__ == '__main__':
         r = np.sqrt((y - center_y)**2 + (x - center_x)**2)
         theta = np.arctan2(y - center_y, x - center_x)
         return r, theta
-    
-    def remove_circular_region(image, centers, radius=6):
-        """
-        This function removes circular regions from a 2D array.
-        """
-    
-        for center in centers:
-            y, x = center
-            for i in range(image.shape[0]):
-                for j in range(image.shape[1]):
-                    if np.sqrt((i - y)**2 + (j - x)**2) <= radius:
-                        image[i, j] = 0
-        return image
-    
-    def predict_values(image, centers, radius=6, center_y=64, center_x=64,
-                       n_estimators=100,learning_rate=0.1, max_depth=10):
-        """
-        Use XGBoost Regressor to interpolate gap regions of 2D array
-        """
-        # Apply the mask to the image
-        if isinstance(radius, np.ndarray):    
-            masked_image = image.copy()
-            for idx, center in enumerate(centers):
-                masked_image = remove_circular_region(masked_image, np.array([centers[idx]]), radius[idx])
-        else:
-            masked_image = remove_circular_region(image.copy(), centers, radius)
-    
-        # Create training data from the unmasked pixels using polar coordinates
-        y, x = np.where(masked_image > 0)  
-        r, theta = y,x
-        # r, theta = cartesian_to_polar(y, x, center_y, center_x)
-        X_train = np.column_stack((r, theta))
-        y_train = masked_image[y, x]
-    
-        # Initialize and fit the model
-        model = xgb.XGBRegressor(objective ='reg:squarederror', n_estimators=n_estimators, 
-                                 learning_rate=learning_rate, max_depth=max_depth)
-        model.fit(X_train, y_train)
-    
-        # Predict the values of the masked pixels
-        y_test, x_test = np.where(masked_image == 0)
-        r_test, theta_test = y_test, x_test
-        # r_test, theta_test = cartesian_to_polar(y_test, x_test, center_y, center_x)
-        X_test = np.column_stack((r_test, theta_test))
-        predictions = model.predict(X_test)
-    
-        # Fill in the predictions in the image
-        predicted_background = masked_image.copy()
-        predicted_background[y_test, x_test] = predictions
-    
-        return predicted_background
-    
+  
     
     def adjust_phi_to_match_gradients(xgrad, ygrad, phiMap):
         """
@@ -5344,6 +5706,7 @@ if __name__ == '__main__':
         # Output the standard deviations
         for i in range(len(std_dev_x)):
             print(f"Dataset {i+1}: Std Dev in x_coords_centered = {std_dev_x[i]:.2f}, Std Dev in y_coords_centered = {std_dev_y[i]:.2f}")
+    
     
     def plot_all_centers_of_mass(centers_ws2, transparency=0.5, labels=None, drawConvexHull=True):
         """
@@ -5554,7 +5917,7 @@ if __name__ == '__main__':
         
         return average_values
         
-    def getSNR(dataset, signalMask, resBgMask, noiseMask, returnArray=False):
+    def get_SNR(dataset, signalMask, resBgMask, noiseMask, returnArray=False):
         """
         Return a signal-to-noise ratio (SNR) measurement for the input 4D dataset or diffraction pattern
         """
@@ -5602,7 +5965,7 @@ if __name__ == '__main__':
                 
                 return meanSNR, stdSNR
             
-    def getNoise(dataset, noiseMask):
+    def get_noise(dataset, noiseMask):
         
         assert len(dataset.shape) == 2 or len(dataset.shape) == 4, "Input 'dataset' must be 2D or 4D"
         
