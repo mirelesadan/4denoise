@@ -21,11 +21,11 @@ The core Python module provides a modular toolkit for loading, cleaning, and ana
 - **Visualization** – Quick-look plots.
 - **Extensibility** – Designed so denoising, inpainting, or custom models can be swapped in without changing the overall workflow.
 
-## 2.1. Simulation of Ripple-like 4D-STEM Dataset (`NAME_OF_FILE.ipynb`) [Jupyter Notebook]
+## 2.1. Simulation of Ripple-like 4D-STEM Dataset (`generateSimulatedRipple_4Ddata.ipynb`) [Jupyter Notebook]
 
 This Jupyter notebook shows how the simulation data in `simulated_4d_dataset_highRes.npy` was obtained and how Poisson shot noise was added to obtain the results shown in _"**Strain Mapping of Three-dimensionally Structured Two-dimensional Materials**"_.
 
-## 2.2. Processing of Experimental Nanobeam 4D-STEM Data (`generateSimulatedRipple_4Ddata.ipynb`) [Jupyter Notebook]
+## 2.2. Processing of Experimental Nanobeam 4D-STEM Data (`NAME.ipynb`) [Jupyter Notebook]
 
 ## 2.3. BRIGHT MATLAB GUI: 3D Strain & Topography Viewer (`gui.m`) [MATLAB Script]
 
