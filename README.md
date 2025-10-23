@@ -23,7 +23,7 @@ The core Python module provides a modular toolkit for loading, cleaning, and ana
 
 ## 2.1. Simulation of Ripple-like 4D-STEM Dataset (`generateSimulatedRipple_4Ddata.ipynb`) [Jupyter Notebook]
 
-This Jupyter notebook shows how the simulation data in `simulated_4d_dataset_highRes.npy` was obtained, how Poisson shot noise was added to such data, and how the corresponding 3D reconstructions were obtained. These are the results shown in _"**Strain Mapping of Three-dimensionally Structured Two-dimensional Materials**"_.
+This Jupyter notebook shows how the simulation data in `simulated_4d_dataset_highRes.npy` was obtained, how Poisson shot noise was added to such data, and how the corresponding 3D reconstructions were obtained. The notebook includes the results shown in _"**Strain Mapping of Three-dimensionally Structured Two-dimensional Materials**"_.
 
 ## 2.2. Processing of Experimental Nanobeam 4D-STEM Data (`NAME.ipynb`) [Jupyter Notebook]
 
