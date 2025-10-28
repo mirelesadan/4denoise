@@ -1,4 +1,4 @@
-⚠️ **Status (Oct 14, 2025)**: We are updating this package to ensure full reproducibility of the results in **_“Strain Mapping of Three-dimensionally Structured Two-dimensional Materials”_**, including Jupyter notebooks and detailed, step-by-step instructions.
+⚠️ **Status (Oct 25, 2025)**: We are updating this package to ensure full reproducibility of the results in **_“Strain Mapping of Three-dimensionally Structured Two-dimensional Materials”_**, including Jupyter notebooks and detailed, step-by-step instructions.
 
 # 1. About the Project
 **4Denoise** is a Python package for advanced processing, visualizing, and denoising 4D-STEM datasets.
