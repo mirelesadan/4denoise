@@ -27,7 +27,7 @@ This Jupyter notebook shows how the simulation data in `simulated_4d_dataset_hig
 
 ## 2.2. Processing of Experimental Nanobeam 4D-STEM Data (`exp_MoS2_MoSe2_processing.ipynb`) [Jupyter Notebook]
 
-
+In this notebook, we load the experimental data presented in _"**Strain Mapping of Three-dimensionally Structured Two-dimensional Materials**"_, show methods for visualizing and processing it, and enable 3D reconstruction followed by strain mapping and strain correction using tilt information. The notebook details each step carefully and contains multiple notes to guide the user. 
 
 ## 2.3. BRIGHT MATLAB GUI: 3D Strain & Topography Viewer (`gui.m`) [MATLAB Script]
 
