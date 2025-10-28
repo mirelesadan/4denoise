@@ -25,7 +25,9 @@ The core Python module provides a modular toolkit for loading, cleaning, and ana
 
 This Jupyter notebook shows how the simulation data in `simulated_4d_dataset_highRes.npy` was obtained, how Poisson shot noise was added to such data, and how the corresponding 3D reconstructions were obtained. The notebook includes the results shown in _"**Strain Mapping of Three-dimensionally Structured Two-dimensional Materials**"_.
 
-## 2.2. Processing of Experimental Nanobeam 4D-STEM Data (`NAME.ipynb`) [Jupyter Notebook]
+## 2.2. Processing of Experimental Nanobeam 4D-STEM Data (`exp_MoS2_MoSe2_processing.ipynb`) [Jupyter Notebook]
+
+
 
 ## 2.3. BRIGHT MATLAB GUI: 3D Strain & Topography Viewer (`gui.m`) [MATLAB Script]
 
@@ -39,7 +41,7 @@ It allows toggling between corrected/uncorrected strain components, rotating the
 ### 2.3.2. Requirements
 
 - MATLAB R2021a or newer
-- Ten `.mat` input files generated from the Jupyter notebook ([`name of notebook`]) in the **4Denoise** repository:
+- Ten `.mat` input files generated from the Jupyter notebook ([`exp_MoS2_MoSe2_processing`]) in the **4Denoise** repository:
   ```
   height_map.mat
   exx_rippleData.mat
