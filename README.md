@@ -29,6 +29,10 @@ This Jupyter notebook shows how the simulation data in `simulated_4d_dataset_hig
 
 In this notebook, we load the experimental data presented in _"**Strain Mapping of Three-dimensionally Structured Two-dimensional Materials**"_, show methods for visualizing and processing it, and enable 3D reconstruction followed by strain mapping and strain correction using tilt information. The notebook details each step carefully and contains multiple notes to guide the user. 
 
+### 2.2.1. DEMO Notebook
+
+We also add a Jupyter notebook that uses a small 4D dataset `mini_dataset_binned.npy` for testing the reconstructiong algorithm. This dataset is binned (each pixel is ~10.3 nm) and encompasses a whole ripple. All instructions are contained within the Jupyter notebook.
+
 ## 2.3. BRIGHT MATLAB GUI: 3D Strain & Topography Viewer (`gui.m`) [MATLAB Script]
 
 <img width="1149" height="548" alt="image" src="https://github.com/user-attachments/assets/52c2c52f-20d8-429f-a906-590bdc09674a" />
