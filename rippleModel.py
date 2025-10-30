@@ -322,138 +322,138 @@ def phplot(field1, Amp='raw', scale=True, subplot=True):
 
     return rgb_image
 
-#%%
+# #%%
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.cm import get_cmap
+# import numpy as np
+# import matplotlib.pyplot as plt
+# from matplotlib.cm import get_cmap
 
-def generate_digitized_data():
-    """
-    Generate data for digitizing the sketch graph.
+# def generate_digitized_data():
+#     """
+#     Generate data for digitizing the sketch graph.
 
-    Returns:
-    --------
-    theta_input : ndarray
-        Array of theta_input values (x-axis).
-    errors : list of ndarray
-        List containing arrays of error values for each curve (y-axis).
-    phi_input : list of ndarray
-        List containing arrays of phi_input values for each curve (color-coded scatter points).
-    """
-    # Parameters
-    num_points = 50  # Number of points per curve
-    num_curves = 4   # Number of curves
-    noise_scale = [0.1, 0.15, 0.2, 0.25]  # Noise scales for each curve
+#     Returns:
+#     --------
+#     theta_input : ndarray
+#         Array of theta_input values (x-axis).
+#     errors : list of ndarray
+#         List containing arrays of error values for each curve (y-axis).
+#     phi_input : list of ndarray
+#         List containing arrays of phi_input values for each curve (color-coded scatter points).
+#     """
+#     # Parameters
+#     num_points = 50  # Number of points per curve
+#     num_curves = 4   # Number of curves
+#     noise_scale = [0.1, 0.15, 0.2, 0.25]  # Noise scales for each curve
 
-    # Generate theta_input (common for all curves)
-    theta_input = np.linspace(0, 25, num_points)
+#     # Generate theta_input (common for all curves)
+#     theta_input = np.linspace(0, 25, num_points)
 
-    # Generate fitted curves and scattered data
-    errors = []
-    phi_input = []
-    for i in range(num_curves):
-        # Define a monotonically increasing base curve
-        curve = (i + 1) * 0.4 * np.sqrt(theta_input)
+#     # Generate fitted curves and scattered data
+#     errors = []
+#     phi_input = []
+#     for i in range(num_curves):
+#         # Define a monotonically increasing base curve
+#         curve = (i + 1) * 0.4 * np.sqrt(theta_input)
 
-        # Add random noise to create scattered points
-        scattered_points = curve + np.random.normal(scale=noise_scale[i], size=num_points)
+#         # Add random noise to create scattered points
+#         scattered_points = curve + np.random.normal(scale=noise_scale[i], size=num_points)
 
-        # Generate random phi_input values for color mapping
-        phi = np.random.uniform(0, 360, num_points)  # Randomly distributed over 0-360 degrees
+#         # Generate random phi_input values for color mapping
+#         phi = np.random.uniform(0, 360, num_points)  # Randomly distributed over 0-360 degrees
 
-        # Append to lists
-        errors.append(scattered_points)
-        phi_input.append(phi)
+#         # Append to lists
+#         errors.append(scattered_points)
+#         phi_input.append(phi)
 
-    return theta_input, errors, phi_input
-
-
-def normalize_data_globally(errors, fitted_curves, target_min=0, target_max=3):
-    """
-    Normalize all data (scattered points and fitted curves) globally between target_min and target_max.
-
-    Parameters:
-    -----------
-    errors : list of ndarray
-        List of scattered data arrays.
-    fitted_curves : list of ndarray
-        List of fitted curve arrays.
-    target_min : float
-        Minimum value of the target range. Default is 0.
-    target_max : float
-        Maximum value of the target range. Default is 3.
-
-    Returns:
-    --------
-    normalized_errors : list of ndarray
-        List of globally normalized scattered data arrays.
-    normalized_curves : list of ndarray
-        List of globally normalized fitted curve arrays.
-    """
-    # Flatten all data into a single array to compute global min and max
-    all_data = np.concatenate([np.hstack(errors), np.hstack(fitted_curves)])
-    data_min = np.min(all_data)
-    data_max = np.max(all_data)
-
-    # Normalize data globally to the target range
-    def normalize(array):
-        return (array - data_min) / (data_max - data_min) * (target_max - target_min) + target_min
-
-    normalized_errors = [normalize(error) for error in errors]
-    normalized_curves = [normalize(curve) for curve in fitted_curves]
-
-    return normalized_errors, normalized_curves
+#     return theta_input, errors, phi_input
 
 
-def plot_digitized_data(theta_input, errors, phi_input):
-    """
-    Plot the digitized data resembling the sketch.
+# def normalize_data_globally(errors, fitted_curves, target_min=0, target_max=3):
+#     """
+#     Normalize all data (scattered points and fitted curves) globally between target_min and target_max.
 
-    Parameters:
-    -----------
-    theta_input : ndarray
-        Array of theta_input values (x-axis).
-    errors : list of ndarray
-        List containing arrays of error values for each curve (y-axis).
-    phi_input : list of ndarray
-        List containing arrays of phi_input values for each curve (color-coded scatter points).
-    """
-    cmap = get_cmap("turbo")  # Color map for phi_input
+#     Parameters:
+#     -----------
+#     errors : list of ndarray
+#         List of scattered data arrays.
+#     fitted_curves : list of ndarray
+#         List of fitted curve arrays.
+#     target_min : float
+#         Minimum value of the target range. Default is 0.
+#     target_max : float
+#         Maximum value of the target range. Default is 3.
 
-    # Generate fitted curves
-    fitted_curves = [(i + 1) * 0.4 * np.sqrt(theta_input) for i in range(len(errors))]
+#     Returns:
+#     --------
+#     normalized_errors : list of ndarray
+#         List of globally normalized scattered data arrays.
+#     normalized_curves : list of ndarray
+#         List of globally normalized fitted curve arrays.
+#     """
+#     # Flatten all data into a single array to compute global min and max
+#     all_data = np.concatenate([np.hstack(errors), np.hstack(fitted_curves)])
+#     data_min = np.min(all_data)
+#     data_max = np.max(all_data)
 
-    # Normalize all data globally
-    normalized_errors, normalized_curves = normalize_data_globally(errors, fitted_curves)
+#     # Normalize data globally to the target range
+#     def normalize(array):
+#         return (array - data_min) / (data_max - data_min) * (target_max - target_min) + target_min
 
-    # Create the figure and axis
-    plt.figure(figsize=(8, 6))
-    for i in range(len(errors)):
-        # Plot scattered points with color mapping
-        sc = plt.scatter(theta_input, normalized_errors[i], c=phi_input[i], cmap=cmap, s=15, alpha=0.8)
+#     normalized_errors = [normalize(error) for error in errors]
+#     normalized_curves = [normalize(curve) for curve in fitted_curves]
 
-        # Plot normalized fitted curves (black line)
-        plt.plot(theta_input, normalized_curves[i], color='black', linewidth=1)
-
-    # Add labels, colorbar, and title
-    cbar = plt.colorbar(sc)
-    cbar.set_label(r'$\phi_{\mathrm{input}}$ (°)', fontsize=14)
-    cbar.ax.tick_params(labelsize=12)
-
-    plt.xlabel(r'$\theta_{\mathrm{input}}$ (°)', fontsize=14)
-    plt.ylabel(r'Error = $|\theta_{\mathrm{input}} - \theta_{\mathrm{model}}|$ (°)', fontsize=14)
-    plt.xticks(fontsize=12)
-    plt.yticks(fontsize=12)
-
-    # Set axis ranges
-    plt.xlim(0, 25)
-    plt.ylim(0, 3)
-
-    plt.tight_layout()
-    plt.show()
+#     return normalized_errors, normalized_curves
 
 
-# Generate data and plot
-theta_input, errors, phi_input = generate_digitized_data()
-plot_digitized_data(theta_input, errors, phi_input)
+# def plot_digitized_data(theta_input, errors, phi_input):
+#     """
+#     Plot the digitized data resembling the sketch.
+
+#     Parameters:
+#     -----------
+#     theta_input : ndarray
+#         Array of theta_input values (x-axis).
+#     errors : list of ndarray
+#         List containing arrays of error values for each curve (y-axis).
+#     phi_input : list of ndarray
+#         List containing arrays of phi_input values for each curve (color-coded scatter points).
+#     """
+#     cmap = get_cmap("turbo")  # Color map for phi_input
+
+#     # Generate fitted curves
+#     fitted_curves = [(i + 1) * 0.4 * np.sqrt(theta_input) for i in range(len(errors))]
+
+#     # Normalize all data globally
+#     normalized_errors, normalized_curves = normalize_data_globally(errors, fitted_curves)
+
+#     # Create the figure and axis
+#     plt.figure(figsize=(8, 6))
+#     for i in range(len(errors)):
+#         # Plot scattered points with color mapping
+#         sc = plt.scatter(theta_input, normalized_errors[i], c=phi_input[i], cmap=cmap, s=15, alpha=0.8)
+
+#         # Plot normalized fitted curves (black line)
+#         plt.plot(theta_input, normalized_curves[i], color='black', linewidth=1)
+
+#     # Add labels, colorbar, and title
+#     cbar = plt.colorbar(sc)
+#     cbar.set_label(r'$\phi_{\mathrm{input}}$ (°)', fontsize=14)
+#     cbar.ax.tick_params(labelsize=12)
+
+#     plt.xlabel(r'$\theta_{\mathrm{input}}$ (°)', fontsize=14)
+#     plt.ylabel(r'Error = $|\theta_{\mathrm{input}} - \theta_{\mathrm{model}}|$ (°)', fontsize=14)
+#     plt.xticks(fontsize=12)
+#     plt.yticks(fontsize=12)
+
+#     # Set axis ranges
+#     plt.xlim(0, 25)
+#     plt.ylim(0, 3)
+
+#     plt.tight_layout()
+#     plt.show()
+
+
+# # Generate data and plot
+# theta_input, errors, phi_input = generate_digitized_data()
+# plot_digitized_data(theta_input, errors, phi_input)
