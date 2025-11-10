@@ -76,7 +76,7 @@ Controls include:
 
 #### 3. Save the unzipped folder in a desired directory.
 
-#### 4. _Open Anaconda and **launch** `anaconda_prompt`._
+#### 4. Open Anaconda and **launch** `anaconda_prompt`.
 <img width="1654" height="484" alt="image" src="https://github.com/user-attachments/assets/aa470bb6-0ce5-424e-b971-6ebdc5754179" />
 
 #### 5. Go to the directory with the unzipped folder and **Copy Address as Text**:
