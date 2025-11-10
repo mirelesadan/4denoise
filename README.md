@@ -1,3 +1,10 @@
+# How to Run
+Make sure you install [**Anaconda**] (https://www.anaconda.com/download) (create account and download for free).
+
+We begin by downloading the code.
+<img width="1762" height="768" alt="image" src="https://github.com/user-attachments/assets/89124471-c322-4a93-97e3-fb45a315c1da" />
+
+
 # 1. About the Project
 **4Denoise** is a Python package for advanced processing, visualizing, and denoising 4D-STEM datasets.
 
