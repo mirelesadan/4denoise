@@ -7,8 +7,10 @@
 (iii) _Save the unzipped folder in a desired directory._
 
 (iv) _Open Anaconda and **launch** `anaconda_prompt`._
-
 <img width="1654" height="484" alt="image" src="https://github.com/user-attachments/assets/aa470bb6-0ce5-424e-b971-6ebdc5754179" />
+
+(v) Go to the directory with the unzipped folder and copy the address:
+<img width="1713" height="257" alt="image" src="https://github.com/user-attachments/assets/07d47c51-72d5-40ea-94ad-ab098f3b869d" />
 
 
 # 1. About the Project
