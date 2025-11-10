@@ -1,4 +1,4 @@
-name: 4denoise-demo
+name: 4denoise
 channels: [conda-forge]
 dependencies:
   - python=3.11
