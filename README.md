@@ -1,5 +1,5 @@
-# How to Run
-(i) Make sure you install [**Anaconda**](https://www.anaconda.com/download) (create account and download for free).
+<img width="1072" height="124" alt="image" src="https://github.com/user-attachments/assets/600c0f0c-a3de-40c6-b520-38a3b6ff05c1" /># How to Run
+(i) _Make sure you install [**Anaconda**](https://www.anaconda.com/download) (create account and download for free)_.
 
 (ii) _We begin by downloading the code._
 <img width="1762" height="768" alt="image" src="https://github.com/user-attachments/assets/89124471-c322-4a93-97e3-fb45a315c1da" />
@@ -9,9 +9,13 @@
 (iv) _Open Anaconda and **launch** `anaconda_prompt`._
 <img width="1654" height="484" alt="image" src="https://github.com/user-attachments/assets/aa470bb6-0ce5-424e-b971-6ebdc5754179" />
 
-(v) Go to the directory with the unzipped folder and copy the address:
+(v) _Go to the directory with the unzipped folder and **Copy Address as Text**_:
 <img width="1713" height="257" alt="image" src="https://github.com/user-attachments/assets/07d47c51-72d5-40ea-94ad-ab098f3b869d" />
 
+(vi) In the **Anaconda Prompt**, change directory to the one where the unzipped folder was saved using the following. Make sure that you type `cd` ("**c**hange **d**irectory") before the address:
+```
+cd your\directory\here\4denoise-main
+```
 
 # 1. About the Project
 **4Denoise** is a Python package for advanced processing, visualizing, and denoising 4D-STEM datasets.
