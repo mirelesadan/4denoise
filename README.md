@@ -69,17 +69,17 @@ Controls include:
 - Overlay group: HAADF / Height / Phase Map (mutually exclusive with the Strain group).
 
 # 3. How to Run
-#### 1. _Make sure you install [**Anaconda**](https://www.anaconda.com/download) (create account and download for free)_.
+#### 1. Make sure you install [**Anaconda**](https://www.anaconda.com/download) (create account and download for free).
 
-#### 2. _We begin by downloading the code._
+#### 2. We begin by downloading the code.
 <img width="1762" height="768" alt="image" src="https://github.com/user-attachments/assets/89124471-c322-4a93-97e3-fb45a315c1da" />
 
-#### 3. _Save the unzipped folder in a desired directory._
+#### 3. Save the unzipped folder in a desired directory.
 
 #### 4. _Open Anaconda and **launch** `anaconda_prompt`._
 <img width="1654" height="484" alt="image" src="https://github.com/user-attachments/assets/aa470bb6-0ce5-424e-b971-6ebdc5754179" />
 
-#### 5. _Go to the directory with the unzipped folder and **Copy Address as Text**_:
+#### 5. Go to the directory with the unzipped folder and **Copy Address as Text**:
 <img width="1713" height="257" alt="image" src="https://github.com/user-attachments/assets/07d47c51-72d5-40ea-94ad-ab098f3b869d" />
 
 #### 6. In the **Anaconda Prompt**, change directory to the one where the unzipped folder was saved using the following. Make sure that you type `cd` ("**c**hange **d**irectory") before the address you just copied. Paste it as is:
