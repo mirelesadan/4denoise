@@ -1,0 +1,16 @@
+name: 4denoise-demo
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - numpy=1.26.*
+  - scipy=1.11.*
+  - matplotlib=3.8.*
+  - scikit-image=0.22.*
+  - scikit-learn=1.4.*
+  - h5py=3.10.*
+  - tqdm=4.66.*
+  - jupyterlab=4.2.*
+  - ipykernel=6.29.*
+  - pip
+  - pip:
+      - opencv-python==4.9.*
