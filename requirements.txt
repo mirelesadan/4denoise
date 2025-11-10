@@ -1,10 +1,13 @@
-numpy
-matplotlib
-opencv-python-headless  # If you don't need GUI functions from OpenCV, use headless for environments without GUI support.
-h5py
-scipy
+numpy==1.26.*
+scipy==1.11.*
+matplotlib==3.8.*
+scikit-image==0.22.*
+scikit-learn==1.4.*
+h5py==3.10.*
+tqdm==4.66.*
+ipykernel==6.29.*
+jupyterlab==4.2.*
+opencv-python==4.10.*              # or headless
 xgboost
-scikit-image
-scikit-learn
-abtem 
+abtem
 ase
