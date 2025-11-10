@@ -1,4 +1,4 @@
-<img width="1072" height="124" alt="image" src="https://github.com/user-attachments/assets/600c0f0c-a3de-40c6-b520-38a3b6ff05c1" /># How to Run
+# How to Run
 (i) _Make sure you install [**Anaconda**](https://www.anaconda.com/download) (create account and download for free)_.
 
 (ii) _We begin by downloading the code._
@@ -16,6 +16,18 @@
 ```
 cd your\directory\here\4denoise-main
 ```
+
+(vii) We will then run the following (ensuring we are in the proper directory). This will download and install required Python packages to use **4Denoise**.
+```
+conda env create -f environment.yml
+conda activate 4denoise-main
+pip install -e .
+python -m ipykernel install --user --name 4denoise-main --display-name "4denoise-main"
+```
+
+(viii) We type `jupyter notebook` in the Anaconda Prompt (or select it directly in the Anaconda app) to open the Jupyter notebook application. We then open the file `DEMO_exp_4dstem_ripple_processing.ipynb`
+
+---
 
 # 1. About the Project
 **4Denoise** is a Python package for advanced processing, visualizing, and denoising 4D-STEM datasets.
