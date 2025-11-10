@@ -1,8 +1,14 @@
 # How to Run
-Make sure you install [**Anaconda**] (https://www.anaconda.com/download) (create account and download for free).
+(i) Make sure you install [**Anaconda**] (https://www.anaconda.com/download) (create account and download for free).
 
-We begin by downloading the code.
+(ii) _We begin by downloading the code._
 <img width="1762" height="768" alt="image" src="https://github.com/user-attachments/assets/89124471-c322-4a93-97e3-fb45a315c1da" />
+
+(iii) _Save the unzipped folder in a desired directory._
+
+(iv) _Open Anaconda and **launch** `anaconda_prompt`._
+
+<img width="1654" height="484" alt="image" src="https://github.com/user-attachments/assets/aa470bb6-0ce5-424e-b971-6ebdc5754179" />
 
 
 # 1. About the Project
