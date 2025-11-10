@@ -12,7 +12,7 @@
 (v) _Go to the directory with the unzipped folder and **Copy Address as Text**_:
 <img width="1713" height="257" alt="image" src="https://github.com/user-attachments/assets/07d47c51-72d5-40ea-94ad-ab098f3b869d" />
 
-(vi) In the **Anaconda Prompt**, change directory to the one where the unzipped folder was saved using the following. Make sure that you type `cd` ("**c**hange **d**irectory") before the address:
+(vi) In the **Anaconda Prompt**, change directory to the one where the unzipped folder was saved using the following. Make sure that you type `cd` ("**c**hange **d**irectory") before the address you just copied. Paste it as is:
 ```
 cd your\directory\here\4denoise-main
 ```
