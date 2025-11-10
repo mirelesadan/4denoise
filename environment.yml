@@ -13,4 +13,4 @@ dependencies:
   - ipykernel=6.29.*
   - pip
   - pip:
-      - opencv-python==4.9.*
+      - opencv-python==4.10.*
