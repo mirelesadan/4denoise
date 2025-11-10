@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fourdenoise-demo"
+version = "0.0.0"
+description = "4Denoise classroom demo utilities"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+py-modules = [
+  "fourdenoise",
+  "abTEM_helpers",
+  "rippleModel",
+  "kin_diff_sim"
+]
