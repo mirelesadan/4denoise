@@ -11,6 +11,8 @@ dependencies:
   - tqdm=4.66.*
   - jupyterlab=4.2.*
   - ipykernel=6.29.*
+  - notebook=7.3.*
+  - jupyterlab=4.2.*
   - py-opencv=4.10.*      
   - pip
   - pip:
