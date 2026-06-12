@@ -3,8 +3,8 @@ The 4denoise data structures:
     - HyperData
     - ReciprocalSpace
     - RealSpace
-    - DenoisingMethods
-    - Denoiser
+    - _DenoisingMethods
+    - _DenoiseEngine
 
 Author: 
     Adan J Mireles
@@ -18,12 +18,13 @@ Date:
 
 import numpy as np
 import h5py
+from copy import deepcopy
+from functools import lru_cache
 from numbers import Integral
 
 
 from scipy import ndimage
 from scipy.stats import mode
-from scipy.signal import find_peaks as hist_peaks
 import scipy.stats
 from scipy.ndimage import center_of_mass
 from scipy.ndimage import median_filter
@@ -37,6 +38,7 @@ from scipy.fft import fft2, fftshift
 from scipy.interpolate import griddata
 from scipy.spatial.distance import cdist
 from scipy.optimize import minimize
+from scipy.optimize import linear_sum_assignment
 from scipy.optimize import curve_fit
 from scipy.ndimage import affine_transform
 from scipy.ndimage import map_coordinates
@@ -65,26 +67,32 @@ import inspect
 import numba #new
 from numba import jit, prange #new
 
-# import tensorly as tl
+import tensorly as tl
+from tensorly.tt_matrix import tt_matrix_to_tensor
+from tensorly.tt_tensor import tt_to_tensor
 
-# from tensorly.decomposition import constrained_parafac
-# from tensorly.decomposition import parafac2 as par2
-# from tensorly.decomposition import tensor_ring as t_ring
-# from tensorly.decomposition import tensor_train_matrix as tt_mat
-# from tensorly.decomposition import tensor_train as tt
-# from tensorly.decomposition import non_negative_tucker_hals as nnth
-# from tensorly.decomposition import non_negative_tucker as nnt
-# from tensorly.decomposition import partial_tucker as partial_tuck
-# from tensorly.decomposition import tucker as tuck
-# from tensorly.decomposition import randomised_parafac as rand_parafac
-# from tensorly.decomposition import non_negative_parafac_hals as nn_parafac_hals
-# from tensorly.decomposition import non_negative_parafac as nn_parafac
-# from tensorly.decomposition import parafac as par
+from tensorly.decomposition import constrained_parafac
+from tensorly.decomposition import parafac2 as par2
+from tensorly.decomposition import tensor_ring_als as tr_als
+from tensorly.decomposition import tensor_ring_als_sampled as tr_als_sampled
+from tensorly.decomposition import tensor_train_matrix as tt_mat
+from tensorly.decomposition import tensor_train as tt
+from tensorly.decomposition import non_negative_tucker_hals as nnth
+from tensorly.decomposition import non_negative_tucker as nnt
+from tensorly.decomposition import partial_tucker as partial_tuck
+from tensorly.decomposition import tucker as tuck
+from tensorly.decomposition import randomised_parafac as rand_parafac
+from tensorly.decomposition import non_negative_parafac_hals as nn_parafac_hals
+from tensorly.decomposition import non_negative_parafac as nn_parafac
+from tensorly.decomposition import parafac as par
+from tensorly.decomposition import robust_pca as robust_tensor_pca
 
-# from tensorly.decomposition import parafac_power_iteration as parafac_power_iter
-# from tensorly.decomposition import symmetric_parafac_power_iteration as sym_parafac_power_iter
+from tensorly.decomposition import parafac_power_iteration as parafac_power_iter
+from tensorly.decomposition import symmetric_parafac_power_iteration as sym_parafac_power_iter
 
 from typing import Union, Sequence, Tuple
+
+_SCALE_UNSET = object()
     
 #%%
 
@@ -94,10 +102,11 @@ from typing import Union, Sequence, Tuple
 
 #TODO: Allow for reading data that has more than (128,128) in k-space
 #TODO: read EMD file data
+#TODO: combine with RosettaSciIO
 
 def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128), trim_meta=True, clip=True):
     """
-    Read the 4D dataset as a numpy array from .raw , . mat, .npy file.
+    Read a 3D or 4D dataset as a numpy array from .raw, .mat, or .npy file.
     
     Function written by Chuqiao Shi (2022)
     See on GitHub: Chuqiao2333/Hierarchical_Clustering
@@ -109,12 +118,58 @@ def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128), trim_meta=True, clip
     Input:
         fname: the file path
 
-    Return: 
-        dp       : numpy array
-        dp_shape : the shape of the data
+    Return:
+        dp : numpy array
         
     Function modified by Adan Mireles to make '.mat' file reading more general (July 2024)
     """
+
+    def _replace_nan_patterns(dp):
+        """Replace corrupted 2D patterns in 3D/4D stacks with neighbor averages."""
+        if not np.issubdtype(dp.dtype, np.number) or not np.isnan(dp).any():
+            return dp
+
+        if dp.ndim < 3:
+            print('Found NaNs. Replacing with zeros...')
+            return np.nan_to_num(dp, nan=0.0)
+
+        scan_shape = dp.shape[:-2]
+        nan_mask = np.isnan(dp).any(axis=(-2, -1))
+
+        num_NaNs = int(nan_mask.sum())
+        if num_NaNs == 0:
+            return dp
+
+        print(f'Found {num_NaNs} corrupted diffraction patterns. Replacing with local average...')
+
+        bad_indices = np.argwhere(nan_mask)
+        for bad_index_array in bad_indices:
+            bad_index = tuple(bad_index_array)
+            neighbors = []
+
+            for offset_values in np.ndindex(*(3,) * len(scan_shape)):
+                offsets = tuple(value - 1 for value in offset_values)
+                if all(offset == 0 for offset in offsets):
+                    continue
+
+                neighbor_index = tuple(
+                    index + offset
+                    for index, offset in zip(bad_index, offsets)
+                )
+                in_bounds = all(
+                    0 <= index < size
+                    for index, size in zip(neighbor_index, scan_shape)
+                )
+                if in_bounds and not nan_mask[neighbor_index]:
+                    neighbors.append(dp[neighbor_index])
+
+            if neighbors:
+                dp[bad_index] = np.stack(neighbors, axis=0).mean(axis=0)
+            else:
+                dp[bad_index] = 0.0
+
+        print('...Done')
+        return dp
 
     # Read 4D data from .raw file
     fname_end = fname.split('.')[-1]
@@ -144,47 +199,20 @@ def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128), trim_meta=True, clip
         dp = np.load(fname)
         
     else:
-        print('This function only supports reading .mat, .raw & .npy files.') 
-        
-    if clip:
+        raise ValueError('This function only supports reading .mat, .raw & .npy files.')
+
+    if dp is None:
+        raise ValueError(f"Could not read data from '{fname}'.")
+
+    dp = np.asarray(dp)
+
+    if clip and np.issubdtype(dp.dtype, np.number):
         # Replace negative and near-zero pixel values with 1
         low_vals_mask = dp < 1
         dp[low_vals_mask] = 1
-    
-    # We proceed to determine whether there are any `nan` values in the dataset
-    a, b, c, d = dp.shape
-    nan_mask = np.isnan(dp).any(axis=(2, 3))  # shape (a, b)
-    
-    num_NaNs = nan_mask.sum()
-    if num_NaNs > 0:
-        print(f'Found {num_NaNs} corrupted diffraction patterns. Replacing with local average...')
-        
-        # Find all indices of bad diffraction patterns
-        bad_indices = np.argwhere(nan_mask)
-        
-        # Iterate over each bad diffraction pattern
-        for i, j in bad_indices:
-            neighbors = []
-            # loop over 8-connected neighborhood
-            for di in (-1, 0, 1):
-                for dj in (-1, 0, 1):
-                    if di == 0 and dj == 0:
-                        continue
-                    ni, nj = i + di, j + dj
-                    # check bounds and that neighbor has no NaNs
-                    if 0 <= ni < a and 0 <= nj < b and not nan_mask[ni, nj]:
-                        neighbors.append(dp[ni, nj])
-            
-            # if valid neighbors found, replace with their mean
-            if neighbors:
-                stack = np.stack(neighbors, axis=0)
-                dp[i, j] = stack.mean(axis=0)
-            else:
-                # no valid neighbor, you may choose to leave it or fill zeros
-                dp[i, j] = 0.0 
-                
-        print('...Done')
-        
+
+    dp = _replace_nan_patterns(dp)
+
     return dp
 
 def _read_mat_file(filename):
@@ -571,90 +599,1745 @@ def visualize_field_phase_amplitude(field, Amp='raw', scale=True, subplot=True):
 
     return rgb_image
 
-#TODO: assert that unfold_domain is a string and is included in a list of possible unfolding methods
-#TODO: add other method of unfolding bsed on patterns (forgot the name)
-def unfold_tensor(tensor, unfold_domain, undo=False, original_shape=None):
-    
-    
-    if original_shape and unfold_domain in ['real', 'reciprocal', 'both']:
-        tensor = tensor.reshape(original_shape)
-        return tensor
-    
-    if not undo:
-        original_shape = tensor.shape
-    
-    # Unfold real space and obtain a stack of diffraction patterns
-    if unfold_domain == 'real':
-        
-        new_tensor_shape = (original_shape[0]*original_shape[1],) + original_shape[2:]
-        tensor = tensor.reshape(new_tensor_shape)
-    
-    # Unfold reciprocal space and obtain a stack of real-space images
-    elif unfold_domain == 'reciprocal':
-        new_tensor_shape = original_shape[:2] + (original_shape[2]*original_shape[3],)
-        tensor = tensor.reshape(new_tensor_shape)
-    
-    # Create a large 2D array with mixed coordinates
-    elif unfold_domain == 'both':
-        new_tensor_shape = (original_shape[0]*original_shape[1],) + (original_shape[2]*original_shape[3],)
-        tensor = tensor.reshape(new_tensor_shape)
-    
-    elif unfold_domain == 'coordinate_aligned_real':
-               
-        if not undo:
-            # From (0, 1, 2, 3, ...) we swap 1 and 2
-            tensor = np.transpose(tensor, (0, 2, 1, 3, ))
-            
-            new_tensor_shape = (original_shape[0]*original_shape[2],) + (original_shape[1]*original_shape[3],)
-            tensor = tensor.reshape(new_tensor_shape) 
-        
-        elif undo:
-            
-            intermediate_shape = (original_shape[0], original_shape[2], original_shape[1], original_shape[3],)
-            tensor = tensor.reshape(intermediate_shape)
-            # print(tensor)
-            tensor = np.transpose(tensor, (0, 2, 1, 3, ))
-    
-    elif unfold_domain == 'coordinate_aligned_reciprocal':
-               
-        if not undo:
-            # From (0, 1, 2, 3, ...) we swap 1 and 2
-            tensor = np.transpose(tensor, (2, 0, 3, 1 ))
-            
-            new_tensor_shape = (original_shape[2]*original_shape[0],) + (original_shape[3]*original_shape[1],)
-            tensor = tensor.reshape(new_tensor_shape) 
-        
-        elif undo:
-            
-            intermediate_shape = (original_shape[2], original_shape[0], original_shape[3], original_shape[1],)
-            tensor = tensor.reshape(intermediate_shape)
-            # print(tensor)
-            tensor = np.transpose(tensor, (1, 3, 0, 2))
-    
-    # Create a typical 
-    # elif unfold_domain == 'coordinate_aligned_real':
-    #     new_tensor_shape = (original_shape[0]*original_shape[1],) + (original_shape[2]*original_shape[3],)
-    #     tensor = tensor.reshape(new_tensor_shape) 
-    
-    # By default, the serpentine method unfolds real-space
-    elif unfold_domain == 'serpentine':
-        #TODO add serpentine unfolding
-        pass
-    
-    elif unfold_domain == 'spiral_real':
-        #TODO add spiral unfolding
-        
-        if not undo:
-            pass
-        
-        elif undo:
-            pass
-    
-    elif unfold_domain == 'spiral_reciprocal':
-        #TODO add spiral unfolding
-        pass
-    
-    return tensor
+def _row_major_indices(shape):
+    """Return row-major ``(y, x)`` traversal indices for a 2D grid."""
+    y_size, x_size = shape
+    return np.array(
+        [(y_idx, x_idx) for y_idx in range(y_size) for x_idx in range(x_size)],
+        dtype=int,
+    )
+
+
+def _serpentine_indices(shape):
+    """
+    Return left-to-right/right-to-left alternating row traversal indices.
+
+    This keeps consecutive elements adjacent when crossing from one row to the
+    next, which is useful for scan paths that physically snake through the grid.
+    """
+    y_size, x_size = shape
+    indices = []
+    for y_idx in range(y_size):
+        if y_idx % 2 == 0:
+            x_range = range(x_size)
+        else:
+            x_range = range(x_size - 1, -1, -1)
+        indices.extend((y_idx, x_idx) for x_idx in x_range)
+    return np.array(indices, dtype=int)
+
+
+def _spiral_indices(shape):
+    """
+    Return top-left clockwise inward spiral traversal indices for a 2D grid.
+
+    The path starts across the top row, moves down the right column, then left
+    across the bottom row, up the left column, and repeats inward.
+    """
+    y_size, x_size = shape
+    top = 0
+    bottom = y_size - 1
+    left = 0
+    right = x_size - 1
+    indices = []
+
+    while top <= bottom and left <= right:
+        for x_idx in range(left, right + 1):
+            indices.append((top, x_idx))
+        top += 1
+
+        for y_idx in range(top, bottom + 1):
+            indices.append((y_idx, right))
+        right -= 1
+
+        if top <= bottom:
+            for x_idx in range(right, left - 1, -1):
+                indices.append((bottom, x_idx))
+            bottom -= 1
+
+        if left <= right:
+            for y_idx in range(bottom, top - 1, -1):
+                indices.append((y_idx, left))
+            left += 1
+
+    return np.array(indices, dtype=int)
+
+
+def _diagonal_zigzag_indices(shape):
+    """
+    Traverse anti-diagonals while alternating direction on each diagonal.
+
+    This is not a fractal space-filling curve, but it is a simple
+    locality-preserving baseline used in image compression and scanning.
+    """
+    y_size, x_size = shape
+    indices = []
+    for diag in range(y_size + x_size - 1):
+        y_start = max(0, diag - x_size + 1)
+        y_stop = min(y_size - 1, diag)
+        diagonal = [(y_idx, diag - y_idx) for y_idx in range(y_start, y_stop + 1)]
+        if diag % 2 == 0:
+            diagonal.reverse()
+        indices.extend(diagonal)
+    return np.array(indices, dtype=int)
+
+
+def _hilbert_d2yx(side, distance):
+    """
+    Convert Hilbert distance to ``(y, x)`` for a power-of-2 square.
+
+    This is the standard iterative d2xy Hilbert algorithm. It is written in
+    ``(x, y)`` internally and returned as ``(y, x)`` to match array indexing.
+    """
+    x_coord = 0
+    y_coord = 0
+    t_val = int(distance)
+    scale = 1
+
+    while scale < side:
+        rx = 1 & (t_val // 2)
+        ry = 1 & (t_val ^ rx)
+        if ry == 0:
+            if rx == 1:
+                x_coord = scale - 1 - x_coord
+                y_coord = scale - 1 - y_coord
+            x_coord, y_coord = y_coord, x_coord
+
+        x_coord += scale * rx
+        y_coord += scale * ry
+        t_val //= 4
+        scale *= 2
+
+    return y_coord, x_coord
+
+
+def _hilbert_indices(shape):
+    """Return a discrete Hilbert traversal for a power-of-2 square."""
+    side_y, side_x = shape
+    if side_y != side_x or not _is_power_of(side_y, 2):
+        raise ValueError("Hilbert traversal requires a power-of-2 square.")
+    return np.array(
+        [_hilbert_d2yx(side_y, distance) for distance in range(side_y * side_y)],
+        dtype=int,
+    )
+
+
+def _morton_code(y_idx, x_idx):
+    """Interleave the binary bits of ``y`` and ``x`` into a Morton code."""
+    code = 0
+    bit = 0
+    max_val = max(int(y_idx), int(x_idx))
+    while (1 << bit) <= max_val:
+        code |= ((x_idx >> bit) & 1) << (2 * bit)
+        code |= ((y_idx >> bit) & 1) << (2 * bit + 1)
+        bit += 1
+    return code
+
+
+def _morton_indices(shape):
+    """
+    Return Morton/Z-order traversal for a power-of-2 square.
+
+    Coordinates are sorted by interleaving the binary bits of row and column
+    indices. This is less continuous than Hilbert, but useful as a hierarchical
+    locality-preserving baseline.
+    """
+    side_y, side_x = shape
+    if side_y != side_x or not _is_power_of(side_y, 2):
+        raise ValueError("Morton/Z-order traversal requires a power-of-2 square.")
+    coords = [(y_idx, x_idx) for y_idx in range(side_y) for x_idx in range(side_x)]
+    coords.sort(key=lambda coord: _morton_code(coord[0], coord[1]))
+    return np.array(coords, dtype=int)
+
+
+def _peano_indices(shape):
+    """
+    Return a recursive Peano traversal for a power-of-3 square.
+
+    The first-order path traverses a 3x3 square in a ``2``-shaped motif. Higher
+    orders recursively orient each child block so adjacent children connect by a
+    nearest-neighbor step. This alternates ``2``- and ``S``-like motifs across
+    the grid, avoiding the disconnected repeated-block pattern that a naive
+    serpentine recursion would produce.
+    """
+    side_y, side_x = shape
+    if side_y != side_x or not _is_power_of(side_y, 3):
+        raise ValueError("Peano traversal requires a power-of-3 square.")
+
+    order = 0
+    side = side_y
+    while side > 1:
+        side //= 3
+        order += 1
+
+    return np.array(_peano_path(order), dtype=int)
+
+
+def _opposite_corner(corner):
+    """Return the diagonally opposite corner name for a square block."""
+    opposites = {
+        'NW': 'SE',
+        'SE': 'NW',
+        'NE': 'SW',
+        'SW': 'NE',
+    }
+    return opposites[corner]
+
+
+def _peano_base_path(start_corner='NW', end_corner='SE'):
+    """
+    Return an oriented 3x3 Peano base path between opposite corners.
+
+    The canonical orientation starts at ``NW`` and ends at ``SE``:
+    right, right, down, left, left, down, right, right. Reflections provide the
+    other opposite-corner orientations while preserving nearest-neighbor steps.
+    """
+    if _opposite_corner(start_corner) != end_corner:
+        raise ValueError(
+            "Peano child curves require opposite start and end corners."
+        )
+
+    path = np.array(
+        [
+            (0, 0), (0, 1), (0, 2),
+            (1, 2), (1, 1), (1, 0),
+            (2, 0), (2, 1), (2, 2),
+        ],
+        dtype=int,
+    )
+
+    if start_corner in {'SW', 'SE'}:
+        path[:, 0] = 2 - path[:, 0]
+    if start_corner in {'NE', 'SE'}:
+        path[:, 1] = 2 - path[:, 1]
+
+    return path
+
+
+def _peano_next_entry_corner(direction, exit_corner):
+    """Return the child entry corner compatible with a neighboring block step."""
+    compatible_entries = {
+        (0, 1): {'NE': 'NW', 'SE': 'SW'},
+        (0, -1): {'NW': 'NE', 'SW': 'SE'},
+        (1, 0): {'SW': 'NW', 'SE': 'NE'},
+        (-1, 0): {'NW': 'SW', 'NE': 'SE'},
+    }
+    direction = tuple(int(v) for v in direction)
+    if direction not in compatible_entries:
+        raise ValueError(f"Invalid Peano block direction {direction}.")
+    if exit_corner not in compatible_entries[direction]:
+        raise ValueError(
+            f"Peano child exit corner '{exit_corner}' is incompatible with "
+            f"block direction {direction}."
+        )
+    return compatible_entries[direction][exit_corner]
+
+
+def _peano_path(order, start_corner='NW', end_corner='SE'):
+    """Return recursive Peano coordinates for a ``3**order`` square."""
+    if order < 0:
+        raise ValueError("order must be non-negative.")
+    if order == 0:
+        return ((0, 0),)
+
+    macro_path = _peano_base_path(start_corner, end_corner)
+    if order == 1:
+        return tuple(map(tuple, macro_path))
+
+    sub_side = 3 ** (order - 1)
+    coords = []
+    child_start = start_corner
+
+    for block_idx, block in enumerate(macro_path):
+        if block_idx < len(macro_path) - 1:
+            direction = macro_path[block_idx + 1] - block
+            child_end = _opposite_corner(child_start)
+            next_child_start = _peano_next_entry_corner(direction, child_end)
+        else:
+            child_end = end_corner
+            next_child_start = None
+            if _opposite_corner(child_start) != child_end:
+                raise RuntimeError(
+                    "Could not orient the final Peano child block continuously."
+                )
+
+        child = _peano_path(order - 1, child_start, child_end)
+        offset = block * sub_side
+        coords.extend(
+            (y_idx + offset[0], x_idx + offset[1])
+            for y_idx, x_idx in child
+        )
+        child_start = next_child_start
+
+    return tuple(coords)
+
+
+def _corner_coordinate(corner, side):
+    """Return the local ``(y, x)`` coordinate of a named square corner."""
+    corners = {
+        'NW': (0, 0),
+        'NE': (0, side - 1),
+        'SW': (side - 1, 0),
+        'SE': (side - 1, side - 1),
+    }
+    return corners[corner]
+
+
+def _compatible_corner_pairs(direction):
+    """Return adjacent exit/entry corner pairs for neighboring 3x3 blocks."""
+    if direction == (0, 1):
+        return [('NE', 'NW'), ('SE', 'SW')]
+    if direction == (0, -1):
+        return [('NW', 'NE'), ('SW', 'SE')]
+    if direction == (1, 0):
+        return [('SW', 'NW'), ('SE', 'NE')]
+    if direction == (-1, 0):
+        return [('NW', 'SW'), ('NE', 'SE')]
+    raise ValueError(f"Invalid block direction {direction}.")
+
+
+def _base_meander_path(start_corner, end_corner):
+    """Find a 3x3 Hamiltonian path between two square corners."""
+    start = _corner_coordinate(start_corner, 3)
+    end = _corner_coordinate(end_corner, 3)
+    if start == end:
+        raise ValueError("start_corner and end_corner must differ.")
+
+    path = [start]
+    visited = {start}
+
+    def neighbor_score(cell):
+        y_idx, x_idx = cell
+        onward = 0
+        for dy, dx in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+            neighbor = (y_idx + dy, x_idx + dx)
+            if (
+                0 <= neighbor[0] < 3
+                and 0 <= neighbor[1] < 3
+                and neighbor not in visited
+            ):
+                onward += 1
+        distance_to_end = abs(y_idx - end[0]) + abs(x_idx - end[1])
+        return onward, distance_to_end
+
+    def dfs(cell):
+        if len(path) == 9:
+            return cell == end
+
+        y_idx, x_idx = cell
+        candidates = []
+        for dy, dx in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+            neighbor = (y_idx + dy, x_idx + dx)
+            if 0 <= neighbor[0] < 3 and 0 <= neighbor[1] < 3:
+                if neighbor in visited:
+                    continue
+                if neighbor == end and len(path) != 8:
+                    continue
+                candidates.append(neighbor)
+
+        candidates.sort(key=neighbor_score)
+        for neighbor in candidates:
+            visited.add(neighbor)
+            path.append(neighbor)
+            if dfs(neighbor):
+                return True
+            path.pop()
+            visited.remove(neighbor)
+        return False
+
+    if not dfs(start):
+        raise RuntimeError(
+            f"Could not construct 3x3 meander path from {start_corner} to {end_corner}."
+        )
+    return tuple(path)
+
+
+def _meander_block_template(start_corner, end_corner):
+    """
+    Build a 3x3 block traversal with corner-aware child orientations.
+
+    This alternates local 2-like and S-like motifs so neighboring child curves
+    connect continuously across block boundaries.
+    """
+    corner_blocks = {
+        'NW': (0, 0),
+        'NE': (0, 2),
+        'SW': (2, 0),
+        'SE': (2, 2),
+    }
+    start_block = corner_blocks[start_corner]
+    end_block = corner_blocks[end_corner]
+    path = [(start_block, start_corner, None)]
+    visited = {start_block}
+
+    def ordered_neighbors(block):
+        y_idx, x_idx = block
+        if y_idx % 2 == 0:
+            directions = [(0, 1), (1, 0), (0, -1), (-1, 0)]
+        else:
+            directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+
+        for direction in directions:
+            neighbor = (y_idx + direction[0], x_idx + direction[1])
+            if 0 <= neighbor[0] < 3 and 0 <= neighbor[1] < 3:
+                yield neighbor, direction
+
+    def dfs(current_block, current_start):
+        if len(path) == 9:
+            if current_block != end_block or current_start == end_corner:
+                return False
+            path[-1] = (current_block, current_start, end_corner)
+            return True
+
+        for next_block, direction in ordered_neighbors(current_block):
+            if next_block in visited:
+                continue
+            remaining = 9 - len(path)
+            if next_block == end_block and remaining != 1:
+                continue
+
+            for exit_corner, entry_corner in _compatible_corner_pairs(direction):
+                if exit_corner == current_start:
+                    continue
+                path[-1] = (current_block, current_start, exit_corner)
+                visited.add(next_block)
+                path.append((next_block, entry_corner, None))
+                if dfs(next_block, entry_corner):
+                    return True
+                path.pop()
+                visited.remove(next_block)
+                path[-1] = (current_block, current_start, None)
+
+        return False
+
+    if not dfs(start_block, start_corner):
+        raise RuntimeError(
+            f"Could not construct meander block from {start_corner} to {end_corner}."
+        )
+    return tuple(path)
+
+
+def _peano_meander_path(order, start_corner='NW', end_corner='SE'):
+    """
+    Return a recursive Peano-meander path for ``3**order`` square grids.
+
+    This is not a mathematically strict Peano curve. It is a Peano-like
+    ternary meander that fills powers-of-3 grids with continuous nearest-neighbor
+    steps while alternating child-curve orientation for better block-to-block
+    continuity.
+    """
+    if order == 1:
+        return _base_meander_path(start_corner, end_corner)
+
+    sub_side = 3 ** (order - 1)
+    coords = []
+    for (block_y, block_x), child_start, child_end in _meander_block_template(
+        start_corner,
+        end_corner,
+    ):
+        child = _peano_meander_path(order - 1, child_start, child_end)
+        coords.extend(
+            (y_idx + block_y * sub_side, x_idx + block_x * sub_side)
+            for y_idx, x_idx in child
+        )
+    return tuple(coords)
+
+
+def _peano_meander_indices(shape):
+    """
+    Return a Peano-like ternary meander traversal for a power-of-3 square.
+
+    This curve is useful when a continuous power-of-3 locality-preserving path is
+    desired, while avoiding the repeated local motif in the simpler Peano-style
+    implementation.
+    """
+    side_y, side_x = shape
+    if side_y != side_x or not _is_power_of(side_y, 3):
+        raise ValueError("Peano-meander traversal requires a power-of-3 square.")
+
+    order = 0
+    side = side_y
+    while side > 1:
+        side //= 3
+        order += 1
+
+    return np.array(_peano_meander_path(order), dtype=int)
+
+
+_MEANDER4_BLOCK_SIZE = 4
+_MEANDER4_CORNERS = {
+    'NW': (0, 0),
+    'NE': (0, _MEANDER4_BLOCK_SIZE - 1),
+    'SW': (_MEANDER4_BLOCK_SIZE - 1, 0),
+    'SE': (_MEANDER4_BLOCK_SIZE - 1, _MEANDER4_BLOCK_SIZE - 1),
+}
+_MEANDER4_SIDE_EXIT_CORNERS = {
+    'N': ('NW', 'NE'),
+    'E': ('NE', 'SE'),
+    'S': ('SW', 'SE'),
+    'W': ('NW', 'SW'),
+}
+_MEANDER4_DIRECTION_TO_SIDE = {
+    (0, 1): 'E',
+    (0, -1): 'W',
+    (1, 0): 'S',
+    (-1, 0): 'N',
+}
+_MEANDER4_NEXT_ENTRY = {
+    ((0, 1), 'NE'): 'NW',
+    ((0, 1), 'SE'): 'SW',
+    ((0, -1), 'NW'): 'NE',
+    ((0, -1), 'SW'): 'SE',
+    ((1, 0), 'SW'): 'NW',
+    ((1, 0), 'SE'): 'NE',
+    ((-1, 0), 'NW'): 'SW',
+    ((-1, 0), 'NE'): 'SE',
+}
+_MEANDER4_BASE_NW_NE = np.array(
+    [
+        (0, 0),
+        (1, 0), (2, 0), (3, 0),
+        (3, 1), (3, 2), (3, 3),
+        (2, 3), (1, 3),
+        (1, 2),
+        (2, 2),
+        (2, 1),
+        (1, 1), (0, 1),
+        (0, 2), (0, 3),
+    ],
+    dtype=int,
+)
+
+
+def _meander4_transform_path(path, transform_name):
+    """Apply a square symmetry transform to a 4x4 meander tile path."""
+    size = _MEANDER4_BLOCK_SIZE
+    y_idx = path[:, 0]
+    x_idx = path[:, 1]
+
+    if transform_name == 'identity':
+        transformed = np.column_stack([y_idx, x_idx])
+    elif transform_name == 'rot90':
+        transformed = np.column_stack([x_idx, size - 1 - y_idx])
+    elif transform_name == 'rot180':
+        transformed = np.column_stack([size - 1 - y_idx, size - 1 - x_idx])
+    elif transform_name == 'rot270':
+        transformed = np.column_stack([size - 1 - x_idx, y_idx])
+    elif transform_name == 'flip_y':
+        transformed = np.column_stack([size - 1 - y_idx, x_idx])
+    elif transform_name == 'flip_x':
+        transformed = np.column_stack([y_idx, size - 1 - x_idx])
+    elif transform_name == 'diag':
+        transformed = np.column_stack([x_idx, y_idx])
+    elif transform_name == 'anti_diag':
+        transformed = np.column_stack([size - 1 - x_idx, size - 1 - y_idx])
+    else:
+        raise ValueError(f"Unknown meander-4 transform '{transform_name}'.")
+
+    return transformed.astype(int)
+
+
+def _meander4_corner_name(coord):
+    """Return the named 4x4 block corner at ``coord``."""
+    coord = tuple(int(v) for v in coord)
+    for name, corner in _MEANDER4_CORNERS.items():
+        if coord == corner:
+            return name
+    return None
+
+
+def _meander4_tile_paths():
+    """
+    Return oriented 4x4 meander tile paths between adjacent corners.
+
+    The canonical tile is the user-specified path from ``NW`` to ``NE``:
+    down x3, right x3, up x2, left, down, left, up x2, right x2. Direct square
+    symmetries generate the remaining orientations while preserving that motif.
+    """
+    transforms = (
+        'identity',
+        'rot90',
+        'rot180',
+        'rot270',
+        'flip_y',
+        'flip_x',
+        'diag',
+        'anti_diag',
+    )
+    tile_paths = {}
+    for transform_name in transforms:
+        path = _meander4_transform_path(_MEANDER4_BASE_NW_NE, transform_name)
+        start_corner = _meander4_corner_name(path[0])
+        end_corner = _meander4_corner_name(path[-1])
+        tile_paths[(start_corner, end_corner)] = path
+    return tile_paths
+
+
+_MEANDER4_TILE_PATHS = _meander4_tile_paths()
+
+
+def _meander4_corners_are_adjacent(first_corner, second_corner):
+    """Return True when two 4x4 block corners share a block side."""
+    first_y, first_x = _MEANDER4_CORNERS[first_corner]
+    second_y, second_x = _MEANDER4_CORNERS[second_corner]
+    distance = abs(first_y - second_y) + abs(first_x - second_x)
+    return distance == _MEANDER4_BLOCK_SIZE - 1
+
+
+def _meander4_choose_exit_corner(entry_corner, direction):
+    """Choose the exit corner for a block-to-block step."""
+    side = _MEANDER4_DIRECTION_TO_SIDE[direction]
+    for exit_corner in _MEANDER4_SIDE_EXIT_CORNERS[side]:
+        if (
+            exit_corner != entry_corner
+            and _meander4_corners_are_adjacent(entry_corner, exit_corner)
+        ):
+            return exit_corner
+    raise ValueError(
+        f"No meander-4 exit corner for entry='{entry_corner}', direction={direction}."
+    )
+
+
+def _meander4_indices(shape):
+    """
+    Return a 4x4 Greek-key meander traversal for dimensions divisible by 4.
+
+    The array is divided into 4x4 tiles. The first tile follows the exact local
+    step pattern ``down x3, right x3, up x2, left, down, left, up x2, right x2``.
+    Tiles are then visited along an inward spiral, with each tile orientation
+    chosen so neighboring tiles connect by a one-pixel step. Rectangular
+    ``4*Ny`` by ``4*Nx`` grids are supported.
+    """
+    height, width = tuple(int(v) for v in shape)
+    if height <= 0 or width <= 0:
+        raise ValueError("meander-4 traversal shape must be positive.")
+    if height % _MEANDER4_BLOCK_SIZE != 0 or width % _MEANDER4_BLOCK_SIZE != 0:
+        raise ValueError(
+            "meander-4 traversal requires both dimensions to be multiples of 4."
+        )
+
+    block_rows = height // _MEANDER4_BLOCK_SIZE
+    block_cols = width // _MEANDER4_BLOCK_SIZE
+    block_order = [tuple(coord) for coord in _spiral_indices((block_rows, block_cols))]
+    coords = []
+    entry_corner = 'NW'
+
+    for block_idx, (block_y, block_x) in enumerate(block_order):
+        if block_idx < len(block_order) - 1:
+            next_block = block_order[block_idx + 1]
+            direction_to_next = (
+                next_block[0] - block_y,
+                next_block[1] - block_x,
+            )
+            exit_corner = _meander4_choose_exit_corner(
+                entry_corner,
+                direction_to_next,
+            )
+            next_entry_corner = _MEANDER4_NEXT_ENTRY[
+                (direction_to_next, exit_corner)
+            ]
+        else:
+            for candidate_corner in ('NE', 'SE', 'SW', 'NW'):
+                if (
+                    candidate_corner != entry_corner
+                    and _meander4_corners_are_adjacent(
+                        entry_corner,
+                        candidate_corner,
+                    )
+                ):
+                    exit_corner = candidate_corner
+                    break
+            next_entry_corner = None
+
+        local_path = _MEANDER4_TILE_PATHS[(entry_corner, exit_corner)]
+        offset = np.array(
+            [
+                block_y * _MEANDER4_BLOCK_SIZE,
+                block_x * _MEANDER4_BLOCK_SIZE,
+            ]
+        )
+        coords.extend(
+            (y_idx + offset[0], x_idx + offset[1])
+            for y_idx, x_idx in local_path
+        )
+        entry_corner = next_entry_corner
+
+    return np.array(coords, dtype=int)
+
+
+_MEANDER5_BLOCK_SIZE = 5
+_MEANDER5_SIDE_COORDS = {
+    'N': (0, 2),
+    'E': (2, 4),
+    'S': (4, 2),
+    'W': (2, 0),
+    'C': (2, 2),
+}
+_MEANDER5_DIRECTION_TO_SIDE = {
+    (0, 1): 'E',
+    (0, -1): 'W',
+    (1, 0): 'S',
+    (-1, 0): 'N',
+}
+_MEANDER5_OPPOSITE_SIDE = {
+    'N': 'S',
+    'S': 'N',
+    'E': 'W',
+    'W': 'E',
+}
+_MEANDER5_STEP_DIRECTIONS = ((0, 1), (1, 0), (0, -1), (-1, 0))
+_MEANDER5_SPIRAL_RANK = {
+    tuple(coord): idx
+    for idx, coord in enumerate(_spiral_indices((_MEANDER5_BLOCK_SIZE, _MEANDER5_BLOCK_SIZE)))
+}
+
+
+@lru_cache(maxsize=None)
+def _meander5_block_path(entry_side, exit_side):
+    """
+    Return a 5x5 Greek-key block traversal between two block endpoints.
+
+    The endpoints lie on side midpoints, or on the center for the final block.
+    A small depth-first Hamiltonian search is used once per entry/exit pair and
+    cached; the scoring favors perimeter-to-interior squared turns, giving the
+    Greek-key hook motif while preserving one-pixel steps.
+    """
+    if entry_side not in _MEANDER5_SIDE_COORDS:
+        raise ValueError(f"Invalid meander-5 entry side '{entry_side}'.")
+    if exit_side not in _MEANDER5_SIDE_COORDS:
+        raise ValueError(f"Invalid meander-5 exit side '{exit_side}'.")
+
+    block_size = _MEANDER5_BLOCK_SIZE
+    start = _MEANDER5_SIDE_COORDS[entry_side]
+    end = _MEANDER5_SIDE_COORDS[exit_side]
+    if start == end:
+        raise ValueError("meander-5 entry and exit endpoints must differ.")
+
+    total = block_size * block_size
+    visited = {start}
+    path = [start]
+
+    def connectivity_ok():
+        remaining = {
+            (y_idx, x_idx)
+            for y_idx in range(block_size)
+            for x_idx in range(block_size)
+            if (y_idx, x_idx) not in visited
+        }
+        if not remaining:
+            return True
+
+        stack = [next(iter(remaining))]
+        seen = {stack[0]}
+        while stack:
+            y_idx, x_idx = stack.pop()
+            for dy, dx in _MEANDER5_STEP_DIRECTIONS:
+                neighbor = (y_idx + dy, x_idx + dx)
+                if neighbor in remaining and neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        return len(seen) == len(remaining)
+
+    def onward_count(cell):
+        y_idx, x_idx = cell
+        count = 0
+        for dy, dx in _MEANDER5_STEP_DIRECTIONS:
+            neighbor = (y_idx + dy, x_idx + dx)
+            if (
+                0 <= neighbor[0] < block_size
+                and 0 <= neighbor[1] < block_size
+                and neighbor not in visited
+            ):
+                if neighbor == end and len(path) != total - 1:
+                    continue
+                count += 1
+        return count
+
+    def neighbor_score(cell, previous):
+        py, px = previous
+        cy, cx = cell
+        straight_penalty = 0
+        if len(path) >= 2:
+            ay, ax = path[-2]
+            old_direction = (py - ay, px - ax)
+            new_direction = (cy - py, cx - px)
+            straight_penalty = int(old_direction == new_direction)
+
+        return (
+            onward_count(cell),
+            _MEANDER5_SPIRAL_RANK[cell],
+            straight_penalty,
+            abs(cy - end[0]) + abs(cx - end[1]),
+        )
+
+    def dfs(cell):
+        if len(path) == total:
+            return cell == end
+
+        y_idx, x_idx = cell
+        candidates = []
+        for dy, dx in _MEANDER5_STEP_DIRECTIONS:
+            neighbor = (y_idx + dy, x_idx + dx)
+            if not (0 <= neighbor[0] < block_size and 0 <= neighbor[1] < block_size):
+                continue
+            if neighbor in visited:
+                continue
+            if neighbor == end and len(path) != total - 1:
+                continue
+            candidates.append(neighbor)
+
+        candidates.sort(key=lambda neighbor: neighbor_score(neighbor, cell))
+        for neighbor in candidates:
+            visited.add(neighbor)
+            path.append(neighbor)
+            if connectivity_ok() and dfs(neighbor):
+                return True
+            path.pop()
+            visited.remove(neighbor)
+        return False
+
+    if not dfs(start):
+        raise RuntimeError(
+            f"Could not construct meander-5 block path {entry_side}->{exit_side}."
+        )
+    return tuple(path)
+
+
+def _meander5_indices(shape):
+    """
+    Return a Greek-key meander traversal for dimensions divisible by 5.
+
+    The array is divided into 5x5 tiles. Tiles are visited along an inward
+    spiral, and each tile is filled by a small squared Greek-key hook whose
+    entry and exit sides are oriented to connect continuously to neighboring
+    tiles. Rectangular ``5*Ny`` by ``5*Nx`` grids are supported.
+    """
+    height, width = tuple(int(v) for v in shape)
+    if height <= 0 or width <= 0:
+        raise ValueError("meander-5 traversal shape must be positive.")
+    if height % _MEANDER5_BLOCK_SIZE != 0 or width % _MEANDER5_BLOCK_SIZE != 0:
+        raise ValueError(
+            "meander-5 traversal requires both dimensions to be multiples of 5."
+        )
+
+    block_rows = height // _MEANDER5_BLOCK_SIZE
+    block_cols = width // _MEANDER5_BLOCK_SIZE
+    block_order = [tuple(coord) for coord in _spiral_indices((block_rows, block_cols))]
+    coords = []
+
+    for block_idx, (block_y, block_x) in enumerate(block_order):
+        if len(block_order) == 1:
+            entry_side = 'W'
+            exit_side = 'C'
+        elif block_idx == 0:
+            next_block = block_order[block_idx + 1]
+            direction_to_next = (
+                next_block[0] - block_y,
+                next_block[1] - block_x,
+            )
+            exit_side = _MEANDER5_DIRECTION_TO_SIDE[direction_to_next]
+            entry_side = _MEANDER5_OPPOSITE_SIDE[exit_side]
+        else:
+            previous_block = block_order[block_idx - 1]
+            direction_to_previous = (
+                previous_block[0] - block_y,
+                previous_block[1] - block_x,
+            )
+            entry_side = _MEANDER5_DIRECTION_TO_SIDE[direction_to_previous]
+            if block_idx < len(block_order) - 1:
+                next_block = block_order[block_idx + 1]
+                direction_to_next = (
+                    next_block[0] - block_y,
+                    next_block[1] - block_x,
+                )
+                exit_side = _MEANDER5_DIRECTION_TO_SIDE[direction_to_next]
+            else:
+                exit_side = 'C'
+
+        local_path = _meander5_block_path(entry_side, exit_side)
+        offset = np.array(
+            [
+                block_y * _MEANDER5_BLOCK_SIZE,
+                block_x * _MEANDER5_BLOCK_SIZE,
+            ]
+        )
+        coords.extend(
+            (y_idx + offset[0], x_idx + offset[1])
+            for y_idx, x_idx in local_path
+        )
+
+    return np.array(coords, dtype=int)
+
+
+def _moore_indices(shape):
+    """
+    Placeholder for a closed Hilbert-like Moore traversal.
+
+    Moore curves are useful, but implementing a clear closed discrete variant is
+    a separate step from the current unfolding refactor.
+    """
+    raise NotImplementedError(
+        "method='moore' is registered but not implemented yet. "
+        "Use method='hilbert' for an open Hilbert traversal."
+    )
+
+
+_FULL_SHAPE_TRAVERSAL_METHODS = {
+    'row_major',
+    'serpentine',
+    'spiral',
+    'diagonal_zigzag',
+}
+
+_CURVE_TRAVERSAL_METHODS = {
+    'hilbert',
+    'morton',
+    'peano',
+    'peano_meander',
+    'moore',
+}
+
+_BLOCK_TRAVERSAL_METHODS = {
+    'meander-4',
+    'meander-5',
+}
+
+_TRAVERSAL_INDEX_GENERATORS = {
+    'row_major': _row_major_indices,
+    'serpentine': _serpentine_indices,
+    'spiral': _spiral_indices,
+    'diagonal_zigzag': _diagonal_zigzag_indices,
+    'hilbert': _hilbert_indices,
+    'morton': _morton_indices,
+    'peano': _peano_indices,
+    'peano_meander': _peano_meander_indices,
+    'meander-4': _meander4_indices,
+    'meander-5': _meander5_indices,
+    'moore': _moore_indices,
+}
+
+_TRAVERSAL_METHOD_ALIASES = {
+    'z_order': 'morton',
+    'meander_4': 'meander-4',
+    'meander_5': 'meander-5',
+}
+
+
+def _is_power_of(value, base):
+    """Return True when ``value`` is an integer power of ``base``."""
+    value = int(value)
+    if value < 1:
+        return False
+    while value % base == 0:
+        value //= base
+    return value == 1
+
+
+def _largest_power_leq(value, base):
+    """Return the largest power of ``base`` less than or equal to ``value``."""
+    value = int(value)
+    if value < 1:
+        raise ValueError("value must be positive.")
+    power = 1
+    while power * base <= value:
+        power *= base
+    return power
+
+
+def _largest_multiple_leq(value, factor):
+    """Return the largest positive multiple of ``factor`` not exceeding ``value``."""
+    value = int(value)
+    factor = int(factor)
+    if value < factor:
+        raise ValueError(
+            f"value must be at least {factor} for this traversal method."
+        )
+    return (value // factor) * factor
+
+
+def _smallest_power_geq(value, base):
+    """Return the smallest power of ``base`` greater than or equal to ``value``."""
+    value = int(value)
+    if value < 1:
+        raise ValueError("value must be positive.")
+    power = 1
+    while power < value:
+        power *= base
+    return power
+
+
+def _nearest_power(value, base):
+    """
+    Return the nearest power of ``base`` to ``value``.
+
+    Ties choose the smaller side to avoid introducing interpolated data unless
+    the user explicitly requests upsampling.
+    """
+    lower = _largest_power_leq(value, base)
+    upper = _smallest_power_geq(value, base)
+    if abs(value - lower) <= abs(upper - value):
+        return lower
+    return upper
+
+
+def _curve_base_for_method(method):
+    """Return the natural integer base for a square-compatible traversal."""
+    if method == 'peano':
+        return 3
+    if method == 'peano_meander':
+        return 3
+    return 2
+
+
+def _block_size_for_method(method):
+    """Return the required tile size for block-compatible traversals."""
+    if method == 'meander-4':
+        return _MEANDER4_BLOCK_SIZE
+    if method == 'meander-5':
+        return _MEANDER5_BLOCK_SIZE
+    raise ValueError(f"method='{method}' is not a block traversal method.")
+
+
+def _normalize_traversal_method(method):
+    """Normalize method aliases such as ``z_order`` to their implementation."""
+    if not isinstance(method, str):
+        raise ValueError("method must be a string.")
+    method = method.lower()
+    return _TRAVERSAL_METHOD_ALIASES.get(method, method)
+
+
+def _validate_unfold_shape(shape):
+    """Validate and normalize a 4D-STEM tensor shape."""
+    if shape is None:
+        raise ValueError("original_shape is required to undo an unfolding.")
+    if len(shape) != 4:
+        raise ValueError(
+            "Unfolding expects a 4D-STEM shape in the convention "
+            "(Ry, Rx, Ky, Kx)."
+        )
+    shape = tuple(int(v) for v in shape)
+    if any(v <= 0 for v in shape):
+        raise ValueError("All original_shape dimensions must be positive.")
+    return shape
+
+
+def _normalize_unfold_request(domain='real', method='row_major'):
+    """Validate the modern unfolding API: separate domain and method names."""
+    if domain is None:
+        domain = 'real'
+    if method is None:
+        method = 'row_major'
+    if not isinstance(domain, str):
+        raise ValueError("domain must be a string.")
+
+    domain = domain.lower()
+    method = _normalize_traversal_method(method)
+    if domain not in ('real', 'reciprocal', 'both'):
+        raise ValueError("domain must be one of 'real', 'reciprocal', or 'both'.")
+
+    valid_methods = set(_TRAVERSAL_INDEX_GENERATORS) | {'coordinate_aligned'}
+    if method not in valid_methods:
+        valid = ', '.join(sorted(valid_methods | set(_TRAVERSAL_METHOD_ALIASES)))
+        raise ValueError(f"method must be one of: {valid}.")
+    if method == 'coordinate_aligned' and domain == 'both':
+        raise ValueError("method='coordinate_aligned' supports domain='real' or 'reciprocal', not 'both'.")
+    if domain == 'both' and method not in {'row_major', 'morton'}:
+        raise NotImplementedError(
+            "domain='both' currently supports method='row_major' and "
+            "method='morton'. Other traversal pairings need an explicit design."
+        )
+
+    return domain, method
+
+
+def _validate_resize_side(method, resize_side):
+    """Validate a user-provided side length for a curve method."""
+    resize_side = int(resize_side)
+    base = _curve_base_for_method(method)
+    if resize_side <= 0 or not _is_power_of(resize_side, base):
+        raise ValueError(
+            f"resize_side must be a positive power of {base} for method='{method}'."
+        )
+    return resize_side
+
+
+def _select_resize_side(shape, method, resize_side=None, resize_side_mode='nearest'):
+    """Select a compatible square side for curve resize mode."""
+    if resize_side is not None:
+        return _validate_resize_side(method, resize_side)
+
+    resize_side_mode = resize_side_mode.lower()
+    if resize_side_mode not in ('nearest', 'downsample', 'upsample'):
+        raise ValueError("resize_side_mode must be 'nearest', 'downsample', or 'upsample'.")
+
+    target = min(shape)
+    base = _curve_base_for_method(method)
+    if resize_side_mode == 'nearest':
+        return _nearest_power(target, base)
+    if resize_side_mode == 'downsample':
+        return _largest_power_leq(target, base)
+    return _smallest_power_geq(target, base)
+
+
+def _center_crop_metadata(shape, method):
+    """Return centered compatible crop metadata for special traversals."""
+    height, width = tuple(int(v) for v in shape)
+    if method in _BLOCK_TRAVERSAL_METHODS:
+        block_size = _block_size_for_method(method)
+        grid_y = _largest_multiple_leq(height, block_size)
+        grid_x = _largest_multiple_leq(width, block_size)
+    else:
+        side = _largest_power_leq(min(height, width), _curve_base_for_method(method))
+        grid_y = side
+        grid_x = side
+
+    y0 = (height - grid_y) // 2
+    x0 = (width - grid_x) // 2
+    y1 = y0 + grid_y
+    x1 = x0 + grid_x
+    return (grid_y, grid_x), y0, y1, x0, x1
+
+
+def _excess_indices_for_crop(shape, y0, y1, x0, x1):
+    """Return coordinates outside a centered compatible square crop."""
+    height, width = shape
+    excess = [
+        (y_idx, x_idx)
+        for y_idx in range(height)
+        for x_idx in range(width)
+        if not (y0 <= y_idx < y1 and x0 <= x_idx < x1)
+    ]
+    return np.array(excess, dtype=int).reshape((-1, 2))
+
+
+def _validate_traversal_indices(indices, shape, method):
+    """Ensure traversal coordinates are unique and within ``shape``."""
+    indices = np.asarray(indices, dtype=int)
+    if indices.ndim != 2 or indices.shape[1] != 2:
+        raise ValueError(f"Traversal method '{method}' must return an (N, 2) array.")
+    if indices.size == 0:
+        raise ValueError(f"Traversal method '{method}' returned no coordinates.")
+
+    height, width = shape
+    if np.any(indices[:, 0] < 0) or np.any(indices[:, 0] >= height):
+        raise ValueError(f"Traversal method '{method}' returned out-of-bounds y coordinates.")
+    if np.any(indices[:, 1] < 0) or np.any(indices[:, 1] >= width):
+        raise ValueError(f"Traversal method '{method}' returned out-of-bounds x coordinates.")
+
+    if len(set(map(tuple, indices))) != len(indices):
+        raise ValueError(f"Traversal method '{method}' returned duplicate coordinates.")
+    return indices
+
+
+def _get_traversal_indices(shape, method, curve_shape_strategy='center_crop',
+                           resize_side=None, resize_side_mode='nearest'):
+    """
+    Return traversal indices and metadata for a 2D coordinate grid.
+
+    Full-shape methods visit every coordinate in ``shape``. Curve methods use
+    either a centered compatible square crop or a resized compatible square.
+    Block methods such as ``meander-4`` and ``meander-5`` use a centered
+    compatible rectangular crop whose dimensions are multiples of the required
+    block size.
+    """
+    method = _normalize_traversal_method(method)
+    shape = tuple(int(v) for v in shape)
+    if len(shape) != 2 or any(v <= 0 for v in shape):
+        raise ValueError("Traversal shape must be a pair of positive integers.")
+    if method not in _TRAVERSAL_INDEX_GENERATORS:
+        valid = ', '.join(sorted(set(_TRAVERSAL_INDEX_GENERATORS) | set(_TRAVERSAL_METHOD_ALIASES)))
+        raise ValueError(f"method='{method}' is not a traversal method. Valid methods are: {valid}.")
+
+    if method in _FULL_SHAPE_TRAVERSAL_METHODS:
+        indices = np.asarray(_TRAVERSAL_INDEX_GENERATORS[method](shape), dtype=int)
+        expected_size = shape[0] * shape[1]
+        if indices.shape != (expected_size, 2):
+            raise ValueError(
+                f"Traversal method '{method}' returned shape {indices.shape}; "
+                f"expected {(expected_size, 2)}."
+            )
+        indices = _validate_traversal_indices(indices, shape, method)
+        return indices, {
+            'curve_shape_strategy': 'full_shape',
+            'traversal_shape': shape,
+        }
+
+    if method == 'moore':
+        _moore_indices(shape)
+
+    special_methods = _CURVE_TRAVERSAL_METHODS | _BLOCK_TRAVERSAL_METHODS
+    if method not in special_methods:
+        raise ValueError(f"Unknown traversal method '{method}'.")
+
+    if curve_shape_strategy is None:
+        curve_shape_strategy = 'center_crop'
+    if not isinstance(curve_shape_strategy, str):
+        raise ValueError("curve_shape_strategy must be a string.")
+    curve_shape_strategy = curve_shape_strategy.lower()
+
+    if curve_shape_strategy == 'center_crop':
+        grid_shape, y0, y1, x0, x1 = _center_crop_metadata(shape, method)
+        local_indices = np.asarray(
+            _TRAVERSAL_INDEX_GENERATORS[method](grid_shape),
+            dtype=int,
+        )
+        indices = local_indices + np.array([y0, x0])
+        indices = _validate_traversal_indices(indices, shape, method)
+        traversal_metadata = {
+            'curve_shape_strategy': 'center_crop',
+            'curve_grid_shape': grid_shape,
+            'crop_slices': {'y': (y0, y1), 'x': (x0, x1)},
+            'kept_indices': indices,
+            'excess_indices': _excess_indices_for_crop(shape, y0, y1, x0, x1),
+            'traversal_shape': shape,
+        }
+        if method in _BLOCK_TRAVERSAL_METHODS:
+            block_size = _block_size_for_method(method)
+            traversal_metadata.update({
+                'block_size': block_size,
+                'block_grid_shape': (
+                    grid_shape[0] // block_size,
+                    grid_shape[1] // block_size,
+                ),
+            })
+        return indices, traversal_metadata
+
+    if curve_shape_strategy == 'resize':
+        if method in _BLOCK_TRAVERSAL_METHODS:
+            block_size = _block_size_for_method(method)
+            raise NotImplementedError(
+                f"method='{method}' currently supports "
+                "curve_shape_strategy='center_crop' only. Its compatible "
+                "domain is a centered rectangle with dimensions divisible by "
+                f"{block_size}."
+            )
+        side = _select_resize_side(
+            shape,
+            method,
+            resize_side=resize_side,
+            resize_side_mode=resize_side_mode,
+        )
+        indices = np.asarray(
+            _TRAVERSAL_INDEX_GENERATORS[method]((side, side)),
+            dtype=int,
+        )
+        indices = _validate_traversal_indices(indices, (side, side), method)
+        return indices, {
+            'curve_shape_strategy': 'resize',
+            'curve_grid_shape': (side, side),
+            'resize_side': side,
+            'resize_side_mode': resize_side_mode,
+            'resized_traversal_shape': (side, side),
+            'traversal_shape': (side, side),
+        }
+
+    raise ValueError("curve_shape_strategy must be 'center_crop' or 'resize'.")
+
+
+def _inverse_transpose_order(order):
+    """Return the inverse permutation for a transpose order."""
+    inverse = [0] * len(order)
+    for idx, axis in enumerate(order):
+        inverse[axis] = idx
+    return tuple(inverse)
+
+
+def _copy_traversal_metadata(prefix, metadata):
+    """Copy traversal metadata, optionally namespaced for domain='both'."""
+    if prefix is None:
+        return dict(metadata)
+    return {f"{prefix}_{key}": value for key, value in metadata.items()}
+
+
+def _build_unfold_metadata(original_shape, domain='real', method='row_major',
+                           curve_shape_strategy='center_crop',
+                           preserve_excess=True, resize_side=None,
+                           resize_side_mode='nearest', resize_method='linear',
+                           preserve_original=False, working_shape=None):
+    """Build metadata needed to undo an unfolding exactly when possible."""
+    original_shape = _validate_unfold_shape(original_shape)
+    working_shape = _validate_unfold_shape(working_shape or original_shape)
+    domain, method = _normalize_unfold_request(domain=domain, method=method)
+    ry, rx, ky, kx = working_shape
+
+    metadata = {
+        'version': 2,
+        'original_shape': original_shape,
+        'working_shape': working_shape,
+        'domain': domain,
+        'method': method,
+        'preserve_excess': bool(preserve_excess),
+        'preserve_original': bool(preserve_original),
+    }
+
+    if method == 'coordinate_aligned':
+        if domain == 'real':
+            transpose_order = (0, 2, 1, 3)
+            intermediate_shape = (ry, ky, rx, kx)
+            output_shape = (ry * ky, rx * kx)
+            interpretation = (
+                "Rows combine real-space y with reciprocal-space y; columns "
+                "combine real-space x with reciprocal-space x."
+            )
+        else:
+            transpose_order = (2, 0, 3, 1)
+            intermediate_shape = (ky, ry, kx, rx)
+            output_shape = (ky * ry, kx * rx)
+            interpretation = (
+                "Rows combine reciprocal-space y with real-space y; columns "
+                "combine reciprocal-space x with real-space x."
+            )
+
+        metadata.update({
+            'representation': 'coordinate_aligned_matrix',
+            'curve_shape_strategy': 'not_applicable',
+            'transpose_order': transpose_order,
+            'inverse_transpose_order': _inverse_transpose_order(transpose_order),
+            'intermediate_shape': intermediate_shape,
+            'output_shape': output_shape,
+            'interpretation': interpretation,
+        })
+        return metadata
+
+    if domain == 'real':
+        indices, traversal_meta = _get_traversal_indices(
+            (ry, rx),
+            method,
+            curve_shape_strategy=curve_shape_strategy,
+            resize_side=resize_side,
+            resize_side_mode=resize_side_mode,
+        )
+        metadata.update(_copy_traversal_metadata(None, traversal_meta))
+        metadata.update({
+            'representation': 'real_stack',
+            'traversal_indices': indices,
+            'output_shape': (len(indices), ky, kx),
+            'resize_method': resize_method,
+            'resized_shape': working_shape if traversal_meta['curve_shape_strategy'] == 'resize' else None,
+            'interpretation': (
+                "The real-space scan grid is traversed into a stack of "
+                "diffraction patterns."
+            ),
+        })
+    elif domain == 'reciprocal':
+        indices, traversal_meta = _get_traversal_indices(
+            (ky, kx),
+            method,
+            curve_shape_strategy=curve_shape_strategy,
+            resize_side=resize_side,
+            resize_side_mode=resize_side_mode,
+        )
+        metadata.update(_copy_traversal_metadata(None, traversal_meta))
+        metadata.update({
+            'representation': 'reciprocal_stack',
+            'traversal_indices': indices,
+            'output_shape': (len(indices), ry, rx),
+            'resize_method': resize_method,
+            'resized_shape': working_shape if traversal_meta['curve_shape_strategy'] == 'resize' else None,
+            'interpretation': (
+                "The reciprocal-space diffraction grid is traversed into a "
+                "stack of real-space images."
+            ),
+        })
+    else:
+        real_indices, real_meta = _get_traversal_indices(
+            (ry, rx),
+            method,
+            curve_shape_strategy=curve_shape_strategy,
+            resize_side=resize_side,
+            resize_side_mode=resize_side_mode,
+        )
+        reciprocal_indices, reciprocal_meta = _get_traversal_indices(
+            (ky, kx),
+            method,
+            curve_shape_strategy=curve_shape_strategy,
+            resize_side=resize_side,
+            resize_side_mode=resize_side_mode,
+        )
+        metadata.update({
+            'representation': 'both_matrix',
+            'real_traversal_indices': real_indices,
+            'reciprocal_traversal_indices': reciprocal_indices,
+            'output_shape': (len(real_indices), len(reciprocal_indices)),
+            'resize_method': resize_method,
+            'resized_shape': working_shape if real_meta['curve_shape_strategy'] == 'resize' else None,
+            'interpretation': (
+                "Rows traverse real-space positions and columns traverse "
+                "reciprocal-space pixels."
+            ),
+        })
+        metadata.update(_copy_traversal_metadata('real', real_meta))
+        metadata.update(_copy_traversal_metadata('reciprocal', reciprocal_meta))
+        metadata['curve_shape_strategy'] = real_meta['curve_shape_strategy']
+
+    return metadata
+
+
+def _require_metadata(metadata):
+    """Validate unfolding metadata and return a shallow copy."""
+    if metadata is None:
+        raise ValueError(
+            "metadata is required for undo=True. Use return_metadata=True when "
+            "unfolding, or call HyperData.unfold(undo=True) on an unfolded "
+            "HyperData object that still has attached metadata."
+        )
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dictionary returned by unfold(...).")
+
+    required = {'original_shape', 'domain', 'method', 'representation', 'output_shape'}
+    missing = sorted(required - set(metadata))
+    if missing:
+        raise ValueError(f"metadata is missing required field(s): {', '.join(missing)}.")
+
+    clean = dict(metadata)
+    clean['original_shape'] = _validate_unfold_shape(clean['original_shape'])
+    clean['working_shape'] = _validate_unfold_shape(
+        clean.get('working_shape', clean['original_shape'])
+    )
+    clean['output_shape'] = tuple(int(v) for v in clean['output_shape'])
+    return clean
+
+
+def _validate_unfolded_shape(array, metadata):
+    """Raise a helpful error if an unfolded array does not match metadata."""
+    expected_shape = tuple(metadata['output_shape'])
+    if array.shape != expected_shape:
+        raise ValueError(
+            "Unfolded array shape does not match metadata: "
+            f"got {array.shape}, expected {expected_shape}."
+        )
+
+
+def _extract_excess_values(array, metadata):
+    """Store excluded data required for exact center-crop undo."""
+    representation = metadata['representation']
+    if metadata.get('curve_shape_strategy') != 'center_crop':
+        return
+    if not metadata.get('preserve_excess', False):
+        return
+
+    if representation == 'real_stack':
+        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
+        metadata['excess_values'] = array[
+            excess_indices[:, 0],
+            excess_indices[:, 1],
+            :,
+            :,
+        ].copy()
+    elif representation == 'reciprocal_stack':
+        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
+        values = np.empty(
+            (len(excess_indices), array.shape[0], array.shape[1]),
+            dtype=array.dtype,
+        )
+        for idx, (ky_idx, kx_idx) in enumerate(excess_indices):
+            values[idx] = array[:, :, ky_idx, kx_idx]
+        metadata['excess_values'] = values
+    elif representation == 'both_matrix':
+        metadata['excess_values'] = array.copy()
+        metadata['excess_values_encoding'] = 'full_tensor'
+
+
+def _crop_restore_shape(metadata):
+    """Return the shape restored when center-crop excess was not preserved."""
+    representation = metadata['representation']
+    working_shape = metadata['working_shape']
+    ry, rx, ky, kx = working_shape
+
+    if representation == 'real_stack':
+        side_y, side_x = metadata['curve_grid_shape']
+        return (side_y, side_x, ky, kx)
+    if representation == 'reciprocal_stack':
+        side_y, side_x = metadata['curve_grid_shape']
+        return (ry, rx, side_y, side_x)
+    if representation == 'both_matrix':
+        real_side_y, real_side_x = metadata['real_curve_grid_shape']
+        reciprocal_side_y, reciprocal_side_x = metadata['reciprocal_curve_grid_shape']
+        return (real_side_y, real_side_x, reciprocal_side_y, reciprocal_side_x)
+    raise ValueError(f"Unsupported crop restore representation '{representation}'.")
+
+
+def _local_crop_indices(indices, crop_slices):
+    """Convert original-array crop coordinates to local cropped coordinates."""
+    indices = np.asarray(indices, dtype=int)
+    y0 = crop_slices['y'][0]
+    x0 = crop_slices['x'][0]
+    return indices - np.array([y0, x0])
+
+
+def _restore_real_stack(array, metadata):
+    """Undo a real-domain stack unfolding."""
+    indices = np.asarray(metadata['traversal_indices'], dtype=int)
+    strategy = metadata.get('curve_shape_strategy', 'full_shape')
+
+    if strategy == 'center_crop' and not metadata.get('preserve_excess', False):
+        restored = np.empty(_crop_restore_shape(metadata), dtype=array.dtype)
+        local_indices = _local_crop_indices(indices, metadata['crop_slices'])
+        restored[local_indices[:, 0], local_indices[:, 1], :, :] = array
+        return restored
+
+    if strategy == 'resize' and metadata.get('preserve_original', False):
+        return np.array(metadata['original_values'], copy=True)
+
+    restored_shape = metadata['working_shape']
+    restored = np.empty(restored_shape, dtype=array.dtype)
+
+    if strategy == 'center_crop' and metadata.get('preserve_excess', False):
+        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
+        restored[excess_indices[:, 0], excess_indices[:, 1], :, :] = metadata['excess_values']
+
+    restored[indices[:, 0], indices[:, 1], :, :] = array
+    return restored
+
+
+def _restore_reciprocal_stack(array, metadata):
+    """Undo a reciprocal-domain stack unfolding."""
+    indices = np.asarray(metadata['traversal_indices'], dtype=int)
+    strategy = metadata.get('curve_shape_strategy', 'full_shape')
+
+    if strategy == 'center_crop' and not metadata.get('preserve_excess', False):
+        restored = np.empty(_crop_restore_shape(metadata), dtype=array.dtype)
+        local_indices = _local_crop_indices(indices, metadata['crop_slices'])
+        for flat_idx, (ky_idx, kx_idx) in enumerate(local_indices):
+            restored[:, :, ky_idx, kx_idx] = array[flat_idx]
+        return restored
+
+    if strategy == 'resize' and metadata.get('preserve_original', False):
+        return np.array(metadata['original_values'], copy=True)
+
+    restored_shape = metadata['working_shape']
+    restored = np.empty(restored_shape, dtype=array.dtype)
+
+    if strategy == 'center_crop' and metadata.get('preserve_excess', False):
+        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
+        for flat_idx, (ky_idx, kx_idx) in enumerate(excess_indices):
+            restored[:, :, ky_idx, kx_idx] = metadata['excess_values'][flat_idx]
+
+    for flat_idx, (ky_idx, kx_idx) in enumerate(indices):
+        restored[:, :, ky_idx, kx_idx] = array[flat_idx]
+    return restored
+
+
+def _restore_both_matrix(array, metadata):
+    """Undo a 2D mixed real/reciprocal unfolding."""
+    real_indices = np.asarray(metadata['real_traversal_indices'], dtype=int)
+    reciprocal_indices = np.asarray(metadata['reciprocal_traversal_indices'], dtype=int)
+    strategy = metadata.get('curve_shape_strategy', 'full_shape')
+
+    if strategy == 'center_crop' and not metadata.get('preserve_excess', False):
+        restored = np.empty(_crop_restore_shape(metadata), dtype=array.dtype)
+        real_local = _local_crop_indices(real_indices, metadata['real_crop_slices'])
+        reciprocal_local = _local_crop_indices(
+            reciprocal_indices,
+            metadata['reciprocal_crop_slices'],
+        )
+    else:
+        if strategy == 'resize' and metadata.get('preserve_original', False):
+            return np.array(metadata['original_values'], copy=True)
+        if strategy == 'center_crop' and metadata.get('preserve_excess', False):
+            restored = np.array(metadata['excess_values'], copy=True)
+        else:
+            restored = np.empty(metadata['working_shape'], dtype=array.dtype)
+        real_local = real_indices
+        reciprocal_local = reciprocal_indices
+
+    for real_flat_idx, (ry_idx, rx_idx) in enumerate(real_local):
+        restored[
+            ry_idx,
+            rx_idx,
+            reciprocal_local[:, 0],
+            reciprocal_local[:, 1],
+        ] = array[real_flat_idx]
+    return restored
+
+
+def _infer_square_side(value, label):
+    """Infer a square side length from a flattened grid size."""
+    value = int(value)
+    side = int(np.sqrt(value))
+    if side * side != value:
+        raise ValueError(
+            f"Cannot infer a square {label} grid from {value} elements. "
+            "Pass original_shape explicitly."
+        )
+    return side
+
+
+def _infer_row_major_original_shape(array, domain, original_shape=None):
+    """Infer or validate the original 4D shape for row-major undo without metadata."""
+    domain, _ = _normalize_unfold_request(domain=domain, method='row_major')
+
+    if original_shape is not None:
+        original_shape = tuple(int(v) for v in original_shape)
+        if len(original_shape) == 4:
+            return _validate_unfold_shape(original_shape)
+        if len(original_shape) == 2 and domain == 'real' and array.ndim == 3:
+            ry, rx = original_shape
+            return _validate_unfold_shape((ry, rx, array.shape[1], array.shape[2]))
+        if len(original_shape) == 2 and domain == 'reciprocal' and array.ndim == 3:
+            ky, kx = original_shape
+            return _validate_unfold_shape((array.shape[1], array.shape[2], ky, kx))
+        raise ValueError(
+            "original_shape must be (Ry, Rx, Ky, Kx). For 3D row-major "
+            "domain='real' undo, (Ry, Rx) is also accepted; for "
+            "domain='reciprocal' undo, (Ky, Kx) is also accepted."
+        )
+
+    if domain == 'real' and array.ndim == 3:
+        ry = rx = _infer_square_side(array.shape[0], 'real-space')
+        return (ry, rx, array.shape[1], array.shape[2])
+
+    if domain == 'reciprocal' and array.ndim == 3:
+        ky = kx = _infer_square_side(array.shape[0], 'reciprocal-space')
+        return (array.shape[1], array.shape[2], ky, kx)
+
+    if domain == 'both' and array.ndim == 2:
+        ry = rx = _infer_square_side(array.shape[0], 'real-space')
+        ky = kx = _infer_square_side(array.shape[1], 'reciprocal-space')
+        return (ry, rx, ky, kx)
+
+    raise ValueError(
+        "metadata-less undo requires original_shape unless a square row-major "
+        "shape can be inferred from the unfolded array."
+    )
+
+
+def _build_row_major_undo_metadata(array, domain='real', method='row_major',
+                                   original_shape=None):
+    """Build minimal row-major metadata for undo when no unfold metadata exists."""
+    domain, method = _normalize_unfold_request(domain=domain, method=method)
+    if method != 'row_major':
+        raise ValueError(
+            "metadata-less undo only supports method='row_major'. Pass metadata "
+            "for non-row-major traversal methods."
+        )
+
+    original_shape = _infer_row_major_original_shape(
+        array,
+        domain=domain,
+        original_shape=original_shape,
+    )
+    return _build_unfold_metadata(
+        original_shape=original_shape,
+        working_shape=original_shape,
+        domain=domain,
+        method='row_major',
+        preserve_excess=False,
+    )
+
+
+def _unfold_array(array, domain='real', method='row_major',
+                  curve_shape_strategy='center_crop', preserve_excess=True,
+                  resize_side=None, resize_side_mode='nearest',
+                  resize_method='linear', preserve_original=False,
+                  original_shape=None, original_values=None, undo=False,
+                  metadata=None, return_metadata=False):
+    """
+    Unfold or restore a 4D-STEM tensor using explicit domain/method metadata.
+
+    Examples
+    --------
+    >>> original = np.arange(5*7*4*6).reshape(5, 7, 4, 6)
+    >>> unfolded, meta = _unfold_array(original, domain='real',
+    ...                                method='hilbert',
+    ...                                preserve_excess=True,
+    ...                                return_metadata=True)
+    >>> restored = _unfold_array(unfolded, undo=True, metadata=meta)
+    >>> np.array_equal(restored, original)
+    True
+    """
+    array = np.asarray(array)
+
+    if undo:
+        if metadata is None:
+            metadata = _build_row_major_undo_metadata(
+                array,
+                domain=domain,
+                method=method,
+                original_shape=original_shape,
+            )
+        metadata = _require_metadata(metadata)
+        _validate_unfolded_shape(array, metadata)
+        representation = metadata['representation']
+
+        if representation == 'coordinate_aligned_matrix':
+            restored = array.reshape(metadata['intermediate_shape'])
+            restored = np.transpose(restored, metadata['inverse_transpose_order'])
+
+        elif representation == 'real_stack':
+            restored = _restore_real_stack(array, metadata)
+
+        elif representation == 'reciprocal_stack':
+            restored = _restore_reciprocal_stack(array, metadata)
+
+        elif representation == 'both_matrix':
+            restored = _restore_both_matrix(array, metadata)
+
+        else:
+            raise ValueError(f"Unsupported metadata representation '{representation}'.")
+
+        if return_metadata:
+            return restored, metadata
+        return restored
+
+    if array.ndim != 4:
+        raise ValueError(
+            "Forward unfolding expects a 4D-STEM tensor with shape "
+            "(Ry, Rx, Ky, Kx)."
+        )
+
+    metadata = _build_unfold_metadata(
+        original_shape=original_shape or array.shape,
+        working_shape=array.shape,
+        domain=domain,
+        method=method,
+        curve_shape_strategy=curve_shape_strategy,
+        preserve_excess=preserve_excess,
+        resize_side=resize_side,
+        resize_side_mode=resize_side_mode,
+        resize_method=resize_method,
+        preserve_original=preserve_original,
+    )
+
+    if preserve_original and original_values is not None:
+        metadata['original_values'] = np.array(original_values, copy=True)
+
+    _extract_excess_values(array, metadata)
+    representation = metadata['representation']
+
+    if representation == 'coordinate_aligned_matrix':
+        unfolded = np.transpose(array, metadata['transpose_order'])
+        unfolded = unfolded.reshape(metadata['output_shape'])
+
+    elif representation == 'real_stack':
+        indices = metadata['traversal_indices']
+        unfolded = array[indices[:, 0], indices[:, 1], :, :]
+
+    elif representation == 'reciprocal_stack':
+        indices = metadata['traversal_indices']
+        unfolded = np.empty(metadata['output_shape'], dtype=array.dtype)
+        for flat_idx, (ky_idx, kx_idx) in enumerate(indices):
+            unfolded[flat_idx] = array[:, :, ky_idx, kx_idx]
+
+    elif representation == 'both_matrix':
+        real_indices = metadata['real_traversal_indices']
+        reciprocal_indices = metadata['reciprocal_traversal_indices']
+        unfolded = np.empty(metadata['output_shape'], dtype=array.dtype)
+        for flat_idx, (ry_idx, rx_idx) in enumerate(real_indices):
+            unfolded[flat_idx] = array[
+                ry_idx,
+                rx_idx,
+                reciprocal_indices[:, 0],
+                reciprocal_indices[:, 1],
+            ]
+
+    else:
+        raise ValueError(f"Unsupported unfolding representation '{representation}'.")
+
+    metadata['output_shape'] = unfolded.shape
+
+    if return_metadata:
+        return unfolded, metadata
+    return unfolded
 
 
 def clip_values(array, a_min=1, a_max=None):
@@ -1658,13 +3341,6 @@ def spiral_matrix(matrix, return_indices=True):
 
     return np.concatenate(result)
 
-# # Example usage
-# matrix = np.linspace(0,7**2-1,7**2).reshape(7,7)
-# # matrix = (np.random.random((5,5))*100).astype(int)
-# spiral = spiral_matrix(matrix)
-# print(spiral)
-# # print(spiral)
-
 def gradient_ascent(data, start, learning_rate=0.1, max_iters=100):
     y, x = start
     for i in range(max_iters):
@@ -1754,9 +3430,6 @@ def mask_corrupted_pixels(arr, threshold=3, window_size=3):
                 mask[i, j] = True
                 
     return mask
-
-import numpy as np
-import matplotlib.pyplot as plt
 
 def get_gradients(sol_array, rot_angle=0, show_result=False, invertY=False, invertX=False, cbar_fraction=0.04):
     """Calculate directional gradients from a solution array of (phi, theta) values.
@@ -2251,7 +3924,12 @@ def combine_strain_maps(strain_maps: np.ndarray,
 
 class HyperData:
     
-    def __init__(self, data):
+    def __init__(self, data,
+                 real_units: str = None,
+                 real_conv_factor: float = None,
+                 reciprocal_units: str = None,
+                 reciprocal_conv_factor: float = None,
+                 polar_metadata: dict = None):
         
         # Read dataset from file path if input object is string
         if type(data) == str:
@@ -2263,7 +3941,823 @@ class HyperData:
         self.real_shape = (data.shape[0], data.shape[1])
         self.k_shape = (data.shape[-2], data.shape[-1])
         self.dtype = data.dtype
-        self.denoiser = Denoiser(self.array)
+        self._denoise_engine = _DenoiseEngine(self.array)
+        self.real_units = None
+        self.real_conv_factor = None
+        self.reciprocal_units = None
+        self.reciprocal_conv_factor = None
+        self.unfold_metadata = None
+        self.polar_metadata = deepcopy(polar_metadata) if polar_metadata is not None else None
+
+        if real_units is not None or real_conv_factor is not None:
+            self.set_real_scale(real_units, real_conv_factor)
+        if reciprocal_units is not None or reciprocal_conv_factor is not None:
+            self.set_reciprocal_scale(reciprocal_units, reciprocal_conv_factor)
+
+    @property
+    def is_polar(self):
+        """Return True when the last two axes represent polar ``(r, theta)``."""
+        return self.polar_metadata is not None
+
+    @staticmethod
+    def _validate_scale(units, conv_factor, label):
+        """Validate a units-per-pixel calibration pair."""
+        if units is None or conv_factor is None:
+            raise ValueError(
+                f"'{label}_units' and '{label}_conv_factor' must both be provided."
+            )
+        if not isinstance(units, str) or not units.strip():
+            raise ValueError(f"'{label}_units' must be a non-empty string.")
+        if not np.isscalar(conv_factor) or conv_factor <= 0:
+            raise ValueError(f"'{label}_conv_factor' must be a positive scalar.")
+        return units.strip(), float(conv_factor)
+
+    def set_real_scale(self, units: str, conv_factor: float):
+        """
+        Attach a real-space calibration in units per pixel.
+        """
+        units, conv_factor = self._validate_scale(units, conv_factor, 'real')
+        self.real_units = units
+        self.real_conv_factor = conv_factor
+        return self
+
+    def set_reciprocal_scale(self, units: str, conv_factor: float):
+        """
+        Attach a reciprocal-space calibration in units per pixel.
+        """
+        units, conv_factor = self._validate_scale(
+            units, conv_factor, 'reciprocal'
+        )
+        self.reciprocal_units = units
+        self.reciprocal_conv_factor = conv_factor
+        return self
+
+    def clear_real_scale(self):
+        """Remove the stored real-space calibration."""
+        self.real_units = None
+        self.real_conv_factor = None
+        return self
+
+    def clear_reciprocal_scale(self):
+        """Remove the stored reciprocal-space calibration."""
+        self.reciprocal_units = None
+        self.reciprocal_conv_factor = None
+        return self
+
+    def _spawn(self, data,
+               real_units=_SCALE_UNSET,
+               real_conv_factor=_SCALE_UNSET,
+               reciprocal_units=_SCALE_UNSET,
+               reciprocal_conv_factor=_SCALE_UNSET,
+               polar_metadata=_SCALE_UNSET):
+        """Create a new HyperData object while preserving calibration."""
+        if real_units is _SCALE_UNSET:
+            real_units = self.real_units
+        if real_conv_factor is _SCALE_UNSET:
+            real_conv_factor = self.real_conv_factor
+        if reciprocal_units is _SCALE_UNSET:
+            reciprocal_units = self.reciprocal_units
+        if reciprocal_conv_factor is _SCALE_UNSET:
+            reciprocal_conv_factor = self.reciprocal_conv_factor
+        if polar_metadata is _SCALE_UNSET:
+            polar_metadata = self.polar_metadata
+
+        return HyperData(
+            data,
+            real_units=real_units,
+            real_conv_factor=real_conv_factor,
+            reciprocal_units=reciprocal_units,
+            reciprocal_conv_factor=reciprocal_conv_factor,
+            polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+        )
+
+    def _spawn_reciprocal(self, data, units=_SCALE_UNSET,
+                          conv_factor=_SCALE_UNSET,
+                          polar_metadata=_SCALE_UNSET):
+        """Create a ReciprocalSpace object using this dataset's calibration."""
+        if units is _SCALE_UNSET:
+            units = self.reciprocal_units
+        if conv_factor is _SCALE_UNSET:
+            conv_factor = self.reciprocal_conv_factor
+        if polar_metadata is _SCALE_UNSET:
+            polar_metadata = self.polar_metadata
+        return ReciprocalSpace(
+            data,
+            units=units,
+            conv_factor=conv_factor,
+            polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+        )
+
+    def _spawn_real(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET):
+        """Create a RealSpace object using this dataset's calibration."""
+        if units is _SCALE_UNSET:
+            units = self.real_units
+        if conv_factor is _SCALE_UNSET:
+            conv_factor = self.real_conv_factor
+        return RealSpace(data, units=units, conv_factor=conv_factor)
+
+
+    @property
+    def available_denoising_methods(self):
+        """Return denoising method names available through :meth:`denoise`."""
+        return tuple(self._denoise_engine.available_methods)
+
+
+    def denoising_method_info(self, method=None, include_doc=True, print_info=True):
+        """
+        Show the method-specific inputs accepted by a denoising method.
+
+        Parameters
+        ----------
+        method : str or None, optional
+            Name of the denoising method. If None, return the available method
+            names instead.
+        include_doc : bool, optional
+            If True, include the selected method's docstring in the returned
+            dictionary.
+        print_info : bool, optional
+            If True, print a compact, notebook-friendly summary.
+
+        Returns
+        -------
+        dict
+            Structured method information. The data array input is supplied by
+            :meth:`denoise`, so it is reported separately from user-provided
+            keyword arguments.
+        """
+        return self._denoise_engine.method_info(
+            method_name=method,
+            include_doc=include_doc,
+            print_info=print_info,
+        )
+
+
+    def denoise_info(self, method=None, include_doc=True, print_info=True):
+        """Alias for :meth:`denoising_method_info`."""
+        return self.denoising_method_info(
+            method=method,
+            include_doc=include_doc,
+            print_info=print_info,
+        )
+
+    def _finalize_denoise_result(self, result, return_array=False):
+        """
+        Return denoised output using this object's metadata.
+
+        Numerical denoising helpers may return either a raw array or, in some
+        legacy paths, a HyperData object. The public HyperData.denoise API
+        always gives ownership of metadata to the caller object.
+        """
+        if isinstance(result, HyperData):
+            result = result.array
+
+        if return_array or not isinstance(result, np.ndarray):
+            return result
+
+        return self._spawn(result)
+
+    @staticmethod
+    def _normalize_scalar_rank(rank):
+        """Return a positive numeric rank from a scalar."""
+        if isinstance(rank, np.generic):
+            rank = rank.item()
+
+        if isinstance(rank, Integral):
+            rank_value = int(rank)
+        elif np.isscalar(rank):
+            try:
+                rank_value = float(rank)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Rank values must be positive numeric values; got {rank!r}."
+                ) from exc
+            if rank_value.is_integer():
+                rank_value = int(rank_value)
+        else:
+            raise ValueError(
+                "Each rank entry must be numeric or a 1D numeric sequence."
+            )
+
+        if not np.isfinite(rank_value) or rank_value <= 0:
+            raise ValueError(
+                f"Rank values must be positive finite numbers; got {rank_value}."
+            )
+        return rank_value
+
+    @classmethod
+    def _normalize_rank_value(cls, rank):
+        """Normalize one scalar rank or one tuple/list/array rank value."""
+        if isinstance(rank, np.ndarray):
+            if rank.ndim == 0:
+                return cls._normalize_scalar_rank(rank.item())
+            if rank.ndim == 1:
+                return tuple(cls._normalize_scalar_rank(value) for value in rank)
+            raise ValueError(
+                "Each rank entry must be scalar or a 1D numeric sequence."
+            )
+
+        if isinstance(rank, (list, tuple)):
+            if len(rank) == 0:
+                raise ValueError("Rank sequences cannot be empty.")
+            return tuple(cls._normalize_scalar_rank(value) for value in rank)
+
+        return cls._normalize_scalar_rank(rank)
+
+    @classmethod
+    def _normalize_rank_sweep(cls, ranks):
+        """Normalize an arbitrary rank iterable into rank values."""
+        if ranks is None:
+            raise ValueError("ranks must be a non-empty iterable of ranks.")
+
+        if isinstance(ranks, np.ndarray):
+            if ranks.ndim == 0:
+                raw_ranks = [ranks.item()]
+            elif ranks.ndim == 1:
+                raw_ranks = ranks.tolist()
+            else:
+                raw_ranks = [row for row in ranks]
+        elif np.isscalar(ranks):
+            raw_ranks = [ranks]
+        else:
+            try:
+                raw_ranks = list(ranks)
+            except TypeError as exc:
+                raise ValueError(
+                    "ranks must be a scalar rank or an iterable of ranks."
+                ) from exc
+
+        if len(raw_ranks) == 0:
+            raise ValueError("ranks must contain at least one rank value.")
+
+        return tuple(cls._normalize_rank_value(rank) for rank in raw_ranks)
+
+    @staticmethod
+    def _rank_label(rank):
+        """Return a compact plot/table label for one rank value."""
+        if isinstance(rank, tuple):
+            return "(" + ", ".join(str(value) for value in rank) + ")"
+        return str(rank)
+
+    @staticmethod
+    def _rank_scree_y_values(metric, relative_errors, residual_norms, fits):
+        """Return plotted y-values and axis label for a rank scree metric."""
+        metric = metric.lower()
+        if metric in ('relative_error', 'error', 'rel_error'):
+            return relative_errors, 'Relative reconstruction error'
+        if metric in ('residual_norm', 'residual'):
+            return residual_norms, 'Residual norm'
+        if metric == 'fit':
+            return fits, 'Fit = 1 - relative error'
+        raise ValueError(
+            "metric must be 'relative_error', 'residual_norm', or 'fit'."
+        )
+
+    def rank_scree(self, method, ranks, domain='reciprocal',
+                   unfold_domain=None, unfold_method='row_major',
+                   unfold_kwargs=None, metric='relative_error',
+                   plot=True, ax=None, log_y=False, show=True,
+                   progress=True, return_reconstructions=False, **kwargs):
+        """
+        Run a rank sweep and plot final reconstruction quality for each rank.
+
+        This method performs one complete denoising/decomposition run per rank.
+        It is therefore much more expensive than a convergence plot from one
+        denoise call. ``ranks`` may be a ``range``, tuple, list, NumPy array, or
+        any iterable of positive numeric rank values. Nested rank values, such as
+        ``[(2, 2, 2), (4, 4, 4)]`` for Tucker-style rank specifications, are
+        also accepted.
+
+        Parameters
+        ----------
+        method : str
+            Name of a denoising method that accepts a ``rank`` argument.
+        ranks : iterable
+            Rank values to evaluate. Examples: ``range(1, 31)``,
+            ``[1, 2, 4, 8]``, ``np.array([5, 10, 20])``.
+        domain : {'real', 'reciprocal'} or None, optional
+            Passed to :meth:`denoise`.
+        unfold_domain : {'real', 'reciprocal', 'both'} or None, optional
+            Passed to :meth:`denoise`.
+        unfold_method : str, optional
+            Passed to :meth:`denoise`.
+        unfold_kwargs : dict or None, optional
+            Additional unfolding arguments passed to :meth:`denoise`.
+        metric : {'relative_error', 'residual_norm', 'fit'}, optional
+            Quantity to plot on the y-axis.
+        plot : bool, optional
+            If True, create a Matplotlib scree/elbow plot.
+        ax : matplotlib.axes.Axes or None, optional
+            Existing axes for plotting. If None, a new figure is created.
+        log_y : bool, optional
+            If True, use a logarithmic y-axis.
+        show : bool, optional
+            If True, call ``plt.show()`` after plotting.
+        progress : bool, optional
+            If True, show a progress bar over ranks.
+        return_reconstructions : bool, optional
+            If True, include each reconstructed array in the returned results.
+        **kwargs
+            Keyword arguments passed to :meth:`denoise` for every rank.
+
+        Returns
+        -------
+        dict
+            Dictionary containing ranks, residual norms, relative errors, fit,
+            and plotting objects.
+        """
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a non-empty string.")
+
+        reserved = {
+            'rank',
+            'return_array',
+            'return_decomposition',
+            'return_errors',
+        }
+        conflicts = reserved.intersection(kwargs)
+        if conflicts:
+            conflict_text = ', '.join(sorted(conflicts))
+            raise ValueError(
+                f"Do not pass {conflict_text} to rank_scree. "
+                "rank_scree controls these internally."
+            )
+
+        method_obj = getattr(self._denoise_engine.methods, method, None)
+        if method_obj is None or method.startswith('_'):
+            raise ValueError(
+                f"No such denoising method '{method}'. Available methods are: "
+                f"{', '.join(self.available_denoising_methods)}"
+            )
+        if 'rank' not in inspect.signature(method_obj).parameters:
+            raise ValueError(
+                f"Method '{method}' does not expose a rank parameter."
+            )
+
+        rank_values = self._normalize_rank_sweep(ranks)
+        rank_labels = tuple(self._rank_label(rank) for rank in rank_values)
+        original = np.asarray(self.array)
+        original_norm = np.linalg.norm(original.ravel())
+        if original_norm == 0:
+            original_norm = np.nan
+
+        iterator = rank_values
+        if progress and len(rank_values) > 1:
+            iterator = tqdm(rank_values, desc=f"{method} rank sweep")
+
+        residual_norms = []
+        relative_errors = []
+        fits = []
+        reconstructions = []
+
+        for rank in iterator:
+            reconstruction = self.denoise(
+                method=method,
+                rank=rank,
+                domain=domain,
+                unfold_domain=unfold_domain,
+                unfold_method=unfold_method,
+                unfold_kwargs=unfold_kwargs,
+                return_array=True,
+                **kwargs,
+            )
+
+            reconstruction = np.asarray(reconstruction)
+            if reconstruction.shape != self.array.shape:
+                raise ValueError(
+                    f"Rank {rank!r} returned shape {reconstruction.shape}, "
+                    f"but expected {self.array.shape}. rank_scree requires "
+                    "shape-preserving denoising."
+                )
+
+            residual = original - reconstruction
+            residual_norm = np.linalg.norm(residual.ravel())
+            relative_error = residual_norm / original_norm
+            fit = 1 - relative_error
+
+            residual_norms.append(residual_norm)
+            relative_errors.append(relative_error)
+            fits.append(fit)
+            if return_reconstructions:
+                reconstructions.append(reconstruction)
+
+        residual_norms = np.asarray(residual_norms, dtype=float)
+        relative_errors = np.asarray(relative_errors, dtype=float)
+        fits = np.asarray(fits, dtype=float)
+        y_values, y_label = self._rank_scree_y_values(
+            metric,
+            relative_errors,
+            residual_norms,
+            fits,
+        )
+
+        if all(np.isscalar(rank) for rank in rank_values):
+            x_values = np.asarray(rank_values, dtype=float)
+            if np.all(np.equal(x_values, np.round(x_values))):
+                x_values = x_values.astype(int)
+            x_label = 'Rank'
+            use_rank_tick_labels = False
+        else:
+            x_values = np.arange(1, len(rank_values) + 1)
+            x_label = 'Rank configuration'
+            use_rank_tick_labels = True
+
+        figure = None
+        if plot:
+            if ax is None:
+                figure, ax = plt.subplots(figsize=(7, 4))
+            else:
+                figure = ax.figure
+
+            ax.plot(x_values, y_values, '-o')
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y_label)
+            ax.set_title(f"{method} rank scree")
+            ax.grid(True, alpha=0.3)
+            if log_y:
+                ax.set_yscale('log')
+            if use_rank_tick_labels:
+                ax.set_xticks(x_values)
+                ax.set_xticklabels(rank_labels, rotation=45, ha='right')
+            if show:
+                plt.show()
+
+        results = {
+            'method': method,
+            'ranks': rank_values,
+            'rank_labels': rank_labels,
+            'residual_norm': residual_norms,
+            'relative_error': relative_errors,
+            'errors': relative_errors,
+            'fit': fits,
+            'metric': metric,
+            'x': x_values,
+            'y': y_values,
+            'figure': figure,
+            'ax': ax,
+        }
+        if return_reconstructions:
+            results['reconstructions'] = tuple(reconstructions)
+
+        return results
+
+
+    def denoise(self, method, domain='reciprocal', unfold_domain=None,
+                unfold_method='row_major', unfold_kwargs=None,
+                return_array=False, **kwargs):
+        """
+        Denoise this dataset and return a new :class:`HyperData` object.
+
+        Parameters
+        ----------
+        method : str
+            Name of a method available in ``available_denoising_methods``.
+        domain : {'real', 'reciprocal'} or None, optional
+            Coordinate domain used for slice-wise denoising of 4D data.
+            ``'real'`` applies the method to each real-space image and
+            ``'reciprocal'`` applies it to each diffraction pattern. Use
+            ``domain=None`` to apply the method directly to the whole array.
+            For 2D and 3D data, methods are applied directly to the whole
+            array regardless of domain.
+        unfold_domain : {'real', 'reciprocal', 'both'} or None, optional
+            Domain to unfold before denoising. If provided for 4D data, the
+            data are unfolded, denoised as a whole lower-dimensional array, and
+            then refolded automatically.
+        unfold_method : str, optional
+            Traversal method passed to :meth:`unfold` during generic
+            unfold-denoise-refold routing.
+        unfold_kwargs : dict or None, optional
+            Additional keyword arguments passed to :meth:`unfold`, such as
+            ``curve_shape_strategy`` or ``preserve_excess``.
+        return_array : bool, optional
+            If True, return the denoised ``ndarray`` instead of wrapping it in a
+            new ``HyperData`` object.
+        **kwargs
+            Keyword arguments passed to the selected denoising method.
+
+        Returns
+        -------
+        HyperData or ndarray
+            Denoised data. By default this is a new ``HyperData`` object that
+            preserves this object's calibration metadata.
+
+        Examples
+        --------
+        >>> denoised = my_dataset.denoise(
+        ...     method='median',
+        ...     domain='reciprocal',
+        ...     window_size=3,
+        ... )
+        >>> denoised = my_dataset.denoise(
+        ...     method='some_3d_method',
+        ...     unfold_domain='real',
+        ...     unfold_method='meander-4',
+        ... )
+        >>> denoised = my_dataset.denoise(
+        ...     method='some_whole_array_method',
+        ...     domain=None,
+        ... )
+        """
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a non-empty string.")
+
+        if unfold_domain is not None:
+            if self.ndim != 4:
+                raise ValueError(
+                    "unfold_domain can only be used with 4D HyperData. "
+                    "For 2D or 3D data, denoise applies the method directly."
+                )
+            if unfold_kwargs is None:
+                unfold_kwargs = {}
+            if not isinstance(unfold_kwargs, dict):
+                raise ValueError("unfold_kwargs must be a dictionary or None.")
+
+            unfolded, unfold_metadata = self.unfold(
+                domain=unfold_domain,
+                method=unfold_method,
+                return_metadata=True,
+                **unfold_kwargs,
+            )
+
+            denoised_unfolded = _DenoiseEngine(unfolded.array).denoise(
+                method,
+                **kwargs,
+            )
+            if isinstance(denoised_unfolded, HyperData):
+                denoised_unfolded = denoised_unfolded.array
+            if not isinstance(denoised_unfolded, np.ndarray):
+                raise ValueError(
+                    "Automatic unfold-denoise-refold routing expects the "
+                    "denoising method to return an ndarray or HyperData object. "
+                    "Use return_decomposition=False when denoising unfolded data."
+                )
+            if denoised_unfolded.shape != unfolded.array.shape:
+                raise ValueError(
+                    "The denoising method changed the unfolded shape from "
+                    f"{unfolded.array.shape} to {denoised_unfolded.shape}; "
+                    "automatic refolding requires the shape to be preserved."
+                )
+
+            refolded = HyperData(denoised_unfolded).unfold(
+                undo=True,
+                metadata=unfold_metadata,
+            ).array
+            return self._finalize_denoise_result(
+                refolded,
+                return_array=return_array,
+            )
+
+        engine = _DenoiseEngine(self.array)
+        denoised = engine.apply(
+            method=method,
+            domain=domain,
+            **kwargs,
+        )
+
+        return self._finalize_denoise_result(
+            denoised,
+            return_array=return_array,
+        )
+
+
+    def unfold(self, domain='real', method='row_major',
+               curve_shape_strategy='center_crop', preserve_excess=True,
+               resize_side=None, resize_side_mode='nearest',
+               resize_method='linear', preserve_original=False,
+               undo=False, metadata=None, original_shape=None,
+               return_metadata=False):
+        """
+        Unfold or restore a 4D-STEM tensor using explicit domain/method choices.
+
+        The tensor convention is ``(Ry, Rx, Ky, Kx)``. ``domain`` controls which
+        coordinate grid is unfolded, while ``method`` controls the coordinate
+        traversal or axis alignment strategy.
+
+        Parameters
+        ----------
+        domain : {'real', 'reciprocal', 'both'}, optional
+            Coordinate domain to unfold. ``'real'`` produces a stack of
+            diffraction patterns, ``'reciprocal'`` produces a stack of
+            real-space images along the last axis, and ``'both'`` produces a
+            2D matrix.
+        method : str, optional
+            Traversal or axis-alignment method. Supported traversal methods are
+            ``'row_major'``, ``'serpentine'``, ``'spiral'``,
+            ``'diagonal_zigzag'``, ``'hilbert'``, ``'morton'``/``'z_order'``,
+            ``'peano'``, ``'peano_meander'``, ``'meander-4'``, and
+            ``'meander-5'``. ``'moore'`` is reserved and currently raises
+            ``NotImplementedError``. ``coordinate_aligned`` is supported for
+            ``domain='real'`` and ``domain='reciprocal'`` only.
+        curve_shape_strategy : {'center_crop', 'resize'}, optional
+            How compatible curve/block methods handle incompatible shapes.
+            ``'center_crop'`` unfolds the centered compatible square or
+            block-meander rectangle.
+            ``'resize'`` first resizes the selected traversal domain to a
+            compatible square. ``meander-4`` and ``meander-5`` currently support
+            center-crop only.
+        preserve_excess : bool, optional
+            For center-crop curve methods, store cropped-out values in metadata
+            so undo can reconstruct the original full tensor exactly.
+        resize_side : int or None, optional
+            Explicit compatible side length for resize mode. Hilbert, Morton,
+            Z-order, and Moore require powers of 2; Peano requires powers of 3.
+            ``meander-4`` and ``meander-5`` do not use this parameter.
+        resize_side_mode : {'nearest', 'downsample', 'upsample'}, optional
+            How to choose a compatible side when ``resize_side`` is omitted.
+        resize_method : {'linear', 'nearest', 'area'}, optional
+            Method passed to :meth:`resize` in resize mode.
+        preserve_original : bool, optional
+            For resize mode, store the original tensor in metadata so undo can
+            reconstruct it exactly. Otherwise undo returns the resized tensor.
+        undo : bool, optional
+            If True, restore an unfolded object using ``metadata`` or this
+            object's attached ``unfold_metadata``. If no metadata is available,
+            row-major undo is supported using ``original_shape`` or square-grid
+            inference.
+        metadata : dict or None, optional
+            Metadata returned by a previous unfolding. Required for undo unless
+            this object already has attached metadata, or the requested undo can
+            be handled as row-major using ``original_shape``.
+        original_shape : tuple or None, optional
+            Shape used for metadata-less row-major undo. The full
+            ``(Ry, Rx, Ky, Kx)`` shape is always accepted. For 3D
+            ``domain='real'`` stacks, ``(Ry, Rx)`` is also accepted and
+            ``(Ky, Kx)`` is taken from the stack. For 3D
+            ``domain='reciprocal'`` stacks, ``(Ky, Kx)`` is also accepted and
+            ``(Ry, Rx)`` is taken from the stack.
+        return_metadata : bool, optional
+            If True, return ``(result, metadata)``.
+
+        Returns
+        -------
+        HyperData or tuple[HyperData, dict]
+            New object containing the unfolded or restored data. The original
+            object is not modified.
+
+        Examples
+        --------
+        >>> original = np.arange(2*3*4*5).reshape(2, 3, 4, 5)
+        >>> hd = HyperData(original)
+        >>> unfolded, meta = hd.unfold(domain='real',
+        ...                            method='hilbert',
+        ...                            preserve_excess=True,
+        ...                            return_metadata=True)
+        >>> restored = unfolded.unfold(undo=True)
+        >>> np.array_equal(restored.array, original)
+        True
+        >>> restored = HyperData(unfolded.array).unfold(undo=True, metadata=meta)
+        >>> np.array_equal(restored.array, original)
+        True
+        >>> restored = HyperData(unfolded.array).unfold(
+        ...     undo=True,
+        ...     domain='real',
+        ...     original_shape=original.shape,
+        ... )
+        """
+        if undo:
+            if metadata is None:
+                metadata = getattr(self, 'unfold_metadata', None)
+
+            restored, metadata = _unfold_array(
+                self.array,
+                domain=domain,
+                method=method,
+                undo=True,
+                metadata=metadata,
+                original_shape=original_shape,
+                return_metadata=True,
+            )
+            result = self._spawn(restored)
+            result.unfold_metadata = None
+
+            if return_metadata:
+                return result, metadata
+            return result
+
+        domain, method = _normalize_unfold_request(domain=domain, method=method)
+        if not isinstance(curve_shape_strategy, str):
+            raise ValueError("curve_shape_strategy must be a string.")
+        curve_shape_strategy = curve_shape_strategy.lower()
+        working = self
+        original_values = None
+
+        if method in _CURVE_TRAVERSAL_METHODS and curve_shape_strategy == 'resize':
+            if domain == 'both':
+                real_side = _select_resize_side(
+                    self.shape[:2],
+                    method,
+                    resize_side=resize_side,
+                    resize_side_mode=resize_side_mode,
+                )
+                reciprocal_side = _select_resize_side(
+                    self.shape[2:4],
+                    method,
+                    resize_side=resize_side,
+                    resize_side_mode=resize_side_mode,
+                )
+                working = working.resize(
+                    (real_side, real_side),
+                    domain='real',
+                    method=resize_method,
+                )
+                working = working.resize(
+                    (reciprocal_side, reciprocal_side),
+                    domain='reciprocal',
+                    method=resize_method,
+                )
+            elif domain == 'real':
+                side = _select_resize_side(
+                    self.shape[:2],
+                    method,
+                    resize_side=resize_side,
+                    resize_side_mode=resize_side_mode,
+                )
+                working = working.resize(
+                    (side, side),
+                    domain='real',
+                    method=resize_method,
+                )
+            elif domain == 'reciprocal':
+                side = _select_resize_side(
+                    self.shape[2:4],
+                    method,
+                    resize_side=resize_side,
+                    resize_side_mode=resize_side_mode,
+                )
+                working = working.resize(
+                    (side, side),
+                    domain='reciprocal',
+                    method=resize_method,
+                )
+
+            if preserve_original:
+                original_values = self.array
+
+        unfolded, metadata = _unfold_array(
+            working.array,
+            domain=domain,
+            method=method,
+            curve_shape_strategy=curve_shape_strategy,
+            preserve_excess=preserve_excess,
+            resize_side=resize_side,
+            resize_side_mode=resize_side_mode,
+            resize_method=resize_method,
+            preserve_original=preserve_original,
+            original_shape=self.shape,
+            original_values=original_values,
+            return_metadata=True,
+        )
+        result = working._spawn(unfolded)
+        result.unfold_metadata = metadata
+
+        if return_metadata:
+            return result, metadata
+        return result
+
+
+    def reshape(self, *shape, order='C', return_array=False):
+        """
+        Return a row-major reshaped copy of this dataset.
+
+        This is a thin HyperData wrapper around ``numpy.reshape``. It is useful
+        when the data are already unfolded/folded in standard row-major order
+        and the desired target shape is known directly.
+
+        Parameters
+        ----------
+        *shape : int or tuple
+            Target shape, either as separate dimensions or as one tuple. NumPy's
+            ``-1`` inference is supported.
+        order : {'C', 'F', 'A'}, optional
+            Reshape order passed to ``numpy.reshape``. The default ``'C'`` is
+            Python/NumPy row-major order.
+        return_array : bool, optional
+            If True, return the reshaped ndarray instead of a ``HyperData``.
+
+        Examples
+        --------
+        >>> folded = HyperData(stack).reshape(Ry, Rx, Ky, Kx)
+        >>> stack = HyperData(folded.array).reshape(Ry * Rx, Ky, Kx)
+        """
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list, np.ndarray)):
+            new_shape = tuple(int(v) for v in shape[0])
+        else:
+            new_shape = tuple(int(v) for v in shape)
+
+        if len(new_shape) < 2:
+            raise ValueError("HyperData.reshape requires at least 2 dimensions.")
+        if not isinstance(order, str):
+            raise ValueError("order must be a string accepted by numpy.reshape.")
+
+        try:
+            reshaped = np.reshape(self.array, new_shape, order=order)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot reshape HyperData from {self.shape} to {new_shape}: {exc}"
+            ) from exc
+
+        if return_array:
+            return reshaped
+        return self._spawn(reshaped)
 
 
     def swap_domains(self):
@@ -2279,23 +4773,365 @@ class HyperData:
         # The original order is (0, 1, 2, 3) and we want to change to (2, 3, 0, 1)
         swapped_data = np.transpose(self.array, (2, 3, 0, 1))
         
-        return HyperData(swapped_data)
+        return self._spawn(
+            swapped_data,
+            real_units=self.reciprocal_units,
+            real_conv_factor=self.reciprocal_conv_factor,
+            reciprocal_units=self.real_units,
+            reciprocal_conv_factor=self.real_conv_factor,
+        )
     
     
-    def alignment(self, r_center=5, iterations=1, returnStats=False):
+    def alignment(self, r_center=5, iterations=1, returnStats=False,
+                  center=None, method='com', search_radius=None,
+                  enforce_square=False, fit_radius=False, radius_range=None,
+                  radius_step=1, radius_operation='mean'):
         """
         Align the diffraction patterns through the Center of mass of the center beam
-        
-        Function written by Chuqiao Shi (2022)
-        See on GitHub: Chuqiao2333/Hierarchical_Clustering
-        
-        Modified by Adan J Mireles (April, 2024)
-        - Reordered dimensions (x, y) to (y, x)
-        - Modified translation from 'ky//2 + com' to '(ky-1)//2 + com'
+
+        Parameters
+        ----------
+        r_center : float
+            Radius of the central peak or disk in pixels.
+        iterations : int
+            Number of iterations for the center-of-mass method. Ignored for
+            the disk-template method.
+        returnStats : bool
+            If True, return the aligned dataset, mean center, and center
+            standard deviation.
+        center : tuple or None
+            Approximate reference disk center ``(ky, kx)``. Defaults to the
+            geometric k-space center ``((ky - 1)/2, (kx - 1)/2)``. When
+            ``fit_radius=True`` or ``radius_range`` is provided, this center is
+            refined on the representative diffraction pattern before aligning
+            individual diffraction patterns.
+        method : {'com', 'disk', 'template'}
+            ``'com'`` uses the original center-of-mass workflow. ``'disk'`` or
+            ``'template'`` uses circular template matching, centered cropping,
+            and a final affine subpixel shift.
+        search_radius : float or None
+            Maximum disk-center translation, in pixels, around the current
+            reference center. During reference fitting, the search is centered
+            on ``center``. After the representative disk center is found, the
+            same radius is centered on that fitted reference center for all
+            per-pattern template matching. If None, the full diffraction
+            pattern is searched. This is a translation search radius, not a
+            radius-range search for the disk size.
+        enforce_square : bool
+            If True, force the disk-template output to satisfy ``ky == kx``.
+        fit_radius : bool
+            If True, estimate the best disk-template radius from a
+            representative diffraction pattern before aligning all diffraction
+            patterns.
+        radius_range : tuple or sequence or None
+            Candidate radii used when ``fit_radius=True``. A two-value tuple is
+            interpreted as ``(r_min, r_max)`` and sampled by ``radius_step``.
+            A longer sequence is used directly as the candidate radii. If None,
+            a local radius search around ``r_center`` is used.
+        radius_step : float
+            Step size for two-value ``radius_range`` searches.
+        radius_operation : str
+            Operation passed to ``get_dp(operation=...)`` to build the
+            representative diffraction pattern used for radius fitting.
         """
 
+        if self.ndim != 4:
+            raise ValueError("alignment currently requires a 4D dataset.")
+        if not isinstance(method, str):
+            raise ValueError("method must be 'com', 'disk', or 'template'.")
+
+        method = method.lower()
+        if method in ('center_of_mass', 'centre_of_mass'):
+            method = 'com'
+        elif method in ('circle', 'template_matching', 'template'):
+            method = 'disk'
+        if method not in ('com', 'disk'):
+            raise ValueError("method must be 'com', 'disk', or 'template'.")
+
         y, x, ky, kx = self.shape
-        com_y, com_x = self._quickCOM(r_mask=r_center) 
+        if center is None:
+            center = ((ky - 1) / 2, (kx - 1) / 2)
+        center_y, center_x = tuple(float(v) for v in center)
+        if search_radius is not None and float(search_radius) < 0:
+            raise ValueError("search_radius must be non-negative or None.")
+
+        def _disk_template(radius):
+            radius = float(radius)
+            if radius <= 0:
+                raise ValueError("r_center must be positive.")
+            half_size = int(np.ceil(radius))
+            coords = np.arange(-half_size, half_size + 1)
+            yy, xx = np.meshgrid(coords, coords, indexing='ij')
+            disk = (yy**2 + xx**2 <= radius**2).astype(float)
+            disk -= np.mean(disk)
+            norm = np.linalg.norm(disk)
+            if norm > 0:
+                disk /= norm
+            return disk
+
+        def _candidate_template_radii():
+            step = float(radius_step)
+            if step <= 0:
+                raise ValueError("radius_step must be positive.")
+
+            if radius_range is None:
+                span = max(2.0, 0.25 * float(r_center))
+                r_min = max(1.0, float(r_center) - span)
+                r_max = float(r_center) + span
+                return np.arange(r_min, r_max + 0.5 * step, step)
+
+            radii = np.asarray(radius_range, dtype=float).ravel()
+            if radii.size == 2:
+                r_min, r_max = radii
+                if r_min > r_max:
+                    r_min, r_max = r_max, r_min
+                radii = np.arange(r_min, r_max + 0.5 * step, step)
+
+            radii = radii[np.isfinite(radii) & (radii > 0)]
+            if radii.size == 0:
+                raise ValueError("radius_range must contain positive radii.")
+            return radii
+
+        def _search_bounds(center_value, search_radius_value, radius):
+            if search_radius_value is None:
+                return 0, ky, 0, kx
+
+            cy, cx = tuple(float(v) for v in center_value)
+            search_extent = float(search_radius_value) + int(np.ceil(radius)) + 2
+            y0 = max(0, int(np.floor(cy - search_extent)))
+            y1 = min(ky, int(np.ceil(cy + search_extent)) + 1)
+            x0 = max(0, int(np.floor(cx - search_extent)))
+            x1 = min(kx, int(np.ceil(cx + search_extent)) + 1)
+
+            if y0 >= y1 or x0 >= x1:
+                raise ValueError(
+                    "search_radius neighborhood does not overlap the "
+                    "diffraction pattern."
+                )
+            return y0, y1, x0, x1
+
+        def _normalized_template_correlation(dp_region, template):
+            corr = fftconvolve(dp_region, template[::-1, ::-1], mode='same')
+            support = np.ones_like(template)
+            local_sum = fftconvolve(dp_region, support[::-1, ::-1], mode='same')
+            local_sum_sq = fftconvolve(dp_region**2, support[::-1, ::-1], mode='same')
+            n_pix = support.size
+            local_energy = local_sum_sq - (local_sum**2 / n_pix)
+            local_energy = np.maximum(local_energy, 0)
+            denom = np.sqrt(local_energy)
+            return np.divide(
+                corr,
+                denom,
+                out=np.zeros_like(corr, dtype=float),
+                where=denom > 0,
+            )
+
+        def _integer_template_match(dp, radius, search_radius_value=None,
+                                    center_value=None, template=None):
+            if center_value is None:
+                center_value = (center_y, center_x)
+
+            if template is None:
+                template = _disk_template(radius)
+
+            y0, y1, x0, x1 = _search_bounds(
+                center_value,
+                search_radius_value,
+                radius,
+            )
+            dp_region = np.asarray(dp[y0:y1, x0:x1], dtype=float)
+            corr_region = _normalized_template_correlation(dp_region, template)
+
+            if search_radius_value is not None:
+                search_mask = make_mask(
+                    (center_value[0] - y0, center_value[1] - x0),
+                    float(search_radius_value),
+                    mask_dim=corr_region.shape,
+                )
+                if not np.any(search_mask):
+                    raise ValueError(
+                        "search_radius neighborhood contains no valid "
+                        "diffraction-pattern coordinates."
+                    )
+                corr_region = np.where(search_mask, corr_region, -np.inf)
+
+            local_max_idx = np.unravel_index(
+                np.nanargmax(corr_region),
+                corr_region.shape,
+            )
+            max_idx = (local_max_idx[0] + y0, local_max_idx[1] + x0)
+
+            corr = np.full((ky, kx), -np.inf, dtype=float)
+            corr[y0:y1, x0:x1] = corr_region
+            return corr, max_idx, corr[max_idx]
+
+        def _fit_template_radius():
+            representative = self.get_dp(operation=radius_operation)
+            representative_dp = (
+                representative.array
+                if hasattr(representative, 'array')
+                else np.asarray(representative)
+            )
+            representative_dp = np.asarray(representative_dp, dtype=float)
+            radii = _candidate_template_radii()
+
+            best_radius = float(radii[0])
+            best_center = (center_y, center_x)
+            best_score = -np.inf
+            for candidate_radius in radii:
+                _, match_center, score = _integer_template_match(
+                    representative_dp,
+                    candidate_radius,
+                    search_radius_value=search_radius,
+                    center_value=(center_y, center_x),
+                )
+                if score > best_score:
+                    best_score = score
+                    best_radius = float(candidate_radius)
+                    best_center = match_center
+
+            return best_radius, best_center, best_score
+
+        def _fit_disk_centers(array, reference_center):
+            fit_y = np.zeros((y, x), dtype=float)
+            fit_x = np.zeros_like(fit_y)
+
+            pattern_search_radius = search_radius
+            template = _disk_template(effective_r_center)
+
+            for i in tqdm(range(y), desc='Template-matching disk centers'):
+                for j in range(x):
+                    dp = np.asarray(array[i, j], dtype=float)
+                    corr, max_idx, _ = _integer_template_match(
+                        dp,
+                        effective_r_center,
+                        search_radius_value=pattern_search_radius,
+                        center_value=reference_center,
+                        template=template,
+                    )
+
+                    refine_radius = max(2, int(np.ceil(effective_r_center / 4)))
+                    y0 = max(0, max_idx[0] - refine_radius)
+                    y1 = min(ky, max_idx[0] + refine_radius + 1)
+                    x0 = max(0, max_idx[1] - refine_radius)
+                    x1 = min(kx, max_idx[1] + refine_radius + 1)
+                    patch = corr[y0:y1, x0:x1]
+                    finite_mask = np.isfinite(patch)
+                    if not np.any(finite_mask):
+                        fit_y[i, j] = np.clip(center_y, 0, ky - 1)
+                        fit_x[i, j] = np.clip(center_x, 0, kx - 1)
+                        continue
+
+                    finite_patch = np.where(finite_mask, patch, np.nan)
+                    finite_min = np.min(patch[finite_mask])
+                    weights = finite_patch - finite_min
+                    weights = np.nan_to_num(weights, nan=0.0)
+
+                    total = np.sum(weights)
+                    if total > 0:
+                        yy, xx = np.indices(weights.shape)
+                        fit_y[i, j] = y0 + np.sum(yy * weights) / total
+                        fit_x[i, j] = x0 + np.sum(xx * weights) / total
+                    else:
+                        fit_y[i, j], fit_x[i, j] = max_idx
+
+            return fit_y, fit_x
+
+        def _common_centered_crop_shape(fit_y, fit_x):
+            max_heights = np.zeros_like(fit_y, dtype=int)
+            max_widths = np.zeros_like(fit_x, dtype=int)
+
+            for i in range(y):
+                for j in range(x):
+                    cy = int(np.clip(round(fit_y[i, j]), 0, ky - 1))
+                    cx = int(np.clip(round(fit_x[i, j]), 0, kx - 1))
+                    max_heights[i, j] = 2 * min(cy, ky - 1 - cy) + 1
+                    max_widths[i, j] = 2 * min(cx, kx - 1 - cx) + 1
+
+            out_ky = int(np.min(max_heights))
+            out_kx = int(np.min(max_widths))
+            if enforce_square:
+                out_ky = out_kx = min(out_ky, out_kx)
+            if out_ky < 2 * effective_r_center + 1 or out_kx < 2 * effective_r_center + 1:
+                print(
+                    "Warning: aligned crop is smaller than the fitted disk "
+                    "diameter for at least one diffraction pattern."
+                )
+            if out_ky <= 0 or out_kx <= 0:
+                raise ValueError("Could not determine a valid common crop shape.")
+            return out_ky, out_kx
+
+        def _crop_bounds(center_value, output_size, axis_size):
+            center_idx = int(np.clip(round(center_value), 0, axis_size - 1))
+            start = center_idx - output_size // 2
+            end = start + output_size
+            if start < 0:
+                start = 0
+                end = output_size
+            if end > axis_size:
+                end = axis_size
+                start = axis_size - output_size
+            return int(start), int(end)
+
+        radius_fit_requested = bool(fit_radius or radius_range is not None)
+        effective_r_center = float(r_center)
+        reference_center = (center_y, center_x)
+        radius_score = None
+
+        if method == 'disk':
+            if radius_fit_requested:
+                effective_r_center, reference_center, radius_score = _fit_template_radius()
+                print(
+                    "Selected disk-template reference from "
+                    f"operation='{radius_operation}': radius={effective_r_center:.4f}, "
+                    f"center=({reference_center[0]:.4f}, {reference_center[1]:.4f}) "
+                    f"(score={radius_score:.4g})."
+                )
+
+            fit_y, fit_x = _fit_disk_centers(self.array, reference_center)
+            std_center = (np.std(fit_y), np.std(fit_x))
+            mean_center = (np.mean(fit_y), np.mean(fit_x))
+            print(f'Initial disk-center standard deviation (ky, kx): ({std_center[0]:.4f}, {std_center[1]:.4f})')
+            print(f'Initial disk center (ky, kx): ({mean_center[0]:.4f}, {mean_center[1]:.4f})')
+
+            out_ky, out_kx = _common_centered_crop_shape(fit_y, fit_x)
+            target_y, target_x = (out_ky - 1) / 2, (out_kx - 1) / 2
+            aligned = np.zeros(
+                (y, x, out_ky, out_kx),
+                dtype=np.result_type(self.dtype, np.float64),
+            )
+
+            print(f'Cropping diffraction patterns to common k-space shape ({out_ky}, {out_kx}).')
+            for i in tqdm(range(y), desc='Cropping and affine-aligning disks'):
+                for j in range(x):
+                    y0, y1 = _crop_bounds(fit_y[i, j], out_ky, ky)
+                    x0, x1 = _crop_bounds(fit_x[i, j], out_kx, kx)
+                    cropped = self.array[i, j, y0:y1, x0:x1]
+                    center_rel_y = fit_y[i, j] - y0
+                    center_rel_x = fit_x[i, j] - x0
+                    shift_y = target_y - center_rel_y
+                    shift_x = target_x - center_rel_x
+                    afine_tf = transform.AffineTransform(
+                        translation=(shift_x, shift_y)
+                    )
+                    aligned[i, j] = transform.warp(
+                        cropped,
+                        inverse_map=afine_tf.inverse,
+                        output_shape=(out_ky, out_kx),
+                        preserve_range=True,
+                    )
+
+            aligned_obj = self._spawn(
+                aligned,
+                reciprocal_units=self.reciprocal_units,
+                reciprocal_conv_factor=self.reciprocal_conv_factor,
+            )
+
+            if returnStats:
+                return aligned_obj, mean_center, std_center
+            return aligned_obj
+
+        com_y, com_x = self._quickCOM(r_mask=r_center, center=center) 
         cbed_tran = np.copy(self.array)
         std_com = (np.std(com_y), np.std(com_x))
         mean_com = (np.mean(com_y), np.mean(com_x))
@@ -2308,11 +5144,23 @@ class HyperData:
             print(f'Processing {y} × {x} real-space positions. Iteration ({idx+1}/{iterations})...')        
             for i in tqdm(range(y), desc = 'Alignment Progress'):
                 for j in range(x):
-                    afine_tf = transform.AffineTransform(translation=(com_y[i, j] - (ky-1)/2, com_x[i, j] - (kx-1)/2))
-                    cbed_tran[i,j,:,:] = transform.warp(cbed_tran[i,j,:,:], inverse_map=afine_tf)
+                    afine_tf = transform.AffineTransform(
+                        translation=(
+                            com_y[i, j] - center_y,
+                            com_x[i, j] - center_x,
+                        )
+                    )
+                    cbed_tran[i,j,:,:] = transform.warp(
+                        cbed_tran[i,j,:,:],
+                        inverse_map=afine_tf,
+                        preserve_range=True,
+                    )
         
-            cbed_tran_Obj = HyperData(cbed_tran)
-            com_y, com_x = cbed_tran_Obj._quickCOM()
+            cbed_tran_Obj = self._spawn(cbed_tran)
+            com_y, com_x = cbed_tran_Obj._quickCOM(
+                r_mask=r_center,
+                center=center,
+            )
             std_com = (np.std(com_y), np.std(com_x))
             mean_com = (np.mean(com_y), np.mean(com_x))
             
@@ -2324,27 +5172,183 @@ class HyperData:
         else:
             return cbed_tran_Obj
     
-    # TODO: add functionality for 3D array
-    def rotate_dps(self, angle, units='deg'):
+    def rotate_dps(self, angle, units='deg', order=3):
         """
-        Rotate clockwise all diffraction patterns by angle in degrees
+        Rotate every diffraction pattern by a common angle.
+
+        Cartesian diffraction patterns are spatially rotated on their last two
+        axes. Polar patterns are rotated by periodically shifting the angular
+        axis, so values crossing either edge re-enter at the opposite edge
+        according to the 0/360-degree periodic boundary.
+
+        Positive angles follow the SciPy convention and rotate Cartesian
+        patterns counterclockwise. The polar transform stores increasing theta
+        clockwise along the last array axis, so the equivalent positive
+        rotation shifts polar columns toward lower indices.
+
+        Parameters
+        ----------
+        angle : float
+            Rotation angle shared by all diffraction patterns.
+        units : {'deg', 'rad'}, optional
+            Units of ``angle``. Common degree/radian name variants are accepted.
+        order : int, optional
+            Spline interpolation order from 0 to 5. This is used by Cartesian
+            rotation and by non-integer polar column shifts. Integer polar
+            shifts use an exact periodic roll and do not interpolate.
+
+        Returns
+        -------
+        HyperData
+            Rotated data with calibration and polar metadata preserved.
         """
-        
-        if units == 'rad':
-            angle = np.degrees(angle)
-        
+        if self.ndim not in (3, 4):
+            raise ValueError(
+                "'rotate_dps' only supports 3D stacks of diffraction patterns "
+                "or 4D-STEM datasets."
+            )
+        if (
+            not np.isscalar(angle)
+            or not np.isreal(angle)
+            or not np.isfinite(angle)
+        ):
+            raise ValueError("angle must be a finite scalar.")
+        if not isinstance(units, str):
+            raise ValueError("units must be 'deg' or 'rad'.")
+        if (
+            isinstance(order, (bool, np.bool_))
+            or not isinstance(order, (Integral, np.integer))
+            or not 0 <= order <= 5
+        ):
+            raise ValueError("order must be an integer from 0 to 5.")
+
+        normalized_units = units.strip().lower()
+        if normalized_units in ('deg', 'degree', 'degrees'):
+            angle_degrees = float(angle)
+        elif normalized_units in ('rad', 'radian', 'radians'):
+            angle_degrees = float(np.degrees(angle))
+        else:
+            raise ValueError("units must be 'deg' or 'rad'.")
+
+        if self.is_polar:
+            metadata = self.polar_metadata or {}
+            axis_order = tuple(
+                metadata.get('axis_order', ('radius', 'theta'))
+            )
+            if axis_order != ('radius', 'theta'):
+                raise ValueError(
+                    "Polar rotation requires the last two axes to be ordered "
+                    "as ('radius', 'theta')."
+                )
+
+            n_theta = self.shape[-1]
+            try:
+                theta_range = np.asarray(
+                    metadata.get('theta_range', (0.0, 360.0)),
+                    dtype=float,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "polar_metadata['theta_range'] must contain two finite "
+                    "numeric values."
+                ) from exc
+            if theta_range.shape != (2,) or not np.all(
+                np.isfinite(theta_range)
+            ):
+                raise ValueError(
+                    "polar_metadata['theta_range'] must contain two finite "
+                    "numeric values."
+                )
+            theta_start, theta_stop = theta_range
+            theta_span = theta_stop - theta_start
+            if not np.isclose(theta_span, 360.0):
+                raise ValueError(
+                    "Periodic polar rotation requires a full 360-degree "
+                    "angular range ordered from lower to higher angle."
+                )
+
+            theta_step = float(
+                metadata.get('theta_step', theta_span / n_theta)
+            )
+            if not np.isfinite(theta_step) or theta_step <= 0:
+                raise ValueError(
+                    "polar_metadata['theta_step'] must be positive and finite."
+                )
+            expected_step = theta_span / n_theta
+            if not np.isclose(theta_step, expected_step):
+                raise ValueError(
+                    "polar_metadata['theta_step'] is inconsistent with the "
+                    "angular axis length and theta_range."
+                )
+
+            column_shift = -angle_degrees / theta_step
+            integer_shift = int(np.rint(column_shift))
+            if np.isclose(column_shift, integer_shift):
+                new_data = np.roll(
+                    self.array,
+                    shift=integer_shift,
+                    axis=-1,
+                )
+            else:
+                working_dtype = np.result_type(self.dtype, np.float32)
+                shift_vector = (0.0,) * (self.ndim - 1) + (column_shift,)
+                new_data = ndimage.shift(
+                    self.array.astype(working_dtype, copy=False),
+                    shift=shift_vector,
+                    order=int(order),
+                    mode='grid-wrap',
+                    prefilter=order > 1,
+                )
+
+            return self._spawn(new_data)
+
         if self.ndim == 4:
-            
-            y, x, ky, kx = self.shape
-            ky, kx = rotate(self.array[0, 0], angle).shape
-            new_data = np.zeros((y, x, ky, kx), dtype=self.dtype)
-            
-            for y_idx in tqdm(range(y), desc = 'Rotating Diffraction Patterns'):
-                for x_idx in range(x):
-                    new_data[y_idx, x_idx] = rotate(self.array[y_idx, x_idx], angle)
-                    
-    
-        return HyperData(new_data)
+            y_size, x_size = self.shape[:2]
+            output_shape = rotate(
+                self.array[0, 0],
+                angle_degrees,
+                order=int(order),
+            ).shape
+            new_data = np.zeros(
+                (y_size, x_size, *output_shape),
+                dtype=self.dtype,
+            )
+
+            iterator = np.ndindex(y_size, x_size)
+            iterator = tqdm(
+                iterator,
+                total=y_size * x_size,
+                desc='Rotating Diffraction Patterns',
+            )
+            for y_idx, x_idx in iterator:
+                new_data[y_idx, x_idx] = rotate(
+                    self.array[y_idx, x_idx],
+                    angle_degrees,
+                    order=int(order),
+                )
+        else:
+            n_patterns = self.shape[0]
+            output_shape = rotate(
+                self.array[0],
+                angle_degrees,
+                order=int(order),
+            ).shape
+            new_data = np.zeros(
+                (n_patterns, *output_shape),
+                dtype=self.dtype,
+            )
+
+            for idx in tqdm(
+                range(n_patterns),
+                desc='Rotating Diffraction Patterns',
+            ):
+                new_data[idx] = rotate(
+                    self.array[idx],
+                    angle_degrees,
+                    order=int(order),
+                )
+
+        return self._spawn(new_data)
     
     def standardize(self, method='local'):
         """
@@ -2404,7 +5408,7 @@ class HyperData:
             # Standardize each image independently
             standardized_tensor = (arr - mean) / (std + 1)
     
-        return HyperData(standardized_tensor)
+        return self._spawn(standardized_tensor)
 
     def normalize(self, method='global'):
         """
@@ -2473,7 +5477,7 @@ class HyperData:
     
             normalized_tensor = (arr - min_val) / denom_safe
     
-        return HyperData(normalized_tensor)
+        return self._spawn(normalized_tensor)
 
     
     def clip(self, a_min=1, a_max=None):
@@ -2498,7 +5502,7 @@ class HyperData:
         HyperData
             New HyperData instance with clipped data values.
         """
-        return HyperData(clip_values(self.array, a_min, a_max))
+        return self._spawn(clip_values(self.array, a_min, a_max))
 
     
     def crop(self, ylim=None, xlim=None, kylim=None, kxlim=None,
@@ -2572,7 +5576,7 @@ class HyperData:
         if kylim is None and kxlim is None and kshape is None and rshape is None:
             y0r, y1r = ylim_range
             x0r, x1r = xlim_range
-            return HyperData(self.array[y0r:y1r, x0r:x1r])
+            return self._spawn(self.array[y0r:y1r, x0r:x1r])
     
         # --- Reciprocal-space limits (allow floats for subpixel cropping) ---
         kylim_range = parse_limits(kylim, Ky, allow_float=True, name="kylim")
@@ -2699,11 +5703,43 @@ class HyperData:
                         cropped.dtype, copy=False
                     )
     
-        return HyperData(cropped)
+        new_real_conv = self.real_conv_factor
+        new_reciprocal_conv = self.reciprocal_conv_factor
+
+        if kshape is not None and self.reciprocal_conv_factor is not None:
+            y_scale = (kylim_range[1] - kylim_range[0]) / kshape[0]
+            x_scale = (kxlim_range[1] - kxlim_range[0]) / kshape[1]
+            if np.isclose(y_scale, x_scale):
+                new_reciprocal_conv = self.reciprocal_conv_factor * x_scale
+            else:
+                print("Warning: anisotropic reciprocal-space resizing cleared the stored reciprocal-space calibration.")
+                new_reciprocal_conv = None
+
+        if rshape is not None and self.real_conv_factor is not None:
+            y_scale = (ylim_range[1] - ylim_range[0]) / rshape[0]
+            x_scale = (xlim_range[1] - xlim_range[0]) / rshape[1]
+            if np.isclose(y_scale, x_scale):
+                new_real_conv = self.real_conv_factor * x_scale
+            else:
+                print("Warning: anisotropic real-space resizing cleared the stored real-space calibration.")
+                new_real_conv = None
+
+        new_real_units = self.real_units if new_real_conv is not None else None
+        new_reciprocal_units = (
+            self.reciprocal_units if new_reciprocal_conv is not None else None
+        )
+
+        return self._spawn(
+            cropped,
+            real_units=new_real_units,
+            real_conv_factor=new_real_conv,
+            reciprocal_units=new_reciprocal_units,
+            reciprocal_conv_factor=new_reciprocal_conv,
+        )
            
     
     # Private method: helper function for the 'alignment' method
-    def _quickCOM(self, r_mask=5):
+    def _quickCOM(self, r_mask=5, center=None):
         """
         Compute the center of mass (COM) of electron diffraction patterns within a 
         4D-STEM dataset.
@@ -2720,8 +5756,10 @@ class HyperData:
         """
         
         y, x, ky, kx = np.shape(self.array)
-        center_x = (kx-1) // 2
-        center_y = (ky-1) // 2
+        if center is None:
+            center_y, center_x = (ky - 1) / 2, (kx - 1) / 2
+        else:
+            center_y, center_x = tuple(float(v) for v in center)
 
         # Assuming make_mask function is defined elsewhere that creates a circular mask
         if type(r_mask) == tuple:
@@ -2742,8 +5780,8 @@ class HyperData:
                 cbed = np.squeeze(self.array[i, j, :, :] * mask)
                 pnorm = np.sum(cbed)
                 if pnorm != 0:
-                    ap2_y[i, j] = np.sum(vy * np.sum(cbed, axis=0)) / pnorm
-                    ap2_x[i, j] = np.sum(vx * np.sum(cbed, axis=1)) / pnorm
+                    ap2_y[i, j] = np.sum(vy * np.sum(cbed, axis=1)) / pnorm
+                    ap2_x[i, j] = np.sum(vx * np.sum(cbed, axis=0)) / pnorm
 
         return ap2_y, ap2_x
     
@@ -3001,13 +6039,13 @@ class HyperData:
         Transform dataset to Exit Wave Power Cepstrum (EWPC)
         """
     
-        return HyperData(np.abs(fftshift(
-                                         fft2(
-                                              np.log(self.clip().array),
-                                              axes=(-2, -1)
-                                              ),
-                                         axes=(-2, -1)
-                                        )))
+        return self._spawn(np.abs(fftshift(
+                                       fft2(
+                                            np.log(self.clip().array),
+                                            axes=(-2, -1)
+                                            ),
+                                       axes=(-2, -1)
+                                      )))
     
     
     def get_stdDev(self, domain='reciprocal'):
@@ -3029,14 +6067,271 @@ class HyperData:
         if domain == 'reciprocal':
             # Calculate the standard deviation for each pixel across all diffraction patterns
             std_dev = np.std(self.array, axis=(0, 1))
+            return self._spawn_reciprocal(std_dev)
         elif domain == 'real':
             # Calculate the standard deviation for each pixel across all scanning positions
             std_dev = np.std(self.array, axis=(2, 3))
+            return self._spawn_real(std_dev)
         else:
             raise ValueError("'domain' must be 'reciprocal' or 'real'")
-            
-        return ReciprocalSpace(std_dev)
     
+    def visualize(self, grid_shape=None, padding=2, reduction='mean',
+                  power=1, title='Diffraction-Pattern Montage',
+                  log_scale=True, axes=True, vmin=None, vmax=None,
+                  figsize=None, aspect=None, cmap='turbo',
+                  units=None, conv_factor=None):
+        """
+        Display a reduced 4D dataset as a two-dimensional diffraction montage.
+
+        Neighboring scan positions are combined into ``grid_shape`` real-space
+        bins. Each resulting diffraction pattern is placed at the corresponding
+        scan position in one image, separated by white padding. A shared
+        intensity scale is used so brightness remains comparable across tiles.
+
+        Parameters
+        ----------
+        grid_shape : tuple of int or None, optional
+            Number of diffraction patterns to display as ``(Ny, Nx)``. Values
+            cannot exceed the corresponding real-space dimensions. By default,
+            each dimension is 10 percent of its original size, rounded down,
+            with a minimum of 1 and a maximum of 25.
+        padding : int, optional
+            Number of white display pixels between adjacent patterns.
+        reduction : {'mean', 'sum'}, optional
+            How scan positions contributing to each displayed tile are
+            combined. ``'mean'`` uses area-weighted averaging. ``'sum'``
+            approximates an integrated diffraction pattern for each bin.
+        power : float, optional
+            Display parameter matching :meth:`ReciprocalSpace.show`. With
+            logarithmic scaling the values are ``power * log(intensity)``;
+            otherwise they are ``intensity ** power``.
+        title : str, optional
+            Figure title.
+        log_scale : bool, optional
+            Apply logarithmic intensity scaling.
+        axes : bool, optional
+            Show real-space scan-position axes and a shared colorbar.
+        vmin, vmax : float or None, optional
+            Shared display limits after the intensity transformation.
+        figsize : tuple or None, optional
+            Matplotlib figure size. It is inferred from the montage if omitted.
+        aspect : float, str, or None, optional
+            Aspect ratio forwarded to the montage axes.
+        cmap : str, optional
+            Matplotlib colormap used for every diffraction pattern.
+        units : str or None, optional
+            Reciprocal-space units reported in the per-tile calibration note.
+            Stored dataset calibration is used when omitted.
+        conv_factor : float or None, optional
+            Reciprocal-space units per pixel reported in the per-tile
+            calibration note. Stored dataset calibration is used when omitted.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)`` for further customization or saving.
+
+        Notes
+        -----
+        The outer axes describe real-space scan position. Reciprocal-space axes
+        repeat inside every tile and cannot be represented by one continuous
+        montage axis, so their calibration is reported in the title.
+        """
+        if self.ndim != 4:
+            raise ValueError(
+                "visualize requires 4D data with shape (Ry, Rx, Ky, Kx)."
+            )
+
+        ry, rx, ky, kx = self.shape
+        if grid_shape is None:
+            grid_shape = (
+                min(25, max(1, int(np.floor(0.1 * ry)))),
+                min(25, max(1, int(np.floor(0.1 * rx)))),
+            )
+        elif isinstance(grid_shape, np.ndarray):
+            grid_shape = grid_shape.tolist()
+
+        grid_shape = self._normalize_resize_shape(
+            grid_shape, 2, 'grid_shape'
+        )
+        ny, nx = grid_shape
+        if ny > ry or nx > rx:
+            raise ValueError(
+                "grid_shape cannot exceed the real-space shape "
+                f"{(ry, rx)}; received {grid_shape}."
+            )
+
+        if not isinstance(padding, (Integral, np.integer)) or padding < 0:
+            raise ValueError("padding must be a non-negative integer.")
+        padding = int(padding)
+
+        if not isinstance(reduction, str):
+            raise ValueError("reduction must be 'mean' or 'sum'.")
+        reduction = reduction.lower()
+        if reduction not in ('mean', 'sum'):
+            raise ValueError("reduction must be 'mean' or 'sum'.")
+
+        if not np.isscalar(power) or not np.isfinite(power):
+            raise ValueError("power must be a finite scalar.")
+        if not isinstance(log_scale, (bool, np.bool_)):
+            raise ValueError("log_scale must be a boolean.")
+
+        reduced = self.resize(
+            grid_shape,
+            domain='real',
+            method='area',
+        ).array
+        if reduction == 'sum':
+            reduced = reduced * ((ry / ny) * (rx / nx))
+
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            if log_scale:
+                displayed = power * np.log(reduced)
+            else:
+                displayed = reduced ** power
+
+        montage_shape = (
+            ny * ky + (ny - 1) * padding,
+            nx * kx + (nx - 1) * padding,
+        )
+        montage = np.ma.masked_all(
+            montage_shape,
+            dtype=np.result_type(displayed.dtype, np.float32),
+        )
+        for y_idx in range(ny):
+            y_start = y_idx * (ky + padding)
+            for x_idx in range(nx):
+                x_start = x_idx * (kx + padding)
+                tile = np.ma.masked_invalid(displayed[y_idx, x_idx])
+                montage[
+                    y_start:y_start + ky,
+                    x_start:x_start + kx,
+                ] = tile
+
+        finite_values = montage.compressed()
+        if finite_values.size == 0:
+            raise ValueError(
+                "No finite values remain after applying the display transform."
+            )
+        if vmin is None:
+            vmin = float(np.min(finite_values))
+        if vmax is None:
+            vmax = float(np.max(finite_values))
+        if vmin > vmax:
+            raise ValueError("vmin must be less than or equal to vmax.")
+
+        if figsize is None:
+            ratio = montage_shape[1] / montage_shape[0]
+            if ratio >= 1:
+                figsize = (min(16, 10 * ratio), 10)
+            else:
+                figsize = (10, min(16, 10 / ratio))
+
+        cmap_object = deepcopy(plt.get_cmap(cmap))
+        cmap_object.set_bad('white')
+
+        fig, ax = plt.subplots(figsize=figsize)
+        image = ax.imshow(
+            montage,
+            cmap=cmap_object,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation='nearest',
+            origin='upper',
+        )
+        if aspect is not None:
+            ax.set_aspect(aspect)
+
+        representative_dp = self._spawn_reciprocal(reduced[0, 0])
+        if representative_dp.is_polar:
+            polar_metadata = representative_dp.polar_metadata or {}
+            radius_units = polar_metadata.get('radius_units', 'pixels')
+            theta_units = polar_metadata.get('theta_units', 'deg')
+            tile_description = (
+                f"Each tile: {ky} radial x {kx} angular samples "
+                f"({radius_units}, {theta_units})"
+            )
+        else:
+            reciprocal_units, reciprocal_factor = (
+                representative_dp._resolve_scale(
+                    units=units,
+                    conv_factor=conv_factor,
+                )
+            )
+            unit_text = representative_dp._format_unit_text(reciprocal_units)
+            if reciprocal_factor is None:
+                tile_description = f"Each tile: {ky} x {kx} reciprocal pixels"
+            else:
+                tile_description = (
+                    f"Each tile: {ky} x {kx} pixels; "
+                    f"{reciprocal_factor:g} {unit_text}/pixel"
+                )
+
+        if axes:
+            max_ticks = 8
+
+            def _scan_ticks(count, tile_size, source_size):
+                indices = np.unique(
+                    np.rint(
+                        np.linspace(0, count - 1, min(count, max_ticks))
+                    ).astype(int)
+                )
+                positions = (
+                    indices * (tile_size + padding)
+                    + (tile_size - 1) / 2
+                )
+                source_centers = (
+                    (indices + 0.5) * source_size / count - 0.5
+                )
+                return positions, source_centers
+
+            x_positions, x_centers = _scan_ticks(nx, kx, rx)
+            y_positions, y_centers = _scan_ticks(ny, ky, ry)
+
+            real_scale = (
+                1.0 if self.real_conv_factor is None
+                else self.real_conv_factor
+            )
+            x_labels = x_centers * real_scale
+            y_labels = y_centers * real_scale
+            real_units = (
+                'scan px' if self.real_units is None
+                else self._spawn_real(
+                    np.empty((1, 1))
+                )._format_unit_text(self.real_units)
+            )
+
+            ax.set_xticks(x_positions)
+            ax.set_yticks(y_positions)
+            ax.set_xticklabels([f"{value:g}" for value in x_labels])
+            ax.set_yticklabels([f"{value:g}" for value in y_labels])
+            ax.set_xlabel(f"Real-space x ({real_units})", fontsize=14)
+            ax.set_ylabel(f"Real-space y ({real_units})", fontsize=14)
+            ax.set_title(f"{title}\n{tile_description}", fontsize=16)
+
+            divider = make_axes_locatable(ax)
+            colorbar_axis = divider.append_axes("right", size="3%", pad=0.08)
+            colorbar = fig.colorbar(image, cax=colorbar_axis)
+            if log_scale:
+                colorbar_label = (
+                    "log(Intensity)"
+                    if power == 1
+                    else f"log(Intensity) (Power = {power:g})"
+                )
+            else:
+                colorbar_label = (
+                    "Intensity"
+                    if power == 1
+                    else f"Intensity (Power = {power:g})"
+                )
+            colorbar.set_label(colorbar_label, fontsize=12)
+        else:
+            ax.set_axis_off()
+
+        fig.tight_layout()
+        plt.show()
+        return fig, ax
+
     def get_dp(self, y=None, x=None, mask=None, operation=None, **flat_kwargs):
         """
         Obtain a diffraction pattern from a 3D/4D dataset, either at a
@@ -3104,7 +6399,7 @@ class HyperData:
             valid_ops = ', '.join(f"'{op}'" for op in operations.keys())
             raise ValueError(f"'operation' must be one of: {valid_ops}.")
     
-        # ----------------------- RANDOM SELECTION ------------------------ #
+        # Selecting a random diffraction pattern
         if operation == 'random':
             rng = np.random
             if self.ndim not in (3, 4):
@@ -3122,7 +6417,7 @@ class HyperData:
                 idx = rng.randint(0, ys.size)
                 y_pos, x_pos = int(ys[idx]), int(xs[idx])
                 print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos}) using mask...\n")
-                return ReciprocalSpace(self.array[y_pos, x_pos])
+                return self._spawn_reciprocal(self.array[y_pos, x_pos])
     
             # (1) region via y/x, at least one must be a tuple (4D only)
             if self.ndim == 4 and (isinstance(y, tuple) or isinstance(x, tuple)):
@@ -3139,20 +6434,21 @@ class HyperData:
                 y_pos = rng.randint(y0, y1)
                 x_pos = rng.randint(x0, x1)
                 print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos}) within specified region...\n")
-                return ReciprocalSpace(self.array[y_pos, x_pos])
+                return self._spawn_reciprocal(self.array[y_pos, x_pos])
     
             # Global random selection
             if self.ndim == 4:
                 y_pos = int(self.shape[0] * rng.random())
                 x_pos = int(self.shape[1] * rng.random())
                 print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos})...\n")
-                return ReciprocalSpace(self.array[y_pos, x_pos])
+                return self._spawn_reciprocal(self.array[y_pos, x_pos])
             else:  # self.ndim == 3
                 idx = int(self.shape[0] * rng.random())
                 print(f"Acquired diffraction pattern of index {idx}...\n")
-                return ReciprocalSpace(self.array[idx])
+                return self._spawn_reciprocal(self.array[idx])
     
-        # ------------------------ FLAT MEAN ------------------------------ #
+        # Automatically finding the mean of non-tilt regions
+        #TODO: verify generalizability
         if operation == 'flat_mean':
             r = (self.shape[-2] + self.shape[-1]) / 4
             r_min = 0.6 * r
@@ -3166,12 +6462,12 @@ class HyperData:
                 **flat_kwargs
             )
             result = np.mean(self.apply_mask(mask=flat_mask, domain='real',).array, axis=0)
-            return ReciprocalSpace(result)
+            return self._spawn_reciprocal(result)
     
         # From here on: mean/median/max/min
         agg_func = operations[operation]
     
-        # ------------------------ REAL MASK ------------------------------ #
+        # Operating on a provided real-space mask
         if mask is not None:
             if self.ndim != 4:
                 raise ValueError("mask requires a 4D dataset (A,B,C,D).")
@@ -3179,9 +6475,9 @@ class HyperData:
                 raise ValueError(f"'mask' must be shape {(self.shape[0], self.shape[1])}.")
             sub = self.array[mask]   # shape (N, C, D)
             result = agg_func(sub, axis=0)
-            return ReciprocalSpace(result)
+            return self._spawn_reciprocal(result)
     
-        # -------------------- REGION VIA (y, x) -------------------------- #
+        # Operating based on the (y, x) inputs
         if y is not None or x is not None:
             if self.ndim == 4:
                 A, B = self.shape[0], self.shape[1]
@@ -3192,46 +6488,46 @@ class HyperData:
                     xmin, xmax = x
                     sub = self.array[ymin:ymax, xmin:xmax, :, :]
                     result = agg_func(sub, axis=(0, 1))
-                    return ReciprocalSpace(result)
+                    return self._spawn_reciprocal(result)
     
                 elif isinstance(y, tuple) and isinstance(x, int):
                     ymin, ymax = y
                     sub = self.array[ymin:ymax, x, :, :]
                     result = agg_func(sub, axis=0)
-                    return ReciprocalSpace(result)
+                    return self._spawn_reciprocal(result)
     
                 elif isinstance(y, int) and isinstance(x, tuple):
                     xmin, xmax = x
                     sub = self.array[y, xmin:xmax, :, :]
                     result = agg_func(sub, axis=0)
-                    return ReciprocalSpace(result)
+                    return self._spawn_reciprocal(result)
     
                 elif isinstance(y, int) and isinstance(x, int):
                     # Single DP; operation degenerates to identity
-                    return ReciprocalSpace(self.array[y, x])
+                    return self._spawn_reciprocal(self.array[y, x])
     
                 elif isinstance(y, tuple) and x is None:
                     ymin, ymax = y
                     sub = self.array[ymin:ymax, :, :, :]
                     result = agg_func(sub, axis=(0, 1))
-                    return ReciprocalSpace(result)
+                    return self._spawn_reciprocal(result)
     
                 elif isinstance(y, int) and x is None:
                     # Aggregate along x with chosen operation
                     sub = self.array[y, :, :, :]
                     result = agg_func(sub, axis=0)
-                    return ReciprocalSpace(result)
+                    return self._spawn_reciprocal(result)
     
                 elif y is None and isinstance(x, tuple):
                     xmin, xmax = x
                     sub = self.array[:, xmin:xmax, :, :]
                     result = agg_func(sub, axis=(0, 1))
-                    return ReciprocalSpace(result)
+                    return self._spawn_reciprocal(result)
     
                 elif y is None and isinstance(x, int):
                     sub = self.array[:, x, :, :]
                     result = agg_func(sub, axis=0)
-                    return ReciprocalSpace(result)
+                    return self._spawn_reciprocal(result)
     
                 else:
                     raise ValueError(
@@ -3242,116 +6538,593 @@ class HyperData:
             elif self.ndim == 3:
                 # For 3D: only support picking by index, as before
                 if isinstance(y, int) and x is None:
-                    return ReciprocalSpace(self.array[y, :, :])
+                    return self._spawn_reciprocal(self.array[y, :, :])
                 if y is None and isinstance(x, int):
-                    return ReciprocalSpace(self.array[x, :, :])
+                    return self._spawn_reciprocal(self.array[x, :, :])
                 raise ValueError("Region-based (tuple) selection currently only supported for 4D arrays.")
     
-        # ---------------------- GLOBAL OPERATIONS ------------------------ #
+        # Global Operation
         # If no y/x or masks are given, apply global aggregation over (A,B)
         if self.ndim == 4:
             result = agg_func(self.array, axis=(0, 1))
-            return ReciprocalSpace(result)
+            return self._spawn_reciprocal(result)
         elif self.ndim == 3:
             result = agg_func(self.array, axis=0)
-            return ReciprocalSpace(result)
+            return self._spawn_reciprocal(result)
     
         raise ValueError("No parameters specified.")
 
 
-    #TODO: Generalize this to reshape the real-space to whatever size is desired
-    #      if the desired shape is a divisor of the original dimensions, bin n-times.
-    def bin_data(self, bin_domain='real', iterations=1):
-        """
-        Bin 4D dataset by averaging over either the first two dimensions (real space) or the last two dimensions (reciprocal space).
-        """
-        
-        assert len(self.shape) == 4, "'dataset' must be four-dimensional"
-        assert isinstance(iterations, int) and iterations >= 1, "'iterations' must be an integer >= 1"
-        
-        bin_factor = 2 ** iterations
-        
-        if bin_domain == 'real':
-            A, B, C, D = self.shape[0] // bin_factor, self.shape[1] // bin_factor, self.shape[2], self.shape[3]
-            binned_dataset = np.zeros((A, B, C, D))
-            
-            for i in range(A):
-                for j in range(B):
-                    # Average over the first two dimensions (real space)
-                    binned_dataset[i, j] = np.mean(self.array[bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(0, 1))
-    
-        elif bin_domain == 'reciprocal':
-            A, B, C, D = self.shape[0], self.shape[1], self.shape[2] // bin_factor, self.shape[3] // bin_factor
-            binned_dataset = np.zeros((A, B, C, D))
-            
-            for i in range(C):
-                for j in range(D):
-                    # Average over the last two dimensions (reciprocal space)
-                    binned_dataset[:, :, i, j] = np.mean(self.array[:, :, bin_factor*i:bin_factor*(i+1), bin_factor*j:bin_factor*(j+1)], axis=(2, 3))
-    
+    @staticmethod
+    def _normalize_resize_shape(shape, expected_ndim, label):
+        """Normalize a requested resize shape to a tuple of positive integers."""
+        if expected_ndim == 1 and isinstance(shape, (Integral, np.integer)):
+            shape = (int(shape),)
+        elif isinstance(shape, (tuple, list)):
+            if not all(isinstance(v, (Integral, np.integer)) for v in shape):
+                raise ValueError(f"{label} must contain integers.")
+            shape = tuple(int(v) for v in shape)
         else:
-            raise ValueError("Invalid bin_domain. Choose 'real' or 'reciprocal'.")
-    
-        return HyperData(binned_dataset)
-    
-    #TODO: make this return a RealSpace object
-    #TODO: add the option to accept an arbitrary mask
-    def get_virtualImage(self, r_minor, r_major, vmin=None, vmax=None, 
-                         grid=True, num_div=10, plotMask=False, gridColor='black',
-                         axes=True, returnDetector = False):
+            raise ValueError(f"{label} must be an integer or tuple of integers.")
+
+        if len(shape) != expected_ndim:
+            raise ValueError(f"{label} must have {expected_ndim} dimension(s).")
+        if any(v <= 0 for v in shape):
+            raise ValueError(f"{label} must contain positive integers.")
+        return shape
+
+    @staticmethod
+    def _resize_axis_area(array, new_size, axis):
         """
-        Plot virtual detector image
-        - r_minor, r_major specify the dimensions of the annular ring over which to integrate
-        - vmin, vmax specify the limiting pixel values to be plotted
-        
-        returnArrays: if True, returns the virtual image and detector mask
+        Resize one axis by area-weighted averaging.
+
+        Exact integer factors reduce to standard block averaging. Non-integer
+        factors use fractional overlap weights so each output bin integrates the
+        corresponding input interval.
         """
-        
-        assert self.ndim == 4, "Input dataset must be 4-dimensional"
-        
-        A,B,C,D = self.shape
-        
-        # Virtual detector mask        
-        detector_mask = make_mask(((C-1)/2, (D-1)/2), (r_minor, r_major), mask_dim=(C, D))
-        
-        masked_image = np.sum(self.apply_mask(r_minor, r_major, a_min=0).array, axis=(2,3))
-            
-        if vmin:
-            vmin = vmin
+        old_size = array.shape[axis]
+        if new_size > old_size:
+            raise ValueError("resize currently supports downsampling only.")
+
+        out_dtype = np.result_type(array.dtype, np.float64)
+        if new_size == old_size:
+            return array.astype(out_dtype, copy=True)
+
+        moved = np.moveaxis(array, axis, 0).astype(out_dtype, copy=False)
+        resized = np.zeros((new_size,) + moved.shape[1:], dtype=out_dtype)
+        scale = old_size / new_size
+
+        for out_idx in range(new_size):
+            start = out_idx * scale
+            stop = (out_idx + 1) * scale
+            first = max(0, int(np.floor(start)))
+            last = min(old_size, int(np.ceil(stop)))
+
+            for in_idx in range(first, last):
+                overlap = min(stop, in_idx + 1) - max(start, in_idx)
+                if overlap > 0:
+                    resized[out_idx] += moved[in_idx] * overlap
+
+            resized[out_idx] /= scale
+
+        return np.moveaxis(resized, 0, axis)
+
+    @classmethod
+    def _resize_area(cls, array, output_shape, axes):
+        """Apply area-weighted resizing over one or more axes."""
+        resized = array
+        for axis, new_size in zip(axes, output_shape):
+            resized = cls._resize_axis_area(resized, new_size, axis)
+        return resized
+
+    @staticmethod
+    def _resize_interpolation(array, output_shape, axes, method='linear'):
+        """Resize selected axes with interpolation, supporting up/downsampling."""
+        target_shape = list(array.shape)
+        for axis, new_size in zip(axes, output_shape):
+            target_shape[axis] = int(new_size)
+
+        order = 0 if method == 'nearest' else 1
+        downsampling = any(new < old for new, old in zip(output_shape, [array.shape[a] for a in axes]))
+        resized = transform.resize(
+            array,
+            tuple(target_shape),
+            order=order,
+            mode='reflect',
+            anti_aliasing=(order > 0 and downsampling),
+            preserve_range=True,
+        )
+        if order == 0:
+            return resized.astype(array.dtype, copy=False)
+        return resized
+
+    @staticmethod
+    def _resized_calibration(units, conv_factor, scale_factors, label):
+        """
+        Update isotropic units-per-pixel calibration after resizing.
+
+        A single scalar calibration cannot represent anisotropic pixels, so clear
+        it if the resize changes the two axes by different factors.
+        """
+        if conv_factor is None:
+            return units, conv_factor
+
+        scale_factors = tuple(float(v) for v in scale_factors)
+        if len(scale_factors) == 1 or np.allclose(scale_factors, scale_factors[0]):
+            return units, conv_factor * scale_factors[0]
+
+        print(
+            f"Warning: anisotropic {label}-space resizing cleared the stored "
+            f"{label}-space calibration."
+        )
+        return None, None
+
+    def resize(self, shape, domain, method='area'):
+        """
+        Resize real- or reciprocal-space dimensions.
+
+        Parameters
+        ----------
+        shape : int or tuple
+            Requested output shape for the selected domain. For 4D data,
+            ``domain='real'`` expects ``(Ny, Nx)`` and ``domain='reciprocal'``
+            expects ``(Ky, Kx)``. For 3D stacks, ``domain='real'`` expects the
+            number of diffraction patterns and ``domain='reciprocal'`` expects
+            ``(Ky, Kx)``.
+        domain : {'real', 'reciprocal'}
+            Which axes to resize.
+        method : {'area', 'linear', 'nearest'}, optional
+            ``'area'`` performs weighted area averaging and supports
+            downsampling only. ``'linear'`` and ``'nearest'`` use interpolation
+            and support both downsampling and upsampling.
+        """
+        if domain is None:
+            raise ValueError("domain must be 'real' or 'reciprocal'.")
+        if not isinstance(domain, str):
+            raise ValueError("domain must be 'real' or 'reciprocal'.")
+        if not isinstance(method, str):
+            raise ValueError("method must be a string.")
+
+        domain = domain.lower()
+        method = method.lower()
+        if domain not in ('real', 'reciprocal'):
+            raise ValueError("domain must be 'real' or 'reciprocal'.")
+        if method not in ('area', 'linear', 'nearest'):
+            raise ValueError("method must be 'area', 'linear', or 'nearest'.")
+        if self.ndim not in (3, 4):
+            raise ValueError("resize currently supports 3D or 4D datasets.")
+
+        if self.ndim == 4 and domain == 'real':
+            output_shape = self._normalize_resize_shape(shape, 2, 'shape')
+            current_shape = self.shape[:2]
+            axes = (0, 1)
+        elif self.ndim == 4 and domain == 'reciprocal':
+            output_shape = self._normalize_resize_shape(shape, 2, 'shape')
+            current_shape = self.shape[2:4]
+            axes = (2, 3)
+        elif self.ndim == 3 and domain == 'real':
+            output_shape = self._normalize_resize_shape(shape, 1, 'shape')
+            current_shape = (self.shape[0],)
+            axes = (0,)
         else:
-            vmin = np.min(masked_image[masked_image>0])
-        if vmax:
-            vmax = vmax
+            output_shape = self._normalize_resize_shape(shape, 2, 'shape')
+            current_shape = self.shape[1:3]
+            axes = (1, 2)
+
+        if method == 'area' and any(new > old for new, old in zip(output_shape, current_shape)):
+            raise ValueError(
+                "resize with method='area' supports downsampling only: requested "
+                f"{output_shape} from {current_shape}."
+            )
+
+        if method == 'area':
+            resized = self._resize_area(self.array, output_shape, axes)
         else:
+            resized = self._resize_interpolation(
+                self.array,
+                output_shape,
+                axes,
+                method=method,
+            )
+
+        real_units = self.real_units
+        real_conv = self.real_conv_factor
+        reciprocal_units = self.reciprocal_units
+        reciprocal_conv = self.reciprocal_conv_factor
+        scale_factors = tuple(
+            old / new for old, new in zip(current_shape, output_shape)
+        )
+
+        if domain == 'real':
+            real_units, real_conv = self._resized_calibration(
+                real_units, real_conv, scale_factors, 'real'
+            )
+        else:
+            reciprocal_units, reciprocal_conv = self._resized_calibration(
+                reciprocal_units, reciprocal_conv, scale_factors, 'reciprocal'
+            )
+
+        return self._spawn(
+            resized,
+            real_units=real_units,
+            real_conv_factor=real_conv,
+            reciprocal_units=reciprocal_units,
+            reciprocal_conv_factor=reciprocal_conv,
+        )
+
+    def bin_data(self, domain=None, iterations=1, *, bin_domain=None):
+        """
+        Bin data by powers of two through :meth:`resize`.
+
+        ``domain`` must be provided explicitly as ``'real'`` or
+        ``'reciprocal'``. ``bin_domain`` is accepted as a backwards-compatible
+        keyword alias.
+        """
+        if domain is None:
+            domain = bin_domain
+        elif bin_domain is not None and domain != bin_domain:
+            raise ValueError("domain and bin_domain refer to different domains.")
+        if domain is None:
+            raise ValueError("domain must be provided as 'real' or 'reciprocal'.")
+        if not isinstance(iterations, (Integral, np.integer)) or iterations < 1:
+            raise ValueError("iterations must be an integer >= 1.")
+        if not isinstance(domain, str):
+            raise ValueError("domain must be 'real' or 'reciprocal'.")
+
+        domain = domain.lower()
+        if domain not in ('real', 'reciprocal'):
+            raise ValueError("domain must be 'real' or 'reciprocal'.")
+
+        bin_factor = 2 ** int(iterations)
+
+        if self.ndim == 4 and domain == 'real':
+            output_shape = (
+                self.shape[0] // bin_factor,
+                self.shape[1] // bin_factor,
+            )
+        elif self.ndim == 4 and domain == 'reciprocal':
+            output_shape = (
+                self.shape[2] // bin_factor,
+                self.shape[3] // bin_factor,
+            )
+        elif self.ndim == 3 and domain == 'real':
+            output_shape = self.shape[0] // bin_factor
+        elif self.ndim == 3 and domain == 'reciprocal':
+            output_shape = (
+                self.shape[1] // bin_factor,
+                self.shape[2] // bin_factor,
+            )
+        else:
+            raise ValueError("bin_data currently supports 3D or 4D datasets.")
+
+        if isinstance(output_shape, tuple):
+            too_small = any(v < 1 for v in output_shape)
+        else:
+            too_small = output_shape < 1
+        if too_small:
+            raise ValueError("iterations are too large for the selected domain.")
+
+        return self.resize(output_shape, domain=domain, method='area')
+    
+    def virtual_image(self, annulus=None, *, radius=None, centers=None,
+                      mask=None, theta_range=None, vmin=None, vmax=None,
+                      grid=True, num_div=10, plot_mask=False,
+                      grid_color='black', axes=True,
+                      return_detector=False):
+        """
+        Form a real-space virtual image using a reciprocal-space detector.
+
+        The detector type is inferred from exactly one of these specifications:
+
+        - ``annulus=(inner_radius, outer_radius)`` for a centered annulus.
+        - ``radius`` and ``centers`` for one or more Cartesian disks.
+        - ``mask`` for an arbitrary Boolean or weighted detector.
+
+        Parameters
+        ----------
+        annulus : array-like of two floats or None, optional
+            Inner and outer detector radii in reciprocal-space pixels. For
+            Cartesian data the annulus is centered at the diffraction origin.
+            For polar data it selects a radial ``kr`` interval.
+        radius : float or array-like of floats or None, optional
+            Radius of each Cartesian circular detector in pixels. A scalar is
+            applied to every center; otherwise provide one radius per center.
+        centers : array-like or None, optional
+            One ``(ky, kx)`` center or an ``(N, 2)`` array of centers. Multiple
+            circles are combined as a union. Only valid for Cartesian data.
+        mask : ndarray or None, optional
+            Arbitrary detector with shape matching the last two data axes.
+            Boolean masks select pixels. Numeric masks act as detector weights
+            and may contain positive, negative, or fractional values.
+        theta_range : array-like of two floats or None, optional
+            Angular interval in degrees for a polar annular detector. A wrapped
+            interval such as ``(330, 30)`` is supported. This parameter is only
+            valid with ``annulus`` on polar data.
+        vmin, vmax : float or None, optional
+            Display range passed to the real-space visualization.
+        grid : bool, optional
+            Whether to overlay a scan grid on the virtual image.
+        num_div : int or tuple, optional
+            Number of grid divisions along each real-space axis.
+        plot_mask : bool, optional
+            If True, display the masked mean diffraction pattern.
+        grid_color : str, optional
+            Grid color for the real-space visualization.
+        axes : bool, optional
+            Whether to show axes in the real-space visualization.
+        return_detector : bool, optional
+            If True, also return the masked mean diffraction pattern.
+
+        Returns
+        -------
+        RealSpace or tuple
+            The virtual image, optionally followed by the detector image. The
+            detector image is ``ReciprocalSpace`` for Cartesian data and
+            ``HyperData`` with polar metadata for polar data.
+
+        Examples
+        --------
+        >>> image = data.virtual_image(annulus=(10, 35))
+        >>> image = data.virtual_image(radius=5, centers=(62, 74))
+        >>> image = data.virtual_image(
+        ...     radius=[4, 5],
+        ...     centers=[(62, 74), (51, 43)],
+        ... )
+        >>> image = data.virtual_image(mask=detector_weights)
+        """
+        if self.ndim != 4:
+            raise ValueError("virtual_image requires a 4D HyperData object.")
+
+        has_annulus = annulus is not None
+        has_mask = mask is not None
+        has_disk_input = radius is not None or centers is not None
+
+        if (radius is None) != (centers is None):
+            raise ValueError(
+                "radius and centers must be provided together for circular "
+                "detectors."
+            )
+
+        detector_count = sum((has_annulus, has_mask, has_disk_input))
+        if detector_count != 1:
+            raise ValueError(
+                "Specify exactly one detector: annulus, radius with centers, "
+                "or mask."
+            )
+
+        ky, kx = self.shape[-2:]
+
+        if has_mask:
+            if theta_range is not None:
+                raise ValueError(
+                    "theta_range is only valid with annulus on polar data."
+                )
+            detector_weights = np.asarray(mask)
+            if detector_weights.shape != (ky, kx):
+                raise ValueError(
+                    "mask must match the reciprocal-space shape "
+                    f"{(ky, kx)}; got {detector_weights.shape}."
+                )
+            if not (
+                np.issubdtype(detector_weights.dtype, np.bool_)
+                or np.issubdtype(detector_weights.dtype, np.number)
+            ):
+                raise TypeError("mask must contain Boolean or numeric values.")
+            if np.issubdtype(detector_weights.dtype, np.complexfloating):
+                raise TypeError("mask weights must be real-valued.")
+            if (
+                np.issubdtype(detector_weights.dtype, np.number)
+                and not np.all(np.isfinite(detector_weights))
+            ):
+                raise ValueError("mask must contain only finite values.")
+            detector_weights = detector_weights.astype(
+                np.result_type(detector_weights.dtype, np.float32),
+                copy=False,
+            )
+
+        elif has_annulus:
+            annulus_values = np.asarray(annulus, dtype=float)
+            if annulus_values.shape != (2,):
+                raise ValueError(
+                    "annulus must contain exactly (inner_radius, outer_radius)."
+                )
+            if not np.all(np.isfinite(annulus_values)):
+                raise ValueError("annulus radii must be finite.")
+            inner_radius, outer_radius = annulus_values
+            if inner_radius < 0 or outer_radius <= inner_radius:
+                raise ValueError(
+                    "annulus must satisfy 0 <= inner_radius < outer_radius."
+                )
+
+            if self.is_polar:
+                metadata = self.polar_metadata or {}
+                radius_min, radius_max = metadata.get(
+                    'radius_range_pixels',
+                    (0.0, float(ky - 1)),
+                )
+                radius_values = np.linspace(radius_min, radius_max, ky)
+                radial_mask = (
+                    (radius_values >= inner_radius)
+                    & (radius_values <= outer_radius)
+                )
+
+                angular_mask = np.ones(kx, dtype=bool)
+                if theta_range is not None:
+                    angle_values = np.asarray(theta_range, dtype=float)
+                    if angle_values.shape != (2,):
+                        raise ValueError(
+                            "theta_range must contain exactly two angles."
+                        )
+                    if not np.all(np.isfinite(angle_values)):
+                        raise ValueError("theta_range angles must be finite.")
+                    theta_min, theta_max = angle_values
+                    theta_start, theta_stop = metadata.get(
+                        'theta_range',
+                        (0.0, 360.0),
+                    )
+                    theta_values = np.linspace(
+                        theta_start,
+                        theta_stop,
+                        kx,
+                        endpoint=False,
+                    )
+                    if theta_min <= theta_max:
+                        angular_mask = (
+                            (theta_values >= theta_min)
+                            & (theta_values <= theta_max)
+                        )
+                    else:
+                        angular_mask = (
+                            (theta_values >= theta_min)
+                            | (theta_values <= theta_max)
+                        )
+
+                detector_weights = (
+                    radial_mask[:, None] & angular_mask[None, :]
+                ).astype(np.float32)
+            else:
+                if theta_range is not None:
+                    raise ValueError(
+                        "theta_range is only valid for polar data."
+                    )
+                detector_weights = make_mask(
+                    ((ky - 1) / 2, (kx - 1) / 2),
+                    (float(inner_radius), float(outer_radius)),
+                    mask_dim=(ky, kx),
+                ).astype(np.float32)
+
+        else:
+            if self.is_polar:
+                raise ValueError(
+                    "radius and centers define Cartesian (ky, kx) circles and "
+                    "cannot be applied after to_polar(). Use annulus or mask."
+                )
+            if theta_range is not None:
+                raise ValueError(
+                    "theta_range is only valid with annulus on polar data."
+                )
+
+            center_values = np.asarray(centers, dtype=float)
+            if center_values.shape == (2,):
+                center_values = center_values.reshape(1, 2)
+            elif center_values.ndim != 2 or center_values.shape[1] != 2:
+                raise ValueError(
+                    "centers must be one (ky, kx) pair or an (N, 2) array."
+                )
+            if center_values.shape[0] == 0:
+                raise ValueError("centers must contain at least one center.")
+            if not np.all(np.isfinite(center_values)):
+                raise ValueError("centers must contain only finite values.")
+
+            radius_values = np.asarray(radius, dtype=float)
+            if radius_values.ndim == 0:
+                radius_values = np.full(
+                    center_values.shape[0],
+                    float(radius_values),
+                )
+            elif (
+                radius_values.ndim == 1
+                and radius_values.size == center_values.shape[0]
+            ):
+                pass
+            else:
+                raise ValueError(
+                    "radius must be a scalar or contain one value per center."
+                )
+            if (
+                not np.all(np.isfinite(radius_values))
+                or np.any(radius_values <= 0)
+            ):
+                raise ValueError("All detector radii must be positive and finite.")
+
+            detector_weights = np.zeros((ky, kx), dtype=np.float32)
+            for center, disk_radius in zip(center_values, radius_values):
+                detector_weights[
+                    make_mask(
+                        center,
+                        float(disk_radius),
+                        mask_dim=(ky, kx),
+                    )
+                ] = 1.0
+
+        if not np.any(detector_weights != 0):
+            raise ValueError("The detector selects no reciprocal-space pixels.")
+
+        mean_detector = np.mean(self.array, axis=(0, 1))
+        masked_image = np.sum(
+            self.array * detector_weights[None, None, :, :],
+            axis=(2, 3),
+        )
+        virtual_image = self._spawn_real(masked_image)
+
+        detector_array = mean_detector * detector_weights
+        if self.is_polar:
+            detector_image = HyperData(
+                detector_array,
+                polar_metadata=deepcopy(self.polar_metadata),
+            )
+        else:
+            detector_image = self._spawn_reciprocal(detector_array)
+
+        has_negative_weights = np.any(detector_weights < 0)
+        if vmin is None:
+            if has_negative_weights:
+                vmin = np.min(masked_image)
+            else:
+                positive_values = masked_image[masked_image > 0]
+                vmin = (
+                    np.min(positive_values)
+                    if positive_values.size
+                    else np.min(masked_image)
+                )
+        if vmax is None:
             vmax = np.max(masked_image)
-            
-        plt.imshow(masked_image, vmin=vmin, vmax=vmax, cmap='gray')
-        
-        if type(num_div) == tuple:
-            ydiv, xdiv = num_div
-        else:
-            ydiv = num_div
-            xdiv = num_div
-        
-        if axes:
-            plt.axis('on')
-            plt.xticks(np.arange(0, B, B//xdiv))
-            plt.yticks(np.arange(0, A, A//ydiv))
-        else:
-            plt.axis('off')    
-    
-        if grid:
-            plt.grid(c=gridColor)
-        plt.show()
-        
-        if plotMask:
-            plt.imshow(np.log(np.mean(self.array, axis=(0,1))*detector_mask), cmap='turbo',)
+
+        virtual_image.show(
+            title='Virtual Detector Image',
+            cmap='gray',
+            vmin=vmin,
+            vmax=vmax,
+            axes=axes,
+            grid=grid,
+            num_div=num_div,
+            gridColor=grid_color,
+        )
+
+        if plot_mask and self.is_polar:
+            metadata = self.polar_metadata or {}
+            radius_min, radius_max = metadata.get(
+                'radius_display_range',
+                (0.0, float(ky - 1)),
+            )
+            radius_units = metadata.get('radius_units', 'pixels')
+            theta_min, theta_max = metadata.get(
+                'theta_range',
+                (0.0, 360.0),
+            )
+            theta_units = metadata.get('theta_units', 'deg')
+            plt.figure(figsize=(10, 6))
+            plt.imshow(
+                detector_image.array,
+                cmap='coolwarm' if has_negative_weights else 'turbo',
+                aspect='auto',
+                extent=(theta_min, theta_max, radius_max, radius_min),
+            )
+            plt.title('Virtual Detector Response (polar)')
+            plt.xlabel(f'ktheta ({theta_units})')
+            plt.ylabel(f'kr ({radius_units})')
+            plt.colorbar()
             plt.show()
-    
-        if returnDetector:
-            return masked_image, np.mean(self.array, axis=(0,1))*detector_mask
-        else:
-            return masked_image
+        elif plot_mask:
+            detector_image.show(
+                title='Virtual Detector Response',
+                cmap='coolwarm' if has_negative_weights else 'turbo',
+                logScale=not has_negative_weights,
+            )
+
+        if return_detector:
+            return virtual_image, detector_image
+        return virtual_image
         
         
     def get_centers(self, r, ref_coords, method='CoM', real_mask=None):
@@ -3692,94 +7465,275 @@ class HyperData:
                         
         return residual_Bgs
     
-    #TODO: add docstring
-    #TODO: this function seems to work for hexagonal lattices only. I need to extend
-    #      to any number of peaks, maybe depends on symmetry. Add at least 6- and 4-fold symmetry
     #TODO: return as RealSpace object and add a `.show`  
-    def get_strains(self, centers=None, ref_centers=None, ang=0, g_vector=1,
-                    r_CoM=None, r_inner=None, r_outer=None, intensity_array=None, ewpc=False):
+    def get_strains(self, centers=None, ref_centers=None, ang=0, g_vector=None,
+                    r_CoM=None, r_inner=None, r_outer=None, intensity_array=None,
+                    intensity_percentile=None, ewpc=False, match_peaks='auto',
+                    fit_translation=False, min_peak_pairs=2,
+                    return_transform=False):
         """
-        Calculate strain matrices using the given centers and reference centers.
+        Calculate strain and rotation maps from Bragg peak centers.
+
+        This method fits the best 2D linear transform from reference peak
+        coordinates to measured peak coordinates at each diffraction pattern,
+        then extracts strain from the polar stretch matrix. Peak sets are not
+        required to have the same size. If the number of peaks differs,
+        reference and measured peaks are matched by centroid-aligned nearest
+        assignment before fitting.
+
+        Parameters
+        ----------
+        centers : ndarray or nested list, optional
+            Measured peak centers. Common fixed-size shape is
+            ``(Ry, Rx, n_peaks, 2)``. Nested lists may be used when each
+            diffraction pattern has a different number of peaks.
+        ref_centers : ndarray or nested list, optional
+            Reference peak centers. Supported forms are a global
+            ``(n_ref_peaks, 2)`` array or a local reference with the same scan
+            layout as ``centers``.
+        ang : float, optional
+            In-plane angle in degrees used to rotate the strain basis.
+        g_vector : optional
+            Retained for compatibility with older calls. The least-squares
+            implementation uses all matched peaks rather than selecting a
+            hexagonal g-vector pair.
+        r_CoM : float, optional
+            Radius passed to ``get_centers`` when measured centers are not
+            supplied.
+        intensity_array : ndarray or nested list, optional
+            Optional peak weights. If supplied, weights are matched to measured
+            peaks and used in the least-squares fit.
+        intensity_percentile : float or None, optional
+            If supplied with ``intensity_array``, discard measured peaks with
+            intensities below this local percentile before matching and fitting.
+            For example, ``intensity_percentile=20`` removes the weakest 20% of
+            finite measured peaks in each diffraction pattern.
+        ewpc : bool, optional
+            If True, invert the fitted reciprocal-space transform before
+            extracting strain.
+        match_peaks : {'auto', 'ordered', 'nearest'}, optional
+            ``'auto'`` preserves peak order when both sets have the same number
+            of peaks and uses nearest assignment otherwise.
+        fit_translation : bool, optional
+            If True, fit and remove a translation term so detector shifts are
+            not interpreted as strain.
+        min_peak_pairs : int, optional
+            Minimum number of matched peak pairs required to fit a transform.
+        return_transform : bool, optional
+            If True, also return fitted transforms, translations, and match
+            counts.
+
+        Returns
+        -------
+        exx, eyy, exy, erot : ndarray
+            Strain and rotation maps. Rotation is returned in radians.
         """
-                
-        def calculate_g_vectors(centers, g_vector):
-            
-            if centers.shape[2] == 6:
-                g1 = centers[:, :, g_vector-1] - centers[:, :, g_vector+2]
-                g2 = (centers[:, :, g_vector] + centers[:, :, g_vector+1]) / 2 - \
-                     (centers[:, :, (g_vector+3) % 6] + centers[:, :, (g_vector+4) % 6]) / 2
-                     
-            return g1, g2
+        def _is_sequence_of_sequences(value):
+            return (
+                isinstance(value, list)
+                and len(value) > 0
+                and isinstance(value[0], list)
+            )
 
-        def calculate_reference_g_vectors(ref_centers, g_vector):
-            
-            if ref_centers.shape[0] == 6:
+        def _reference_for_center_finding(ref_centers):
+            if _is_sequence_of_sequences(ref_centers):
+                return ref_centers
 
-                ref_g1 = ref_centers[g_vector-1] - ref_centers[g_vector+2]
-                ref_g2 = (ref_centers[g_vector] + ref_centers[g_vector+1]) / 2 - \
-                         (ref_centers[(g_vector+3) % 6] + ref_centers[(g_vector+4) % 6]) / 2
-                         
-            return ref_g1, ref_g2
+            ref_array = np.asarray(ref_centers, dtype=float)
+            if ref_array.ndim == 4 and ref_array.shape[-1] == 2:
+                return [
+                    [ref_array[i, j] for j in range(ref_array.shape[1])]
+                    for i in range(ref_array.shape[0])
+                ]
+            return ref_centers
 
-        def calculate_strain_matrices(centers, ref_centers, ang_rad, g_vector, ewpc=ewpc):
-            
-            ydim, xdim = centers.shape[:2]
-            exx = np.zeros((ydim, xdim))
-            eyy = np.zeros((ydim, xdim))
-            exy = np.zeros((ydim, xdim))
-            erot = np.zeros((ydim, xdim))
+        def _infer_scan_shape(peak_data):
+            if _is_sequence_of_sequences(peak_data):
+                return len(peak_data), len(peak_data[0]), False
+            if isinstance(peak_data, list):
+                return len(peak_data), 1, True
 
-            g1, g2 = calculate_g_vectors(centers, g_vector)
-            ref_g1, ref_g2 = calculate_reference_g_vectors(ref_centers, g_vector)
+            peak_array = np.asarray(peak_data, dtype=float)
+            if peak_array.ndim == 4 and peak_array.shape[-1] == 2:
+                return peak_array.shape[0], peak_array.shape[1], False
+            if peak_array.ndim == 3 and peak_array.shape[-1] == 2:
+                return peak_array.shape[0], 1, True
+            raise ValueError(
+                "centers must have shape (Ry, Rx, n_peaks, 2), "
+                "shape (B, n_peaks, 2), or an equivalent nested list."
+            )
 
-            G_ref = np.array([[ref_g2[0], ref_g1[0]],
-                              [ref_g2[1], ref_g1[1]]])
+        def _local_peaks(peak_data, i, j, squeezed_scan=False):
+            if _is_sequence_of_sequences(peak_data):
+                return np.asarray(peak_data[i][j], dtype=float)
+            if isinstance(peak_data, list):
+                return np.asarray(peak_data[i], dtype=float)
 
-            R1 = np.array([[np.cos(ang_rad), np.sin(ang_rad)],
-                           [-np.sin(ang_rad), np.cos(ang_rad)]])
+            peak_array = np.asarray(peak_data, dtype=float)
+            if peak_array.ndim == 2:
+                return peak_array
+            if peak_array.ndim == 4:
+                return peak_array[i, j]
+            if peak_array.ndim == 3 and squeezed_scan:
+                return peak_array[i]
+            raise ValueError("Unsupported peak-center layout.")
 
-            for i in tqdm(range(ydim), desc='Computing strain matrices'):
-                for j in range(xdim):
-                    G1 = np.array([[g2[i, j, 0], g1[i, j, 0]],
-                                   [g2[i, j, 1], g1[i, j, 1]]])
-                    
-                    if not ewpc:
-                        T = R1 @ G1 @ np.linalg.inv(G_ref) @ np.linalg.inv(R1)
-                    else:
-                        T = R1 @ G_ref @ np.linalg.inv(G1) @ np.linalg.inv(R1)
-                        
-                    R, U = polar(T)
+        def _local_weights(weights, i, j, squeezed_scan=False):
+            if weights is None:
+                return None
+            if _is_sequence_of_sequences(weights):
+                return np.asarray(weights[i][j], dtype=float)
+            if isinstance(weights, list):
+                return np.asarray(weights[i], dtype=float)
 
-                    eyy[i, j]  = 1 - U[0, 0]
-                    exx[i, j]  = 1 - U[1, 1]
-                    exy[i, j]  = U[1, 0]
-                    erot[i, j] = np.arccos(R[0, 1])
+            weight_array = np.asarray(weights, dtype=float)
+            if weight_array.ndim == 1:
+                return weight_array
+            if weight_array.ndim == 3:
+                return weight_array[i, j]
+            if weight_array.ndim == 2 and squeezed_scan:
+                return weight_array[i]
+            return None
 
-            return exx, eyy, exy, erot
+        def _clean_peak_set(peaks):
+            peaks = np.asarray(peaks, dtype=float)
+            if peaks.size == 0:
+                return peaks.reshape(0, 2), np.array([], dtype=int)
+            peaks = peaks.reshape(-1, 2)
+            valid = np.isfinite(peaks).all(axis=1)
+            return peaks[valid], np.flatnonzero(valid)
 
-        def calculate_average_strain_maps(centers, ref_centers, ang_rad):
-            
-            ydim, xdim = centers.shape[:2]
-            exx_maps = np.zeros((3, ydim, xdim))
-            eyy_maps = np.zeros((3, ydim, xdim))
-            exy_maps = np.zeros((3, ydim, xdim))
-            erot_maps = np.zeros((3, ydim, xdim))
+        def _weights_for_valid_measured(weights, meas_valid_idx):
+            if weights is None:
+                return None
 
-            for i, g_vector in enumerate(range(1, 4)):
-                exx_maps[i], eyy_maps[i], exy_maps[i], erot_maps[i] = \
-                    calculate_strain_matrices(centers, ref_centers, ang_rad, g_vector)
+            weights = np.asarray(weights, dtype=float).reshape(-1)
+            if weights.shape[0] == meas_valid_idx.shape[0]:
+                return weights
+            if (
+                meas_valid_idx.size > 0
+                and weights.shape[0] > np.max(meas_valid_idx)
+            ):
+                return weights[meas_valid_idx]
+            return None
 
-            exx = np.mean(exx_maps, axis=0)
-            eyy = np.mean(eyy_maps, axis=0)
-            exy = np.mean(exy_maps, axis=0)
-            erot = np.mean(erot_maps, axis=0)
+        def _match_peak_sets(reference, measured, weights=None):
+            reference, ref_valid_idx = _clean_peak_set(reference)
+            measured, meas_valid_idx = _clean_peak_set(measured)
+            measured_weights = _weights_for_valid_measured(weights, meas_valid_idx)
 
-            return exx, eyy, exy, erot
+            if intensity_percentile is not None:
+                if measured_weights is None:
+                    raise ValueError(
+                        "intensity_percentile requires intensity_array values "
+                        "that match the measured peaks in centers."
+                    )
+                finite_weights = np.isfinite(measured_weights)
+                if not np.any(finite_weights):
+                    return None, None, None, None, None
+
+                threshold = np.percentile(
+                    measured_weights[finite_weights],
+                    intensity_percentile,
+                )
+                keep = finite_weights & (measured_weights >= threshold)
+                measured = measured[keep]
+                meas_valid_idx = meas_valid_idx[keep]
+                measured_weights = measured_weights[keep]
+
+            if reference.shape[0] < min_peak_pairs or measured.shape[0] < min_peak_pairs:
+                return None, None, None, None, None
+
+            match_mode = match_peaks.lower()
+            if match_mode == 'auto':
+                match_mode = 'ordered' if reference.shape[0] == measured.shape[0] else 'nearest'
+
+            if match_mode == 'ordered':
+                n_pairs = min(reference.shape[0], measured.shape[0])
+                ref_idx = np.arange(n_pairs)
+                meas_idx = np.arange(n_pairs)
+            elif match_mode in ('nearest', 'hungarian'):
+                ref_centered = reference - np.mean(reference, axis=0)
+                measured_centered = measured - np.mean(measured, axis=0)
+                distances = cdist(ref_centered, measured_centered)
+                ref_idx, meas_idx = linear_sum_assignment(distances)
+            else:
+                raise ValueError("match_peaks must be 'auto', 'ordered', or 'nearest'.")
+
+            matched_weights = None
+            if measured_weights is not None:
+                matched_weights = measured_weights[meas_idx]
+
+            return (
+                reference[ref_idx],
+                measured[meas_idx],
+                matched_weights,
+                ref_valid_idx[ref_idx],
+                meas_valid_idx[meas_idx],
+            )
+
+        def _fit_peak_transform(reference, measured, weights=None):
+            if weights is not None:
+                weights = np.asarray(weights, dtype=float)
+                weights = np.where(np.isfinite(weights), weights, 0)
+                weights = np.clip(weights, 0, None)
+                if np.sum(weights) <= 0:
+                    weights = None
+
+            if fit_translation:
+                if weights is None:
+                    ref_origin = np.mean(reference, axis=0)
+                    measured_origin = np.mean(measured, axis=0)
+                else:
+                    ref_origin = np.average(reference, axis=0, weights=weights)
+                    measured_origin = np.average(measured, axis=0, weights=weights)
+                X = reference - ref_origin
+                Y = measured - measured_origin
+            else:
+                ref_origin = np.zeros(2)
+                measured_origin = np.zeros(2)
+                X = reference
+                Y = measured
+
+            if weights is None:
+                X_fit = X
+                Y_fit = Y
+            else:
+                sqrt_weights = np.sqrt(weights)[:, np.newaxis]
+                X_fit = X * sqrt_weights
+                Y_fit = Y * sqrt_weights
+
+            coeffs, *_ = np.linalg.lstsq(X_fit, Y_fit, rcond=None)
+            transform_matrix = coeffs.T
+            translation = measured_origin - ref_origin @ coeffs
+            return transform_matrix, translation
 
         if ref_centers is None and centers is None:
             raise ValueError("Either 'ref_centers' or 'centers' must be defined.")
 
+        if intensity_percentile is not None:
+            if intensity_array is None:
+                raise ValueError("intensity_percentile requires intensity_array.")
+            try:
+                intensity_percentile = float(intensity_percentile)
+            except (TypeError, ValueError):
+                raise ValueError("intensity_percentile must be a number.")
+            if not 0 <= intensity_percentile <= 100:
+                raise ValueError("intensity_percentile must be between 0 and 100.")
+
+        if centers is None:
+            centers = self.get_centers(
+                r=r_CoM,
+                ref_coords=_reference_for_center_finding(ref_centers),
+                method='CoM',
+            )
+
         if ref_centers is None:
+            if isinstance(centers, list):
+                raise ValueError(
+                    "ref_centers cannot be inferred from ragged centers. "
+                    "Provide a global or local reference peak set."
+                )
             if r_inner is None or r_outer is None:
                 r = (self.shape[-2] + self.shape[-1]) / 4
                 reduced_data = self.apply_mask(r_inner=0.6 * r, r_outer=0.8 * r)
@@ -3790,44 +7744,170 @@ class HyperData:
                                                percentile=5, show_mask=False)
             ref_centers = np.mean(centers[flat_mask], axis=0)
 
-        if centers is None:
-            centers = self.get_centers(r=r_CoM, ref_coords=ref_centers, method='CoM')
-
+        ydim, xdim, squeezed_scan = _infer_scan_shape(centers)
+        output_shape = (ydim,) if squeezed_scan else (ydim, xdim)
         ang_rad = np.radians(ang)
+        R1 = np.array([[np.cos(ang_rad), np.sin(ang_rad)],
+                       [-np.sin(ang_rad), np.cos(ang_rad)]])
 
-        if g_vector in [1, 2, 3]:
-            return calculate_strain_matrices(centers, ref_centers, ang_rad, g_vector)
-        elif g_vector is None:
-            return calculate_average_strain_maps(centers, ref_centers, ang_rad)
-        else:
-            raise ValueError("Input 'g_vector' can only be one of the following: [1, 2, 3, None]")
+        exx = np.full(output_shape, np.nan)
+        eyy = np.full(output_shape, np.nan)
+        exy = np.full(output_shape, np.nan)
+        erot = np.full(output_shape, np.nan)
+        transforms = np.full(output_shape + (2, 2), np.nan)
+        translations = np.full(output_shape + (2,), np.nan)
+        match_counts = np.zeros(output_shape, dtype=int)
+
+        for i in tqdm(range(ydim), desc='Computing strain matrices'):
+            for j in range(xdim):
+                ref_ij = _local_peaks(ref_centers, i, j, squeezed_scan)
+                centers_ij = _local_peaks(centers, i, j, squeezed_scan)
+                weights_ij = _local_weights(intensity_array, i, j, squeezed_scan)
+
+                matched = _match_peak_sets(ref_ij, centers_ij, weights_ij)
+                matched_ref, matched_centers, weights, _, _ = matched
+                if matched_ref is None or matched_ref.shape[0] < min_peak_pairs:
+                    continue
+
+                try:
+                    transform_matrix, translation = _fit_peak_transform(
+                        matched_ref,
+                        matched_centers,
+                        weights=weights,
+                    )
+
+                    if ewpc:
+                        transform_for_strain = np.linalg.inv(transform_matrix)
+                    else:
+                        transform_for_strain = transform_matrix
+
+                    T = R1 @ transform_for_strain @ np.linalg.inv(R1)
+                    R, U = polar(T)
+                except np.linalg.LinAlgError:
+                    continue
+
+                out_idx = i if squeezed_scan else (i, j)
+                eyy[out_idx] = 1 - U[0, 0]
+                exx[out_idx] = 1 - U[1, 1]
+                exy[out_idx] = U[1, 0]
+                erot[out_idx] = np.arctan2(R[1, 0], R[0, 0])
+                transforms[out_idx] = transform_matrix
+                translations[out_idx] = translation
+                match_counts[out_idx] = matched_ref.shape[0]
+
+        if return_transform:
+            metadata = {
+                'transforms': transforms,
+                'translations': translations,
+                'match_counts': match_counts,
+                'match_peaks': match_peaks,
+                'fit_translation': fit_translation,
+                'min_peak_pairs': min_peak_pairs,
+                'intensity_percentile': intensity_percentile,
+                'g_vector': g_vector,
+            }
+            return exx, eyy, exy, erot, metadata
+
+        return exx, eyy, exy, erot
         
         
-    #TODO: add docstring and figure out what it is doing
-    def apply_mask(self, r_inner=None, r_outer=None, a_min=0, mask=None, domain=None):
-        
+    def apply_mask(self, r_inner=None, r_outer=None, mask=None, domain=None):
+        """
+        Apply either a real-space selection mask or a reciprocal-space mask.
+
+        Parameters
+        ----------
+        r_inner : float or None, optional
+            Inner radius of a reciprocal-space mask centered on the diffraction
+            pattern midpoint. If ``r_outer`` is omitted, ``r_inner`` defines a
+            filled circular mask. If both are provided, they define an annulus.
+        r_outer : float or None, optional
+            Outer radius of an annular reciprocal-space mask.
+        mask : ndarray of bool, optional
+            Explicit mask to apply. For ``domain='real'`` this must match the
+            real-space scan shape ``(Ny, Nx)`` of a 4D dataset and the selected
+            scan positions are returned as a 3D stack. For
+            ``domain='reciprocal'`` this must match the diffraction-pattern
+            shape ``(ky, kx)`` and is broadcast across all scan positions.
+        domain : {'real', 'reciprocal'} or None, optional
+            Domain of an explicit ``mask``. Ignored when using radial masks.
+
+        Returns
+        -------
+        HyperData
+            A new ``HyperData`` instance containing the masked data. Real-space
+            masking returns only the selected diffraction patterns, while
+            reciprocal-space masking preserves the input dimensionality.
+
+        Notes
+        -----
+        This method never mutates ``self.array`` in place.
+        """
+
         if self.ndim < 3:
-            raise ValueError("The data object must be of 3 or greater dimensions.")
-        
+            raise ValueError("The data object must be 3-dimensional or greater.")
+
+        data = self.array
         ky, kx = self.shape[-2], self.shape[-1]
 
-        # Apply arbitrary mask on real or reciprocal space
         if mask is not None:
+            mask = np.asarray(mask, dtype=bool)
+
             if domain == 'real':
-                self.array[~mask,:,:] = a_min
-                return HyperData(self.array[~mask,:,:])
-            elif domain == 'reciprocal':
-                return HyperData(self.array * mask).clip(a_min=a_min)
-        
-        # For ring=shaped mask on reciprocal space
-        elif r_outer is not None:
-            bool_mask = make_mask(((ky-1)/2, (kx-1)/2), (r_inner, r_outer), mask_dim=(ky, kx),)
-        
-        # For center-beam removal
-        else:            
-            bool_mask = make_mask(((ky-1)/2, (kx-1)/2), r_inner, mask_dim=(ky, kx),)
-        
-        return HyperData(self.array * bool_mask).clip(a_min=a_min)
+                if self.ndim != 4:
+                    raise ValueError("Real-space masking requires a 4D dataset.")
+
+                expected_shape = self.shape[:2]
+                if mask.shape != expected_shape:
+                    raise ValueError(
+                        f"Real-space mask must have shape {expected_shape}, "
+                        f"got {mask.shape}."
+                    )
+                if not np.any(mask):
+                    raise ValueError("Real-space mask contains no True pixels.")
+
+                return self._spawn(
+                    data[mask],
+                    real_units=None,
+                    real_conv_factor=None,
+                )
+
+            if domain == 'reciprocal':
+                expected_shape = (ky, kx)
+                if mask.shape != expected_shape:
+                    raise ValueError(
+                        f"Reciprocal-space mask must have shape {expected_shape}, "
+                        f"got {mask.shape}."
+                    )
+
+                return self._spawn(data * mask)
+
+            raise ValueError(
+                "When 'mask' is provided, 'domain' must be either 'real' or "
+                "'reciprocal'."
+            )
+
+        if r_outer is not None:
+            if r_inner is None:
+                raise ValueError("'r_inner' must be provided when 'r_outer' is used.")
+            bool_mask = make_mask(
+                ((ky - 1) / 2, (kx - 1) / 2),
+                (r_inner, r_outer),
+                mask_dim=(ky, kx),
+            )
+        else:
+            if r_inner is None:
+                raise ValueError(
+                    "Provide either an explicit 'mask' or a reciprocal-space "
+                    "radius via 'r_inner'."
+                )
+            bool_mask = make_mask(
+                ((ky - 1) / 2, (kx - 1) / 2),
+                r_inner,
+                mask_dim=(ky, kx),
+            )
+
+        return self._spawn(data * bool_mask)
     
     #TODO: the output of this should be a real-space object
     def get_clusters(self, n_PCAcomponents, n_clusters, r_centerBeam, std_Threshold=0.2, power=1,
@@ -4061,45 +8141,63 @@ class HyperData:
         
         if residual_bg_frac > 0:
             residual_bg = self.get_residualBg(**resBg_kwargs)
-            return HyperData(self.array[:,:] - background*bg_frac - residual_bg*residual_bg_frac).clip()
+            return self._spawn(
+                self.array[:,:] - background*bg_frac - residual_bg*residual_bg_frac
+            ).clip()
         else:
-            return HyperData(self.array[:,:] - background*bg_frac).clip()
+            return self._spawn(self.array[:,:] - background*bg_frac).clip()
 
-    #TODO: remove the `center` parameter by automatically getting the CoM of the DP
-    def get_polarTransform(self,
-                           center: Tuple[float, float] = None,
-                           r_max: int = None,
-                           output_shape: Tuple[int, int] = None,
-                           order: int = 1
-                           ) -> Tuple["HyperData", int]:
+    def to_polar(self,
+                 center: Tuple[float, float] = None,
+                 r_max: float = None,
+                 output_shape: Tuple[int, int] = None,
+                 order: int = 1,
+                 fill_value: float = 0.0,
+                 clip: bool = True,
+                 progress: bool = True
+                 ) -> "HyperData":
         """
-        Return a new HyperData object where each diffraction pattern slice
-        has been remapped from Cartesian to polar. Uses fast interpolation
-        via scipy.ndimage.map_coordinates and tqdm for progress.
+        Remap each diffraction pattern from Cartesian ``(ky, kx)`` to polar
+        ``(radius, angle)`` coordinates.
+
+        The default output samples the largest centered circle that fits inside
+        the diffraction pattern. The radial size is ``ceil(r_max)`` and the
+        angular size is ``ceil(2*pi*r_max)``, so angular sampling roughly
+        matches the outer circumference. The returned object stores
+        ``polar_metadata`` so downstream methods know that the last two axes
+        are ``kr`` and ``ktheta``. ``ktheta`` is displayed from 0 to 360
+        degrees, while ``kr`` is displayed in the original reciprocal units
+        when calibration is available.
 
         Parameters
         ----------
         center : tuple of two floats, optional
             (y_center, x_center) in pixel coordinates. Defaults to the image midpoint.
-        r_max : int, optional
-            Maximum radius (in pixels) to sample. Defaults to min(height, width)//2.
-            If r_max > min(center), those regions will be filled with 1 (instead of NaN).
+        r_max : float, optional
+            Maximum sampled radius in pixels. Defaults to the largest centered
+            circle that fits inside the diffraction pattern. If a larger radius
+            is requested, out-of-bounds samples are filled with ``fill_value``.
         output_shape : tuple (n_r, n_theta), optional
             Desired shape of the output polar image. 
             - n_r = number of radial samples
             - n_theta = number of angular samples
-            Default: (r_max, r_max) so that the result is square.
+            Default: ``(ceil(r_max), ceil(2*pi*r_max))``.
         order : int, default=1
             The spline interpolation order for map_coordinates (0=nearest,
             1=bilinear, 3=cubic, etc.).
+        fill_value : float, optional
+            Value used for out-of-bounds samples if ``r_max`` extends beyond
+            the input diffraction pattern.
+        clip : bool, optional
+            If True, apply :func:`clip_values` to each transformed pattern.
+        progress : bool, optional
+            If True, display a progress bar.
 
         Returns
         -------
-        (polar_hd, r_max_used) : tuple
-            - polar_hd: HyperData instance whose `.array` has shape either
-                         (B, n_r, n_theta) or (A, B, n_r, n_theta),
-                         matching the original dimensionality but polar-transformed.
-            - r_max_used: the integer radius actually used for this transform.
+        HyperData
+            New object with shape ``(B, n_r, n_theta)`` for 3D data or
+            ``(Ry, Rx, n_r, n_theta)`` for 4D data.
         """
         arr = self.array
         shp = arr.shape
@@ -4120,26 +8218,37 @@ class HyperData:
         cx = (width  - 1) / 2.0
         if center is not None:
             cy, cx = center
+            cy = float(cy)
+            cx = float(cx)
 
-        # Default r_max = floor(min(height, width)//2)
-        default_rmax = int(min(height, width) // 2)
+        if not (0 <= cy <= height - 1 and 0 <= cx <= width - 1):
+            raise ValueError(
+                "center must lie inside the diffraction pattern bounds."
+            )
+
         if r_max is None:
-            r_max_used = default_rmax
+            r_max_used = min(cy, cx, height - 1 - cy, width - 1 - cx)
         else:
-            r_max_used = int(r_max)
+            r_max_used = float(r_max)
+        if not np.isfinite(r_max_used) or r_max_used <= 0:
+            raise ValueError("r_max must be a positive finite value.")
 
         # 2) Determine output_shape = (n_r, n_theta)
         if output_shape is None:
-            n_r     = r_max_used
-            n_theta = r_max_used
+            n_r = max(1, int(np.ceil(r_max_used)))
+            n_theta = max(4, int(np.ceil(2 * np.pi * r_max_used)))
         else:
             n_r, n_theta = output_shape
+            n_r = int(n_r)
+            n_theta = int(n_theta)
+        if n_r <= 0 or n_theta <= 0:
+            raise ValueError("output_shape must contain positive integers.")
 
         # 3) Precompute the polar→Cartesian mapping grid
         #    Radial values from 0 to r_max_used in n_r steps
         r_vals = np.linspace(0, r_max_used, n_r)
         #    Theta from -π to +π in n_theta steps
-        theta_vals = np.linspace(-np.pi, np.pi, n_theta, endpoint=False)
+        theta_vals = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
 
         #    Meshgrid in (r, θ), shape = (n_r, n_theta) when indexing='ij'
         #    But map_coordinates expects coords stacked as [row_coords; col_coords].
@@ -4160,49 +8269,313 @@ class HyperData:
         else:
             out_arr = np.zeros((B, n_r, n_theta), dtype=arr.dtype)
 
-        # 5) Define a helper mask for “blank” regions: whenever r_grid > min(cy, cx),
-        #    we’ll force those polar pixels to 1.0 after interpolation.
-        r_limit = min(cy, cx)
-        blank_mask = (r_grid > r_limit).ravel()  # shape: (n_r*n_theta,)
-
-        # 6) Loop over all slices with tqdm progress bars
+        # 5) The default r_max already crops to the useful centered circle.
+        # 6) Loop over all slices. The coordinate grid is shared by every
+        # pattern, so the per-pattern work is only interpolation.
         if A is not None:
-            outer_desc = "Diffraction patterns"
-            inner_desc = "Diffraction slice"
-            for i in tqdm(range(A), desc=outer_desc):
-                for j in tqdm(range(B), desc=inner_desc, leave=False):
-                    diff = arr[i, j]
-                    # Interpolate the 2D slice onto our polar grid
-                    polar_flat = map_coordinates(
-                        diff,
-                        coords,
-                        order=order,
-                        mode='constant',
-                        cval=0.0
-                    )
-                    # Replace blank‐region entries (where r > r_limit) with 1
-                    polar_flat[blank_mask] = 1.0
-
-                    # Reshape back to (n_r, n_theta) and clip
-                    polar_img = polar_flat.reshape((n_r, n_theta))
-                    out_arr[i, j] = clip_values(polar_img)
+            iterator = np.ndindex(A, B)
+            if progress:
+                iterator = tqdm(
+                    iterator,
+                    total=A * B,
+                    desc="Diffraction patterns",
+                )
+            for i, j in iterator:
+                diff = arr[i, j]
+                # Interpolate the 2D slice onto our polar grid
+                polar_flat = map_coordinates(
+                    diff,
+                    coords,
+                    order=order,
+                    mode='constant',
+                    cval=fill_value
+                )
+                # Reshape back to (n_r, n_theta) and clip if requested.
+                polar_img = polar_flat.reshape((n_r, n_theta))
+                if clip:
+                    polar_img = clip_values(polar_img)
+                out_arr[i, j] = polar_img
         else:
-            desc = "Diffraction slice"
-            for j in tqdm(range(B), desc=desc):
+            iterator = (
+                tqdm(range(B), desc="Diffraction patterns")
+                if progress
+                else range(B)
+            )
+            for j in iterator:
                 diff = arr[j]
                 polar_flat = map_coordinates(
                     diff,
                     coords,
                     order=order,
                     mode='constant',
-                    cval=0.0
+                    cval=fill_value
                 )
-                polar_flat[blank_mask] = 1.0
                 polar_img = polar_flat.reshape((n_r, n_theta))
-                out_arr[j] = clip_values(polar_img)
+                if clip:
+                    polar_img = clip_values(polar_img)
+                out_arr[j] = polar_img
 
-        # 7) Return the new HyperData and the r_max_used
-        return HyperData(out_arr)
+        # 7) Return the new HyperData. The reciprocal calibration is cleared
+        # because the last two axes are now radius/angle, not ky/kx pixels.
+        polar_hd = self._spawn(
+            out_arr,
+            reciprocal_units=None,
+            reciprocal_conv_factor=None,
+        )
+        radius_step_pixels = r_max_used / n_r
+        radius_sample_step_pixels = r_max_used / (n_r - 1) if n_r > 1 else 0.0
+        radius_unit_scale = (
+            self.reciprocal_conv_factor
+            if self.reciprocal_conv_factor is not None
+            else 1.0
+        )
+        radius_units = (
+            self.reciprocal_units
+            if self.reciprocal_units is not None
+            else 'pixels'
+        )
+        polar_hd.polar_metadata = {
+            'is_polar': True,
+            'center': (cy, cx),
+            'r_max': r_max_used,
+            'output_shape': (n_r, n_theta),
+            'cartesian_shape': (height, width),
+            'cartesian_center': (cy, cx),
+            'cartesian_reciprocal_units': self.reciprocal_units,
+            'cartesian_reciprocal_conv_factor': self.reciprocal_conv_factor,
+            'axis_order': ('radius', 'theta'),
+            'radius_range': (0.0, r_max_used),
+            'radius_range_pixels': (0.0, r_max_used),
+            'radius_display_range': (
+                0.0,
+                r_max_used * radius_unit_scale,
+            ),
+            'radius_units': radius_units,
+            'radius_conv_factor': radius_unit_scale,
+            'radius_step_pixels': radius_step_pixels,
+            'radius_step': radius_step_pixels * radius_unit_scale,
+            'radius_sample_step_pixels': radius_sample_step_pixels,
+            'radius_sample_step': radius_sample_step_pixels * radius_unit_scale,
+            'theta_range': (0.0, 360.0),
+            'theta_units': 'deg',
+            'theta_step': 360.0 / n_theta,
+            'order': order,
+            'fill_value': fill_value,
+        }
+        return polar_hd
+
+    def to_cartesian(self,
+                     output_shape: Union[Tuple[int, int], str] = None,
+                     center: Tuple[float, float] = None,
+                     order: int = 1,
+                     fill_value: float = 0.0,
+                     clip: bool = True,
+                     progress: bool = True
+                     ) -> "HyperData":
+        """
+        Resample polar diffraction data back onto a Cartesian ``(ky, kx)`` grid.
+
+        This is an inverse resampling operation, not an exact undo of
+        :meth:`to_polar`. Any Cartesian pixels outside the sampled polar
+        ``r_max`` are filled with ``fill_value``.
+
+        Parameters
+        ----------
+        output_shape : tuple(int, int), 'original', or None, optional
+            Cartesian diffraction shape ``(Ky, Kx)`` to reconstruct. If None,
+            use ``(2*n_r, 2*n_r)``, where ``n_r`` is the polar radial axis
+            size. This makes the polar ``kr_max`` map to a circle whose
+            diameter is the output image width/height. Use ``'original'`` to
+            reconstruct on the Cartesian shape stored by :meth:`to_polar`.
+        center : tuple(float, float) or None, optional
+            Cartesian center ``(cy, cx)`` in the output image. If None, use the
+            output midpoint. With ``output_shape='original'``, use the stored
+            original Cartesian center when available.
+        order : int, optional
+            Spline interpolation order passed to :func:`map_coordinates`.
+        fill_value : float, optional
+            Value assigned outside the polar support or outside polar bounds.
+        clip : bool, optional
+            If True, apply :func:`clip_values` to each reconstructed pattern.
+        progress : bool, optional
+            If True, display a progress bar.
+
+        Returns
+        -------
+        HyperData
+            New Cartesian HyperData object. The returned object is not marked
+            polar. Its reciprocal calibration is computed from the polar
+            ``kr_max`` and the selected Cartesian output radius, so the
+            displayed ``kx``/``ky`` scale matches the polar radial scale.
+        """
+        if not self.is_polar:
+            raise ValueError(
+                "to_cartesian can only be called on HyperData produced by "
+                "to_polar, or on an object with polar_metadata."
+            )
+
+        arr = self.array
+        shp = arr.shape
+        if len(shp) == 4:
+            A, B, n_r, n_theta = shp
+        elif len(shp) == 3:
+            A = None
+            B, n_r, n_theta = shp
+        else:
+            raise ValueError(
+                "Polar HyperData must be 3D (B, R, Theta) or 4D "
+                "(Ry, Rx, R, Theta)."
+            )
+
+        metadata = self.polar_metadata or {}
+        use_original_canvas = False
+        if output_shape is None:
+            output_shape = (2 * n_r, 2 * n_r)
+        elif isinstance(output_shape, str):
+            if output_shape.lower() != 'original':
+                raise ValueError("output_shape must be a tuple, None, or 'original'.")
+            output_shape = metadata.get('cartesian_shape')
+            if output_shape is None:
+                raise ValueError(
+                    "output_shape is required because polar_metadata does not "
+                    "contain 'cartesian_shape'."
+                )
+            use_original_canvas = True
+        height, width = output_shape
+        height = int(height)
+        width = int(width)
+        if height <= 0 or width <= 0:
+            raise ValueError("output_shape must contain positive integers.")
+
+        if center is None:
+            if use_original_canvas:
+                center = metadata.get(
+                    'cartesian_center',
+                    metadata.get(
+                        'center',
+                        ((height - 1) / 2.0, (width - 1) / 2.0),
+                    ),
+                )
+            else:
+                center = ((height - 1) / 2.0, (width - 1) / 2.0)
+        cy, cx = center
+        cy = float(cy)
+        cx = float(cx)
+
+        r_max = float(
+            metadata.get(
+                'r_max',
+                metadata.get('radius_range_pixels', (0, n_r - 1))[1],
+            )
+        )
+        if not np.isfinite(r_max) or r_max <= 0:
+            raise ValueError("polar_metadata must define a positive finite r_max.")
+
+        if use_original_canvas:
+            output_radius_pixels = r_max
+        else:
+            output_radius_pixels = min(height, width) / 2.0
+        if not np.isfinite(output_radius_pixels) or output_radius_pixels <= 0:
+            raise ValueError("The output Cartesian radius must be positive.")
+
+        y_grid, x_grid = np.indices((height, width), dtype=float)
+        dy = y_grid - cy
+        dx = x_grid - cx
+        radius_grid = np.sqrt(dx**2 + dy**2)
+        theta_grid = np.mod(np.arctan2(dy, dx), 2 * np.pi)
+
+        if n_r > 1:
+            radius_coord = radius_grid * (n_r - 1) / output_radius_pixels
+        else:
+            radius_coord = np.zeros_like(radius_grid)
+        theta_coord = theta_grid * n_theta / (2 * np.pi)
+        theta_coord = np.mod(theta_coord, n_theta)
+
+        # Add one wrapped theta column so angular interpolation is continuous
+        # at 0/360 without wrapping the radial axis.
+        theta_coord_padded = theta_coord.copy()
+        theta_coord_padded[theta_coord_padded >= n_theta] -= n_theta
+        coords = np.vstack((
+            radius_coord.ravel(),
+            theta_coord_padded.ravel(),
+        ))
+        outside_support = radius_grid.ravel() > output_radius_pixels
+
+        if A is not None:
+            out_arr = np.full((A, B, height, width), fill_value, dtype=arr.dtype)
+        else:
+            out_arr = np.full((B, height, width), fill_value, dtype=arr.dtype)
+
+        if A is not None:
+            iterator = np.ndindex(A, B)
+            if progress:
+                iterator = tqdm(
+                    iterator,
+                    total=A * B,
+                    desc="Cartesian diffraction patterns",
+                )
+            for i, j in iterator:
+                polar_img = arr[i, j]
+                polar_for_interp = np.concatenate(
+                    (polar_img, polar_img[:, :1]),
+                    axis=1,
+                )
+                cart_flat = map_coordinates(
+                    polar_for_interp,
+                    coords,
+                    order=order,
+                    mode='constant',
+                    cval=fill_value,
+                )
+                cart_img = cart_flat.reshape((height, width))
+                if clip:
+                    cart_img = clip_values(cart_img)
+                cart_img.ravel()[outside_support] = fill_value
+                out_arr[i, j] = cart_img
+        else:
+            iterator = (
+                tqdm(range(B), desc="Cartesian diffraction patterns")
+                if progress
+                else range(B)
+            )
+            for j in iterator:
+                polar_img = arr[j]
+                polar_for_interp = np.concatenate(
+                    (polar_img, polar_img[:, :1]),
+                    axis=1,
+                )
+                cart_flat = map_coordinates(
+                    polar_for_interp,
+                    coords,
+                    order=order,
+                    mode='constant',
+                    cval=fill_value,
+                )
+                cart_img = cart_flat.reshape((height, width))
+                if clip:
+                    cart_img = clip_values(cart_img)
+                cart_img.ravel()[outside_support] = fill_value
+                out_arr[j] = cart_img
+
+        radius_display_range = metadata.get(
+            'radius_display_range',
+            (0.0, r_max),
+        )
+        radius_display_max = float(radius_display_range[1])
+        reciprocal_units = metadata.get(
+            'radius_units',
+            metadata.get('cartesian_reciprocal_units'),
+        )
+        reciprocal_conv_factor = radius_display_max / output_radius_pixels
+        if reciprocal_units is None:
+            reciprocal_units = 'pixels'
+
+        return self._spawn(
+            out_arr,
+            reciprocal_units=reciprocal_units,
+            reciprocal_conv_factor=reciprocal_conv_factor,
+            polar_metadata=None,
+        )
 
     def get_average_clusters(self,
                              cluster_map: np.ndarray,
@@ -4294,7 +8667,18 @@ class HyperData:
                 plt.title(f"Cluster {i} ({domain})")
                 plt.show()
 
-        return HyperData(avg)
+        if domain == 'real':
+            return self._spawn(
+                avg,
+                real_units=None,
+                real_conv_factor=None,
+            )
+
+        return self._spawn(
+            avg,
+            reciprocal_units=None,
+            reciprocal_conv_factor=None,
+        )
 
     def get_stdev_clusters(self,
                            cluster_map: np.ndarray,
@@ -4358,7 +8742,11 @@ class HyperData:
 
         # 2) if no threshold → return the raw std‐dev map
         if threshold is None:
-            return HyperData(stdev_arr)
+            return self._spawn(
+                stdev_arr,
+                real_units=None,
+                real_conv_factor=None,
+            )
 
         # 3) validate threshold
         if not (0.0 <= threshold <= 1.0):
@@ -4384,17 +8772,155 @@ class HyperData:
             thresh_val = threshold * max_sd
             bool_arr[i] = (sd >= thresh_val) & region
 
-        return HyperData(bool_arr)
+        return self._spawn(
+            bool_arr,
+            real_units=None,
+            real_conv_factor=None,
+        )
     
 #%%
 
-#TODO: figure out if we can define the scale of the pixel somehow `A^-1` or `mrad`
 class ReciprocalSpace:
+    """
+    Container for a single 2D reciprocal-space image or diffraction pattern.
 
-    def __init__(self, data):
+    Parameters
+    ----------
+    data : np.ndarray
+        Two-dimensional reciprocal-space data.
+    units : str or None, optional
+        Physical units associated with the reciprocal-space pixel spacing
+        (for example ``'mrad'`` or ``'A^-1'``).
+    conv_factor : float or None, optional
+        Conversion factor from pixels to physical units, expressed as
+        ``units / pixel``. When omitted, plots default to pixel units.
+    """
+
+    def __init__(self, data, units: str = None, conv_factor: float = None,
+                 polar_metadata: dict = None):
         self.array = data
         self.shape = data.shape
-        self.denoiser = Denoiser(data)
+        self._denoise_engine = _DenoiseEngine(data)
+        self.units = None
+        self.conv_factor = None
+        self.polar_metadata = deepcopy(polar_metadata) if polar_metadata is not None else None
+
+        if units is not None or conv_factor is not None:
+            self.set_scale(units=units, conv_factor=conv_factor)
+
+    @property
+    def is_polar(self):
+        """Return True when this 2D image is in polar ``(kr, ktheta)`` space."""
+        return self.polar_metadata is not None
+
+    def set_scale(self, units: str, conv_factor: float):
+        """
+        Attach a reciprocal-space calibration to the diffraction pattern.
+
+        Parameters
+        ----------
+        units : str
+            Physical reciprocal-space units, for example ``'mrad'`` or
+            ``'A^-1'``.
+        conv_factor : float
+            Conversion factor in ``units / pixel``.
+
+        Returns
+        -------
+        ReciprocalSpace
+            The current object, updated in place.
+        """
+        if units is None or conv_factor is None:
+            raise ValueError("'units' and 'conv_factor' must both be provided.")
+        if not isinstance(units, str) or not units.strip():
+            raise ValueError("'units' must be a non-empty string.")
+        if not np.isscalar(conv_factor) or conv_factor <= 0:
+            raise ValueError("'conv_factor' must be a positive scalar.")
+
+        self.units = units.strip()
+        self.conv_factor = float(conv_factor)
+        return self
+
+    def clear_scale(self):
+        """Remove any stored reciprocal-space calibration."""
+        self.units = None
+        self.conv_factor = None
+        return self
+
+    def _resolve_scale(self, units=None, conv_factor=None):
+        """Resolve plot calibration from explicit inputs or stored metadata."""
+        resolved_units = self.units if units is None else units
+        resolved_factor = self.conv_factor if conv_factor is None else conv_factor
+
+        if resolved_units is None and resolved_factor is None:
+            return None, None
+        if resolved_units is None or resolved_factor is None:
+            raise ValueError(
+                "'units' and 'conv_factor' must be defined together, either "
+                "on the object or in the method call."
+            )
+        if not np.isscalar(resolved_factor) or resolved_factor <= 0:
+            raise ValueError("'conv_factor' must be a positive scalar.")
+
+        return str(resolved_units).strip(), float(resolved_factor)
+
+    def _format_unit_text(self, units):
+        """Return a display-friendly unit label."""
+        if units is None:
+            return "px"
+
+        normalized = units.lower().replace(" ", "")
+        if normalized in {'inv_ang', 'invang', 'a-1', 'a^-1', 'å^-1', 'å-1', 'ang^-1', 'ang-1'}:
+            return r"Å$^{-1}$"
+        if normalized in {'mrad', 'mrads'}:
+            return "mrad"
+        if normalized in {'deg', 'degree', 'degrees'}:
+            return r"$^\circ$"
+        return units
+
+    def _axis_extent(self, conv_factor=None):
+        """
+        Return imshow-compatible axis limits centered at the diffraction origin.
+        """
+        ky, kx = self.shape
+        scale = 1.0 if conv_factor is None else conv_factor
+        half_y = ky / 2.0
+        half_x = kx / 2.0
+        return (-half_x * scale, half_x * scale, half_y * scale, -half_y * scale)
+
+    def _polar_axis_info(self):
+        """Return imshow extent and labels for polar ``(kr, ktheta)`` data."""
+        metadata = self.polar_metadata or {}
+        n_r, n_theta = self.shape
+
+        radius_min, radius_max = metadata.get(
+            'radius_display_range',
+            metadata.get('radius_range_pixels', (0.0, float(n_r))),
+        )
+        theta_min, theta_max = metadata.get('theta_range', (0.0, 360.0))
+        radius_units = metadata.get('radius_units', 'pixels')
+        theta_units = metadata.get('theta_units', 'deg')
+
+        radius_unit_text = self._format_unit_text(radius_units)
+        theta_unit_text = self._format_unit_text(theta_units)
+        extent = (theta_min, theta_max, radius_max, radius_min)
+        return extent, theta_unit_text, radius_unit_text
+
+    def _spawn(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET,
+               polar_metadata=_SCALE_UNSET):
+        """Create a new ReciprocalSpace object while preserving calibration."""
+        if units is _SCALE_UNSET:
+            units = self.units
+        if conv_factor is _SCALE_UNSET:
+            conv_factor = self.conv_factor
+        if polar_metadata is _SCALE_UNSET:
+            polar_metadata = self.polar_metadata
+        return ReciprocalSpace(
+            data,
+            units=units,
+            conv_factor=conv_factor,
+            polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+        )
     
     def show(self,
              power: float = 1,
@@ -4407,6 +8933,8 @@ class ReciprocalSpace:
              aspect=None,
              cmap: str = 'turbo',
              coords: np.ndarray | None = None,
+             units: str = None,
+             conv_factor: float = None,
              **scatter_kwargs):
         """
         Visualize the diffraction pattern stored in this ReciprocalSpace object.
@@ -4446,6 +8974,14 @@ class ReciprocalSpace:
             Optional array of peak coordinates to overlay as scatter points.
             Each row should be `[y, x]`. When provided, points are plotted at
             `x = coords[:, 1]` and `y = coords[:, 0]` on top of the image.
+        units : str or None, optional
+            Physical units for the reciprocal-space axes. If omitted, the
+            method uses the units previously assigned to this object via
+            ``set_scale``. If no calibration exists, the axes are shown in
+            pixels.
+        conv_factor : float or None, optional
+            Conversion factor in ``units / pixel``. If omitted, the stored
+            object calibration is used when available.
         **scatter_kwargs :
             Additional keyword arguments forwarded to `plt.scatter(...)` for
             the overlay points (e.g., `c='r'`, `s=20`, `marker='x'`, etc.).
@@ -4457,6 +8993,13 @@ class ReciprocalSpace:
           `-inf` or `nan` in the log; it is recommended to use background-
           subtracted and strictly positive data when using log scaling.
         """
+        if self.is_polar:
+            extent, theta_unit_text, radius_unit_text = self._polar_axis_info()
+            conv_factor = None
+        else:
+            units, conv_factor = self._resolve_scale(units=units, conv_factor=conv_factor)
+            axis_unit_text = self._format_unit_text(units)
+            extent = self._axis_extent(conv_factor=conv_factor)
     
         # Visualize
         plt.figure(figsize=figsize)
@@ -4473,7 +9016,16 @@ class ReciprocalSpace:
             vmax = np.max(processed_data)
     
         # Display the image with the specified color mapping and value limits
-        im1 = plt.imshow(processed_data, vmin=vmin, vmax=vmax, cmap=cmap)
+        imshow_kwargs = {
+            'vmin': vmin,
+            'vmax': vmax,
+            'cmap': cmap,
+            'extent': extent,
+        }
+        if self.is_polar:
+            imshow_kwargs['origin'] = 'upper'
+
+        im1 = plt.imshow(processed_data, **imshow_kwargs)
     
         ax = plt.gca()
     
@@ -4485,14 +9037,36 @@ class ReciprocalSpace:
         if coords is not None:
             coords = np.asarray(coords)
             if coords.size > 0:
-                plt.scatter(coords[:, 1], coords[:, 0], **scatter_kwargs)
+                if self.is_polar:
+                    metadata = self.polar_metadata or {}
+                    radius_step = metadata.get(
+                        'radius_sample_step',
+                        metadata.get('radius_step', 1.0),
+                    )
+                    theta_step = metadata.get(
+                        'theta_step',
+                        360.0 / self.shape[1],
+                    )
+                    theta_min = metadata.get('theta_range', (0.0, 360.0))[0]
+                    x_coords = theta_min + coords[:, 1] * theta_step
+                    y_coords = coords[:, 0] * radius_step
+                else:
+                    plot_scale = 1.0 if conv_factor is None else conv_factor
+                    ky, kx = self.shape
+                    center_y = (ky - 1) / 2.0
+                    center_x = (kx - 1) / 2.0
+                    x_coords = (coords[:, 1] - center_x) * plot_scale
+                    y_coords = (center_y - coords[:, 0]) * plot_scale
+                plt.scatter(x_coords, y_coords, **scatter_kwargs)
     
         if axes:
-            ky, kx = self.shape
-    
             plt.axis('on')
-            plt.xticks(np.arange(0, kx, 5))
-            plt.yticks(np.arange(0, ky, 5))
+            if self.is_polar:
+                ax.set_xlabel(rf"$k_\theta$ ({theta_unit_text})", fontsize=14)
+                ax.set_ylabel(rf"$k_r$ ({radius_unit_text})", fontsize=14)
+            else:
+                ax.set_xlabel(rf"$k_x$ ({axis_unit_text})", fontsize=14)
+                ax.set_ylabel(rf"$k_y$ ({axis_unit_text})", fontsize=14)
     
             divider = make_axes_locatable(ax)
             cax = divider.append_axes("right", size="5%", pad=0.05)
@@ -4501,12 +9075,18 @@ class ReciprocalSpace:
             cb.ax.tick_params(labelsize=15)
             ax.set_title(title, fontsize=18)
     
-            if power:
-                cbar_title = f"Intensity\n(Power = {power})"
+            if logScale:
+                if power:
+                    cbar_title = f"log(Intensity)\n(Power = {power})"
+                else:
+                    cbar_title = "log(Intensity)"
             else:
-                cbar_title = "Intensity"
+                if power:
+                    cbar_title = f"Intensity\n(Power = {power})"
+                else:
+                    cbar_title = "Intensity"
     
-            plt.title(cbar_title, fontsize=14)
+            cb.set_label(cbar_title, fontsize=14)
         else:
             plt.axis('off')
     
@@ -4580,14 +9160,27 @@ class ReciprocalSpace:
         # --- Extract raw region ---
         cropped = self.array[y0:y1, x0:x1]
     
+        new_conv_factor = self.conv_factor
+
         # --- Handle subpixel or resize ---
         if subpixel or kshape is not None:
+            if self.conv_factor is not None:
+                y_scale = (kylim_range[1] - kylim_range[0]) / kshape[0]
+                x_scale = (kxlim_range[1] - kxlim_range[0]) / kshape[1]
+
+                if np.isclose(y_scale, x_scale):
+                    new_conv_factor = self.conv_factor * x_scale
+                else:
+                    print("Warning: anisotropic resizing cleared the stored reciprocal-space calibration.")
+                    new_conv_factor = None
+
             cropped = transform.resize(cropped, kshape,
                              order=1,  # bilinear
                              mode='reflect',
                              anti_aliasing=True)
-    
-        return ReciprocalSpace(cropped)
+
+        new_units = self.units if new_conv_factor is not None else None
+        return self._spawn(cropped, units=new_units, conv_factor=new_conv_factor)
     
     def get_spotCenter(self, ky, kx, r, method='CoM', plotSpot=False,):
         """
@@ -4836,7 +9429,7 @@ class ReciprocalSpace:
                 dp_mask += bool_mask
                 res_bgs[c_idx] = np.sum(masked_dp)/np.sum(bool_mask)
             if show:
-                ReciprocalSpace(self.array * dp_mask).show(**kwargs)
+                self._spawn(self.array * dp_mask).show(**kwargs)
             return res_bgs
      
         if bg_method=='rings_mean':            
@@ -4882,7 +9475,7 @@ class ReciprocalSpace:
         masked_dp = self.array * bool_mask
         
         if show:
-            ReciprocalSpace(masked_dp).show(**kwargs)
+            self._spawn(masked_dp).show(**kwargs)
         
         # Return the average background value per pixel
         return np.sum(masked_dp)/np.sum(bool_mask)
@@ -5439,12 +10032,12 @@ class ReciprocalSpace:
         
         """
         
-        return ReciprocalSpace(clip_values(self.array, a_min, a_max))
+        return self._spawn(clip_values(self.array, a_min, a_max))
     
     #TODO: add docstring
     def get_bg(self, centers, radius,):
                            
-        return ReciprocalSpace(inpaint_diffraction(self.array, centers=centers, radius=radius,))
+        return self._spawn(inpaint_diffraction(self.array, centers=centers, radius=radius,))
     
     
     def remove_bg(self, background, bg_frac=1, a_min=1):
@@ -5481,7 +10074,7 @@ class ReciprocalSpace:
         if type(background) != np.ndarray:
             background = background.array
         
-        return ReciprocalSpace(self.array - background*bg_frac).clip(a_min=a_min)
+        return self._spawn(self.array - background*bg_frac).clip(a_min=a_min)
 
 
     def get_radialProfile(self,
@@ -5593,21 +10186,19 @@ class ReciprocalSpace:
         raw_radii   = radii[sel]
 
         # units + conversion
+        units, conv_factor = self._resolve_scale(units=units, conv_factor=conv_factor)
         if units is not None:
-            if conv_factor is None:
-                raise ValueError("`conv_factor` must be provided when `units` is specified")
-            # convert radii to physical units
             phys_r = raw_radii * conv_factor
-            # choose axis label
-            u = units.lower()
-            if u in {'inv_ang','inv_Ang','invang','invAng','a-1','A-1','Å-1'}:
-                xlabel = r"Frequency (Å$^{-1}$)"
-            elif u == 'mrad':
-                xlabel = "Scattering angle (mrad)"
-            elif u in {'deg','degree'}:
-                xlabel = "Scattering angle (°)"
+            unit_text = self._format_unit_text(units)
+            normalized = units.lower().replace(" ", "")
+            if normalized in {'inv_ang', 'invang', 'a-1', 'a^-1', 'å^-1', 'å-1', 'ang^-1', 'ang-1'}:
+                xlabel = rf"Frequency ({unit_text})"
+            elif normalized in {'mrad', 'mrads'}:
+                xlabel = f"Scattering angle ({unit_text})"
+            elif normalized in {'deg', 'degree', 'degrees'}:
+                xlabel = f"Scattering angle ({unit_text})"
             else:
-                xlabel = f"r ({units})"
+                xlabel = f"r ({unit_text})"
         else:
             phys_r = raw_radii
             xlabel = "r (px)"
@@ -5677,19 +10268,305 @@ class ReciprocalSpace:
 
 #%% Real-space Class
 
-# class RealSpace:
-    
-#     def __init__(self):
-#         self.data = np.array(data)
+class RealSpace:
+    """
+    Container for a single 2D real-space image.
 
-#TODO: make function for visualizing the real-space image along with, 
-# optionally, an overlaid cluster map.
+    Parameters
+    ----------
+    data : np.ndarray
+        Two-dimensional real-space data.
+    units : str or None, optional
+        Physical units associated with the real-space pixel spacing
+        (for example ``'nm'`` or ``'Å'``).
+    conv_factor : float or None, optional
+        Conversion factor from pixels to physical units, expressed as
+        ``units / pixel``. When omitted, plots default to pixel units.
+    """
+
+    def __init__(self, data, units: str = None, conv_factor: float = None):
+        self.array = data
+        self.shape = data.shape
+        self._denoise_engine = _DenoiseEngine(data)
+        self.units = None
+        self.conv_factor = None
+
+        if units is not None or conv_factor is not None:
+            self.set_scale(units=units, conv_factor=conv_factor)
+
+    def set_scale(self, units: str, conv_factor: float):
+        """Attach a real-space calibration in units per pixel."""
+        if units is None or conv_factor is None:
+            raise ValueError("'units' and 'conv_factor' must both be provided.")
+        if not isinstance(units, str) or not units.strip():
+            raise ValueError("'units' must be a non-empty string.")
+        if not np.isscalar(conv_factor) or conv_factor <= 0:
+            raise ValueError("'conv_factor' must be a positive scalar.")
+
+        self.units = units.strip()
+        self.conv_factor = float(conv_factor)
+        return self
+
+    def clear_scale(self):
+        """Remove any stored real-space calibration."""
+        self.units = None
+        self.conv_factor = None
+        return self
+
+    def _resolve_scale(self, units=None, conv_factor=None):
+        """Resolve plot calibration from explicit inputs or stored metadata."""
+        resolved_units = self.units if units is None else units
+        resolved_factor = self.conv_factor if conv_factor is None else conv_factor
+
+        if resolved_units is None and resolved_factor is None:
+            return None, None
+        if resolved_units is None or resolved_factor is None:
+            raise ValueError(
+                "'units' and 'conv_factor' must be defined together, either "
+                "on the object or in the method call."
+            )
+        if not np.isscalar(resolved_factor) or resolved_factor <= 0:
+            raise ValueError("'conv_factor' must be a positive scalar.")
+
+        return str(resolved_units).strip(), float(resolved_factor)
+
+    def _format_unit_text(self, units):
+        """Return a display-friendly unit label."""
+        if units is None:
+            return "px"
+
+        normalized = units.lower().replace(" ", "")
+        if normalized in {'ang', 'angstrom', 'angstroms', 'å', 'ångström', 'a'}:
+            return "Å"
+        if normalized in {'nm', 'nanometer', 'nanometers'}:
+            return "nm"
+        if normalized in {'um', 'µm', 'micron', 'microns'}:
+            return "µm"
+        return units
+
+    def _axis_extent(self, conv_factor=None):
+        """
+        Return imshow-compatible axis limits with the origin at the top-left.
+        """
+        ny, nx = self.shape
+        scale = 1.0 if conv_factor is None else conv_factor
+        return (-0.5 * scale, (nx - 0.5) * scale, (ny - 0.5) * scale, -0.5 * scale)
+
+    def _spawn(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET):
+        """Create a new RealSpace object while preserving calibration."""
+        if units is _SCALE_UNSET:
+            units = self.units
+        if conv_factor is _SCALE_UNSET:
+            conv_factor = self.conv_factor
+        return RealSpace(data, units=units, conv_factor=conv_factor)
+
+    def show(self,
+             title: str = 'Real-Space Image',
+             axes: bool = True,
+             grid: bool = False,
+             num_div=10,
+             gridColor: str = 'black',
+             vmin=None,
+             vmax=None,
+             figsize=(8, 8),
+             aspect=None,
+             cmap: str = 'gray',
+             coords: np.ndarray | None = None,
+             units: str = None,
+             conv_factor: float = None,
+             **scatter_kwargs):
+        """
+        Visualize the real-space image stored in this object.
+        """
+        units, conv_factor = self._resolve_scale(units=units, conv_factor=conv_factor)
+        axis_unit_text = self._format_unit_text(units)
+        extent = self._axis_extent(conv_factor=conv_factor)
+        scale = 1.0 if conv_factor is None else conv_factor
+
+        plt.figure(figsize=figsize)
+        im1 = plt.imshow(self.array, vmin=vmin, vmax=vmax, cmap=cmap, extent=extent)
+        ax = plt.gca()
+
+        if aspect is not None:
+            ax.set_aspect(aspect)
+
+        if coords is not None:
+            coords = np.asarray(coords)
+            if coords.size > 0:
+                x_coords = coords[:, 1] * scale
+                y_coords = coords[:, 0] * scale
+                plt.scatter(x_coords, y_coords, **scatter_kwargs)
+
+        if axes:
+            ax.set_xlabel(f"x ({axis_unit_text})", fontsize=14)
+            ax.set_ylabel(f"y ({axis_unit_text})", fontsize=14)
+            ax.set_title(title, fontsize=18)
+
+            if isinstance(num_div, tuple):
+                ydiv, xdiv = num_div
+            else:
+                ydiv = num_div
+                xdiv = num_div
+
+            if xdiv and xdiv > 0:
+                ax.set_xticks(np.linspace(0, (self.shape[1] - 1) * scale, xdiv + 1))
+            if ydiv and ydiv > 0:
+                ax.set_yticks(np.linspace(0, (self.shape[0] - 1) * scale, ydiv + 1))
+
+            if grid:
+                ax.grid(color=gridColor)
+
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.05)
+            cb = plt.colorbar(im1, cax=cax)
+            cb.ax.tick_params(labelsize=12)
+            cb.set_label("Intensity", fontsize=14)
+        else:
+            plt.axis('off')
+
+        plt.show()
 
 #%% Denoising Functions and Classes
 
-#TODO: figure out how to show the parameters and docstring for each of these
-class DenoisingMethods:
+class _DenoisingMethods:
+    """Private collection of numerical denoising algorithms."""
     
+    @staticmethod
+    def _unfold_with_hyperdata(array, unfold_domain=None, unfold_method='row_major'):
+        """
+        Unfold an array through the HyperData API and return array + metadata.
+
+        Decomposition methods operate on arrays, but unfolding belongs to
+        HyperData. This helper keeps that ownership clear while letting the
+        numerical routines work with plain ndarrays.
+        """
+        if unfold_domain is None:
+            return array, None
+
+        unfolded = HyperData(array).unfold(
+            domain=unfold_domain,
+            method=unfold_method,
+        )
+        return unfolded.array, unfolded.unfold_metadata
+
+    @staticmethod
+    def _refold_with_hyperdata(array, unfold_metadata):
+        """Restore an unfolded array through HyperData.unfold(undo=True)."""
+        if unfold_metadata is None:
+            return array
+
+        return HyperData(array).unfold(
+            undo=True,
+            metadata=unfold_metadata,
+        ).array
+
+    @staticmethod
+    def _decomposition_preset(method_name, performance_preset):
+        """
+        Return practical decomposition defaults for denoising workflows.
+
+        TensorLy's native defaults are careful general-purpose optimization
+        settings. For denoising, a lower-iteration approximate factorization is
+        often more useful than a slow, tightly converged decomposition.
+        """
+        preset_name = str(performance_preset).lower()
+        presets = {
+            'parafac': {
+                'fast': {
+                    'n_iter_max': 15,
+                    'init': 'random',
+                    'tol': 1e-4,
+                },
+                'balanced': {
+                    'n_iter_max': 35,
+                    'init': 'random',
+                    'tol': 1e-5,
+                },
+                'accurate': {
+                    'n_iter_max': 100,
+                    'init': 'svd',
+                    'tol': 1e-8,
+                },
+                'tensorly': {
+                    'n_iter_max': 100,
+                    'init': 'svd',
+                    'tol': 1e-8,
+                },
+            },
+            'parafac2': {
+                'fast': {
+                    'n_iter_max': 10,
+                    'n_iter_parafac': 1,
+                    'init': 'random',
+                    'tol': 1e-4,
+                    'linesearch': False,
+                },
+                'balanced': {
+                    'n_iter_max': 25,
+                    'n_iter_parafac': 2,
+                    'init': 'random',
+                    'tol': 1e-5,
+                    'linesearch': True,
+                },
+                'accurate': {
+                    'n_iter_max': 2000,
+                    'n_iter_parafac': 5,
+                    'init': 'random',
+                    'tol': 1e-8,
+                    'linesearch': True,
+                },
+                'tensorly': {
+                    'n_iter_max': 2000,
+                    'n_iter_parafac': 5,
+                    'init': 'random',
+                    'tol': 1e-8,
+                    'linesearch': True,
+                },
+            },
+        }
+
+        if method_name not in presets:
+            raise ValueError(f"No performance presets defined for {method_name!r}.")
+        if preset_name not in presets[method_name]:
+            valid = ', '.join(presets[method_name])
+            raise ValueError(
+                f"performance_preset must be one of: {valid}, or None."
+            )
+        return presets[method_name][preset_name]
+
+    @staticmethod
+    def _split_cp_result(result, return_errors=False):
+        """Return ``(cp_tensor, errors)`` from TensorLy CP-style outputs."""
+        if return_errors:
+            cp_tensor, errors = result
+        else:
+            cp_tensor = result
+            errors = None
+        return cp_tensor, errors
+
+    @staticmethod
+    def _looks_like_error_sequence(values):
+        """Return True when ``values`` looks like TensorLy reconstruction errors."""
+        try:
+            values = list(values)
+        except TypeError:
+            return False
+
+        return all(np.isscalar(value) or np.asarray(value).ndim == 0 for value in values)
+
+    @classmethod
+    def _split_tucker_result(cls, result, return_errors=False):
+        """Return ``(tucker_tensor, errors)`` from TensorLy Tucker-style outputs."""
+        if (
+            return_errors
+            and isinstance(result, tuple)
+            and len(result) == 2
+            and cls._looks_like_error_sequence(result[1])
+        ):
+            return result[0], result[1]
+
+        return result, None
+
     # =============================================================================
     # Spatial Filters
     # =============================================================================
@@ -5866,7 +10743,6 @@ class DenoisingMethods:
 
         return denoise_tv_chambolle(target_data, weight=weight, eps=eps, max_num_iter=max_num_iter)
     
-    # @jit(nopython=True, parallel=True) #new
     def adaptive_median_filter(self, target_data, s=3, sMax=7):
         """
         Apply an adaptive median filter to reduce noise while preserving edges.
@@ -6018,7 +10894,7 @@ class DenoisingMethods:
     def nmf(self, X, n_components=None, init='random', update_H=True, solver='cd', 
             beta_loss='frobenius', tol=0.0001, max_iter=200, alpha_W=0.0, alpha_H='same', 
             l1_ratio=0.0, random_state=None, verbose=0, shuffle=False, return_decomposition=False,
-            plot_eigenvalues=False, unfold_domain=None):
+            plot_eigenvalues=False, unfold_domain=None, unfold_method='row_major'):
         """
         Non-negative Matrix Factorization (NMF) using scikit-learn's `non_negative_factorization`.
         
@@ -6097,12 +10973,12 @@ class DenoisingMethods:
             The reconstructed matrix X from W and H, returned if return_reconstruction is True.
         """
         from sklearn.decomposition import non_negative_factorization
-        import numpy as np
     
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
         if unfold_domain is not None:
-            original_shape = X.shape
-            X = unfold_tensor(X, unfold_domain)
+            X, unfold_metadata = self._unfold_with_hyperdata(
+                X, unfold_domain, unfold_method
+            )
     
         # Perform NMF
         W, H, n_iter = non_negative_factorization(X, n_components=n_components, init=init,
@@ -6135,7 +11011,9 @@ class DenoisingMethods:
         
         # Re-fold the tensor if it was unfolded
         if unfold_domain is not None:               
-            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
         
         if return_decomposition:
             return [reconstruction, [W, H, n_iter]]
@@ -6143,6 +11021,10 @@ class DenoisingMethods:
         else:
             return reconstruction
 
+    ##########################
+    # TensorLy Decomposition #
+    ##########################
+    
     
     # Good results with 'reciprocal' unfolding and rank=50
     def parafac(self, tensor, rank, n_iter_max=100, init='svd', svd='truncated_svd', 
@@ -6150,7 +11032,9 @@ class DenoisingMethods:
                 verbose=0, return_errors=False, sparsity=None, l2_reg=0, mask=None, 
                 cvg_criterion='abs_rec_error', fixed_modes=None, svd_mask_repeats=5, 
                 linesearch=False, callback=None, implementation='tensorly', 
-                return_decomposition=False, unfold_domain=None):
+                return_decomposition=False, unfold_domain=None,
+                unfold_method='row_major', performance_preset=None,
+                working_dtype=None):
         """CANDECOMP/PARAFAC decomposition via alternating least squares (ALS)
         
         Computes a rank-rank decomposition of tensor such that:
@@ -6183,7 +11067,8 @@ class DenoisingMethods:
         
         tol : float, optional, default is 1e-08
             Relative reconstruction error tolerance. The algorithm is considered 
-            to have found the global minimum when the reconstruction error is less than tol.
+            to have found the global minimum when the reconstruction error is
+            less than tol.
         
         random_state : {None, int, np.random.RandomState}, optional
             Random seed or state to initialize the random number generator.
@@ -6235,6 +11120,13 @@ class DenoisingMethods:
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor 
                                         and computation time).
+        performance_preset : {'fast', 'balanced', 'accurate', 'tensorly'} or None
+            Optional 4Denoise speed/accuracy preset. If None, use TensorLy's
+            documented defaults exactly. If provided, this overrides
+            ``n_iter_max``, ``init``, and ``tol``.
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32`` to
+            reduce memory pressure. If None, keep the input dtype.
         
         Returns
         -------
@@ -6256,10 +11148,22 @@ class DenoisingMethods:
         -----
         CANDECOMP/PARAFAC decomposition via alternating least squares (ALS).
         """
+        if performance_preset is not None:
+            preset = self._decomposition_preset('parafac', performance_preset)
+            n_iter_max = preset['n_iter_max']
+            init = preset['init']
+            tol = preset['tol']
+
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
         if unfold_domain is not None:
-            original_shape = tensor.shape
-            tensor = unfold_tensor(tensor, unfold_domain)
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
         
         # Conditional implementation
         if implementation == 'tensorly':
@@ -6269,65 +11173,119 @@ class DenoisingMethods:
                                                     sparsity=sparsity, l2_reg=l2_reg, mask=mask, cvg_criterion=cvg_criterion, fixed_modes=fixed_modes,
                                                     svd_mask_repeats=svd_mask_repeats, linesearch=linesearch, callback=callback)
             if return_errors:
-                factors, weights, errors = result
+                cp_result, errors = result
             else:
-                factors, weights = result
+                cp_result = result
+                errors = None
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
+
+        if sparsity is not None:
+            cp_tensor, sparse_component = cp_result
+        else:
+            cp_tensor = cp_result
+            sparse_component = None
         
         # Reconstruct the tensor from CP factors
-        reconstruction = tl.cp_to_tensor((factors, weights))
+        reconstruction = tl.cp_to_tensor(cp_tensor)
         
         # Re-fold the tensor if it was unfolded
         if unfold_domain is not None:
-            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
         
         if return_decomposition:
+            weights, factors = cp_tensor
             results = [weights, factors, reconstruction]
             if return_errors:
                 results.append(errors)
             if sparsity is not None:
-                sparse_component = result[2] if return_errors else result[1]
                 results.append(sparse_component)
             return results
         else:
             return reconstruction
 
     # Dataset must be 3D
-    def parafac2(self, target_data, rank=5, n_iter_max=100, n_iter_parafac=5, 
-                 implementation='tensorly', return_decomposition=False, 
-                 unfold_domain=None, init='random', svd='truncated_svd', 
-                 normalize_factors=False, tol=1e-08, absolute_tol=1e-13, 
-                 nn_modes=None, random_state=None, verbose=False, return_errors=False,):
+    def parafac2(self, tensor_slices, rank, n_iter_max=2000, init='random',
+                 svd='truncated_svd', normalize_factors=False, tol=1e-08,
+                 nn_modes=None, random_state=None, verbose=False,
+                 return_errors=False, n_iter_parafac=5, linesearch=True,
+                 implementation='tensorly', return_decomposition=False,
+                 unfold_domain=None, unfold_method='row_major',
+                 performance_preset=None, working_dtype=None):
         """
-        Apply PARAFAC2 decomposition to input tensor.
+        Apply PARAFAC2 decomposition to a 3D input tensor.
+
+        The TensorLy-facing parameters mirror
+        ``tensorly.decomposition.parafac2``. ``performance_preset`` and
+        ``working_dtype`` are 4Denoise conveniences and are optional.
         """
+        if performance_preset is not None:
+            preset = self._decomposition_preset('parafac2', performance_preset)
+            n_iter_max = preset['n_iter_max']
+            n_iter_parafac = preset['n_iter_parafac']
+            init = preset['init']
+            tol = preset['tol']
+            linesearch = preset['linesearch']
         
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
-        #TODO consider that this will be in all decomposition functions, so probably add this to HyperData...
         if unfold_domain is not None:
-        
-            original_shape = target_data.shape
-        
-            target_data = unfold_tensor(target_data, unfold_domain, )
+            tensor_slices, unfold_metadata = self._unfold_with_hyperdata(
+                tensor_slices, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor_slices = np.asarray(tensor_slices, dtype=working_dtype)
+
+        if np.ndim(tensor_slices) != 3:
+            raise ValueError(
+                "parafac2 requires a 3D array after optional unfolding. "
+                "Use unfold_domain='real' or unfold_domain='reciprocal' for "
+                "4D data; unfold_domain='both' produces a 2D matrix and is not "
+                "valid for parafac2."
+            )
         
         if implementation == 'tensorly':
             
-            decomposition = par2(target_data, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, normalize_factors=normalize_factors, 
-                 tol=tol, absolute_tol=absolute_tol, nn_modes=nn_modes, random_state=random_state, verbose=verbose, return_errors=return_errors, n_iter_parafac=n_iter_parafac,)
+            decomposition_result = par2(
+                tensor_slices,
+                rank=rank,
+                n_iter_max=n_iter_max,
+                init=init,
+                svd=svd,
+                normalize_factors=normalize_factors,
+                tol=tol,
+                nn_modes=nn_modes,
+                random_state=random_state,
+                verbose=verbose,
+                return_errors=return_errors,
+                n_iter_parafac=n_iter_parafac,
+                linesearch=linesearch,
+            )
+
+            if return_errors:
+                decomposition, errors = decomposition_result
+            else:
+                decomposition = decomposition_result
+                errors = None
             
             # reconstruction = clip_values(tl.parafac2_tensor.parafac2_to_tensor(decomposition))
             reconstruction = tl.parafac2_tensor.parafac2_to_tensor(decomposition)
             
             
             if unfold_domain is not None:
-                
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, 
-                                               undo=True, original_shape=original_shape, )
+                reconstruction = self._refold_with_hyperdata(
+                    reconstruction, unfold_metadata
+                )
             
             if return_decomposition:
                 results = []
                 results.extend((decomposition, HyperData(reconstruction)))
+                if return_errors:
+                    results.append(errors)
                 return results
                 
             else:
@@ -6338,7 +11296,8 @@ class DenoisingMethods:
                            svd='truncated_svd', tol=1e-08, max_stagnation=20, 
                            return_errors=False, random_state=None, verbose=0, 
                            callback=None, implementation='tensorly', 
-                           return_decomposition=False, unfold_domain=None):
+                           return_decomposition=False, unfold_domain=None,
+                           unfold_method='row_major', working_dtype=None):
         """Randomised CP decomposition via sampled ALS
         
         Parameters
@@ -6387,6 +11346,10 @@ class DenoisingMethods:
         
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32`` to
+            reduce memory pressure. If None, keep the input dtype.
         
         Returns
         -------
@@ -6399,29 +11362,48 @@ class DenoisingMethods:
         """
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
         if unfold_domain is not None:
-            original_shape = tensor.shape
-            tensor = unfold_tensor(tensor, unfold_domain)
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
         
         # Conditional implementation
         if implementation == 'tensorly':
             # Randomised CP decomposition
-            factors, weights = rand_parafac(tensor, rank=rank, n_samples=n_samples, 
-                                           n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
-                                           max_stagnation=max_stagnation, return_errors=return_errors, 
-                                           random_state=random_state, verbose=verbose, callback=callback)
+            result = rand_parafac(
+                tensor,
+                rank=rank,
+                n_samples=n_samples,
+                n_iter_max=n_iter_max,
+                init=init,
+                svd=svd,
+                tol=tol,
+                max_stagnation=max_stagnation,
+                return_errors=return_errors,
+                random_state=random_state,
+                verbose=verbose,
+                callback=callback,
+            )
+            cp_tensor, errors = self._split_cp_result(result, return_errors)
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
         
         # Reconstruct the tensor from CP factors
-        reconstruction = tl.cp_to_tensor((factors, weights))
+        reconstruction = tl.cp_to_tensor(cp_tensor)
         
         # Re-fold the tensor if it was unfolded
         if unfold_domain is not None:
-            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, 
-                                           original_shape=original_shape)
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
         
         if return_decomposition:
-            results = [factors, weights, reconstruction]
+            weights, factors = cp_tensor
+            results = [weights, factors, reconstruction]
             if return_errors:
                 results.append(errors)
             return results
@@ -6431,7 +11413,7 @@ class DenoisingMethods:
 
     def parafac_power_iteration(self, tensor, rank, n_repeat=10, n_iteration=10, 
                                 verbose=0, implementation='tensorly', 
-                                return_decomposition=False, unfold_domain=None):
+                                return_decomposition=False, unfold_domain=None, unfold_method='row_major'):
         """CP Decomposition via Robust Tensor Power Iteration
         
         Parameters
@@ -6475,23 +11457,32 @@ class DenoisingMethods:
         """
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
         if unfold_domain is not None:
-            original_shape = tensor.shape
-            tensor = unfold_tensor(tensor, unfold_domain)
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
         
         # Conditional implementation
         if implementation == 'tensorly':
             # CP Decomposition via Robust Tensor Power Iteration
-            factors, weights = parafac_power_iter(tensor, rank=rank, n_repeat=n_repeat, n_iteration=n_iteration, verbose=verbose)
+            weights, factors = parafac_power_iter(
+                tensor,
+                rank=rank,
+                n_repeat=n_repeat,
+                n_iteration=n_iteration,
+                verbose=verbose,
+            )
             
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
         
         # Reconstruct the tensor from CP factors
-        reconstruction = tl.cp_to_tensor((factors, weights))
+        reconstruction = tl.cp_to_tensor((weights, factors))
         
         # Re-fold the tensor if it was unfolded
         if unfold_domain is not None:
-            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
         
         if return_decomposition:
             return weights, factors, reconstruction
@@ -6502,7 +11493,7 @@ class DenoisingMethods:
     def symmetric_parafac_power_iteration(self, tensor, rank, n_repeat=10, 
                                           n_iteration=10, verbose=False, 
                                           implementation='tensorly', 
-                                          return_decomposition=False, unfold_domain=None):
+                                          return_decomposition=False, unfold_domain=None, unfold_method='row_major'):
         """Symmetric CP Decomposition via Robust Symmetric Tensor Power Iteration
         
         Parameters
@@ -6545,28 +11536,158 @@ class DenoisingMethods:
         """
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
         if unfold_domain is not None:
-            original_shape = tensor.shape
-            tensor = unfold_tensor(tensor, unfold_domain)
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
         
         # Conditional implementation
         if implementation == 'tensorly':
             # Symmetric CP Decomposition via Robust Symmetric Tensor Power Iteration
-            factors, weights = sym_parafac_power_iter(tensor, rank=rank, n_repeat=n_repeat,
-                                                     n_iteration=n_iteration, verbose=verbose)
+            weights, factor = sym_parafac_power_iter(
+                tensor,
+                rank=rank,
+                n_repeat=n_repeat,
+                n_iteration=n_iteration,
+                verbose=verbose,
+            )
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
         
-        # Reconstruct the tensor from CP factors
-        reconstruction = tl.cp_to_tensor((factors, weights))
+        # A symmetric CP decomposition uses the same factor for every mode.
+        factors = [factor] * np.ndim(tensor)
+        reconstruction = tl.cp_to_tensor((weights, factors))
         
         # Re-fold the tensor if it was unfolded
         if unfold_domain is not None:
-            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
         
         if return_decomposition:
             return weights, factor, reconstruction
         else:
             return reconstruction
+
+
+    def robust_pca(self, tensor, mask=None, tol=1e-06, reg_E=1.0,
+                   reg_J=1.0, mu_init=0.0001, mu_max=1e10,
+                   learning_rate=1.1, n_iter_max=100, return_errors=False,
+                   verbose=1, implementation='tensorly',
+                   return_decomposition=False, unfold_domain=None,
+                   unfold_method='row_major', working_dtype=None):
+        """
+        Denoise a tensor by separating low-rank signal and sparse corruption.
+
+        This wraps :func:`tensorly.decomposition.robust_pca`. The low-rank
+        component is returned as the denoised reconstruction by default. Use
+        ``return_decomposition=True`` to also obtain the sparse component and,
+        when requested, the per-iteration reconstruction errors.
+
+        Parameters
+        ----------
+        tensor : ndarray
+            Input tensor.
+        mask : ndarray, optional
+            Boolean array with the same shape as ``tensor``. It should be zero
+            where values are missing and one elsewhere.
+        tol : float, optional
+            Convergence tolerance.
+        reg_E : float, optional
+            Regularization strength for the sparse component.
+        reg_J : float, optional
+            Regularization strength for the low-rank component.
+        mu_init : float, optional
+            Initial augmented-Lagrangian penalty.
+        mu_max : float, optional
+            Maximum augmented-Lagrangian penalty.
+        learning_rate : float, optional
+            Multiplicative increase applied to the penalty each iteration.
+        n_iter_max : int, optional
+            Maximum number of iterations.
+        return_errors : bool, optional
+            If True, include reconstruction errors when returning the
+            decomposition.
+        verbose : int, optional
+            TensorLy verbosity level.
+        implementation : {'tensorly'}, optional
+            Numerical implementation to use.
+        return_decomposition : bool, optional
+            If True, return ``[low_rank, sparse_component]`` and append errors
+            when ``return_errors=True``.
+        unfold_domain : {'real', 'reciprocal', 'both'} or None, optional
+            Unfold a 4D tensor before decomposition and refold both components
+            afterward.
+        unfold_method : str, optional
+            Traversal method used when unfolding.
+        working_dtype : dtype or None, optional
+            Optional dtype used during decomposition.
+
+        Returns
+        -------
+        ndarray or list
+            Low-rank denoised tensor, or decomposition details when
+            ``return_decomposition=True``.
+        """
+        if implementation != 'tensorly':
+            raise ValueError(f"Unknown implementation: {implementation}")
+
+        if mask is not None:
+            mask = np.asarray(mask)
+            if mask.shape != np.shape(tensor):
+                raise ValueError(
+                    "mask must have the same shape as the input tensor; "
+                    f"got {mask.shape} and {np.shape(tensor)}."
+                )
+
+        if unfold_domain is not None:
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+            if mask is not None:
+                mask, _ = self._unfold_with_hyperdata(
+                    mask, unfold_domain, unfold_method
+                )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
+
+        result = robust_tensor_pca(
+            tensor,
+            mask=mask,
+            tol=tol,
+            reg_E=reg_E,
+            reg_J=reg_J,
+            mu_init=mu_init,
+            mu_max=mu_max,
+            learning_rate=learning_rate,
+            n_iter_max=n_iter_max,
+            return_errors=return_errors,
+            verbose=verbose,
+        )
+
+        if return_errors:
+            low_rank, sparse_component, errors = result
+        else:
+            low_rank, sparse_component = result
+            errors = None
+
+        if unfold_metadata is not None:
+            low_rank = self._refold_with_hyperdata(
+                low_rank, unfold_metadata
+            )
+            sparse_component = self._refold_with_hyperdata(
+                sparse_component, unfold_metadata
+            )
+
+        if return_decomposition:
+            results = [low_rank, sparse_component]
+            if return_errors:
+                results.append(errors)
+            return results
+
+        return low_rank
 
 
 
@@ -6575,7 +11696,9 @@ class DenoisingMethods:
                     sparsity_coefficients=None, fixed_modes=None, 
                     nn_modes='all', exact=False, normalize_factors=False, 
                     verbose=False, return_errors=False, cvg_criterion='abs_rec_error', 
-                    implementation='tensorly', return_decomposition=False, unfold_domain=None):
+                    implementation='tensorly', return_decomposition=False,
+                    unfold_domain=None, unfold_method='row_major',
+                    working_dtype=None):
         """Non-negative CP decomposition via HALS
         
         Uses Hierarchical ALS (Alternating Least Squares) which updates each factor 
@@ -6643,6 +11766,10 @@ class DenoisingMethods:
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor 
                                         and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32`` to
+            reduce memory pressure. If None, keep the input dtype.
         
         Returns
         -------
@@ -6660,29 +11787,51 @@ class DenoisingMethods:
         """
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
         if unfold_domain is not None:
-            original_shape = tensor.shape
-            tensor = unfold_tensor(tensor, unfold_domain)
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
         
         # Conditional implementation
         if implementation == 'tensorly':
             # Non-negative CP decomposition via HALS
-            # TODO modify the error things
-            factors, weights = nn_parafac_hals(tensor, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
-                                              random_state=random_state, sparsity_coefficients=sparsity_coefficients,
-                                              fixed_modes=fixed_modes, nn_modes=nn_modes, exact=exact, normalize_factors=normalize_factors,
-                                              verbose=verbose, return_errors=return_errors, cvg_criterion=cvg_criterion)
+            result = nn_parafac_hals(
+                tensor,
+                rank=rank,
+                n_iter_max=n_iter_max,
+                init=init,
+                svd=svd,
+                tol=tol,
+                random_state=random_state,
+                sparsity_coefficients=sparsity_coefficients,
+                fixed_modes=fixed_modes,
+                nn_modes=nn_modes,
+                exact=exact,
+                normalize_factors=normalize_factors,
+                verbose=verbose,
+                return_errors=return_errors,
+                cvg_criterion=cvg_criterion,
+            )
+            cp_tensor, errors = self._split_cp_result(result, return_errors)
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
         
         # Reconstruct the tensor from CP factors
-        reconstruction = tl.cp_to_tensor((factors, weights))
+        reconstruction = tl.cp_to_tensor(cp_tensor)
         
         # Re-fold the tensor if it was unfolded
         if unfold_domain is not None:
-            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
         
         if return_decomposition:
-            results = [factors, reconstruction]
+            weights, factors = cp_tensor
+            results = [weights, factors, reconstruction]
             if return_errors:
                 results.append(errors)
             return results
@@ -6693,7 +11842,9 @@ class DenoisingMethods:
                              svd='truncated_svd', tol=1e-06, random_state=None,
                              verbose=0, normalize_factors=False, return_errors=False, 
                              mask=None, cvg_criterion='abs_rec_error', fixed_modes=None, 
-                             implementation='tensorly', return_decomposition=False, unfold_domain=None):
+                             implementation='tensorly', return_decomposition=False,
+                             unfold_domain=None, unfold_method='row_major',
+                             working_dtype=None):
         """Non-negative CP decomposition using multiplicative updates
         
         Parameters
@@ -6745,6 +11896,10 @@ class DenoisingMethods:
         
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32`` to
+            reduce memory pressure. If None, keep the input dtype.
         
         Returns
         -------
@@ -6760,27 +11915,49 @@ class DenoisingMethods:
         """
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
         if unfold_domain is not None:
-            original_shape = tensor.shape
-            tensor = unfold_tensor(tensor, unfold_domain)
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
         
         # Conditional implementation
         if implementation == 'tensorly':
             # Non-negative CP decomposition using multiplicative updates
-            factors , weights = nn_parafac(tensor, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
-                                         random_state=random_state, verbose=verbose, normalize_factors=normalize_factors,
-                                         return_errors=return_errors, mask=mask, cvg_criterion=cvg_criterion, fixed_modes=fixed_modes)
+            result = nn_parafac(
+                tensor,
+                rank=rank,
+                n_iter_max=n_iter_max,
+                init=init,
+                svd=svd,
+                tol=tol,
+                random_state=random_state,
+                verbose=verbose,
+                normalize_factors=normalize_factors,
+                return_errors=return_errors,
+                mask=mask,
+                cvg_criterion=cvg_criterion,
+                fixed_modes=fixed_modes,
+            )
+            cp_tensor, errors = self._split_cp_result(result, return_errors)
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
         
         # Reconstruct the tensor from CP factors
-        reconstruction = tl.cp_to_tensor((factors, weights))
+        reconstruction = tl.cp_to_tensor(cp_tensor)
         
         # Re-fold the tensor if it was unfolded
         if unfold_domain is not None:
-            reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
         
         if return_decomposition:
-            results = [factors, reconstruction]
+            weights, factors = cp_tensor
+            results = [weights, factors, reconstruction]
             if return_errors:
                 results.append(errors)
             return results
@@ -6788,136 +11965,303 @@ class DenoisingMethods:
             return reconstruction
 
 
-    def cp_constrained(self, target_data, rank=5, n_iter_max=100, n_iter_max_inner=10, 
-                       implementation='tensorly', return_decomposition=False, 
-                       unfold_domain=None,):
+    def cp_constrained(self, tensor, rank, n_iter_max=100, n_iter_max_inner=10,
+                       init='svd', svd='truncated_svd', tol_outer=1e-08,
+                       tol_inner=1e-06, random_state=None, verbose=0,
+                       return_errors=False, cvg_criterion='abs_rec_error',
+                       fixed_modes=None, non_negative=None, l1_reg=None,
+                       l2_reg=None, l2_square_reg=None, unimodality=None,
+                       normalize=None, simplex=None, normalized_sparsity=None,
+                       soft_sparsity=None, smoothness=None, monotonicity=None,
+                       hard_sparsity=None, implementation='tensorly',
+                       return_decomposition=False, unfold_domain=None,
+                       unfold_method='row_major', working_dtype=None):
         """
-        Apply constrained PARAFAC decomposition to input tensor.
+        Apply constrained PARAFAC decomposition to an input tensor.
 
         Parameters
         ----------
+        tensor : ndarray
+            Input tensor to decompose.
         rank : int
-            Number of components for the decomposition.
+            Number of components.
+        n_iter_max : int
+            Maximum number of outer iterations.
+        n_iter_max_inner : int
+            Maximum number of inner ADMM iterations.
+        init : {'svd', 'random', CPTensor}, optional
+            TensorLy initialization method.
+        svd : str, optional
+            SVD function used by TensorLy.
+        tol_outer : float, optional
+            Relative reconstruction-error tolerance for the outer loop.
+        tol_inner : float, optional
+            Absolute reconstruction-error tolerance for inner ADMM updates.
         return_decomposition : bool, optional
-            If True, return the decomposition weights and factors instead of the reconstructed tensor.
-        **kwargs
-            Additional arguments for the constrained_parafac function.
+            If True, return ``[weights, factors, reconstruction]`` and append
+            errors when ``return_errors=True``.
+        unfold_domain : any, optional
+            Apply unfolding before decomposition.
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32``.
 
         Returns
         -------
-        results : list
-            List of either reconstructed tensors or decomposition results (weights and factors) for each 3D tensor.
+        ndarray or list
+            Reconstructed tensor, or decomposition details when
+            ``return_decomposition=True``.
 
         Examples
         --------
         >>> my4Dobject = HyperData(data)
-        >>> reconstructed_data = my4Dobject.denoiser.apply_deonising(advanced_method='cp_constrained', unfold_domain='real', 
-                                                                     rank=3, n_iter_max=50, tol_outer=1e-6)
+        >>> reconstructed_data = my4Dobject.denoise(method='cp_constrained',
+                                                    unfold_domain='real',
+                                                    rank=3, n_iter_max=50)
         """
         
         # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
-        #TODO consider that this will be in all decomposition functions, so probably add this to HyperData...
         if unfold_domain is not None:
-        
-            original_shape = target_data.shape
-        
-            target_data = unfold_tensor(target_data, unfold_domain, )
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
         
         if implementation == 'tensorly':
+            result = constrained_parafac(
+                tensor,
+                rank=rank,
+                n_iter_max=n_iter_max,
+                n_iter_max_inner=n_iter_max_inner,
+                init=init,
+                svd=svd,
+                tol_outer=tol_outer,
+                tol_inner=tol_inner,
+                random_state=random_state,
+                verbose=verbose,
+                return_errors=return_errors,
+                cvg_criterion=cvg_criterion,
+                fixed_modes=fixed_modes,
+                non_negative=non_negative,
+                l1_reg=l1_reg,
+                l2_reg=l2_reg,
+                l2_square_reg=l2_square_reg,
+                unimodality=unimodality,
+                normalize=normalize,
+                simplex=simplex,
+                normalized_sparsity=normalized_sparsity,
+                soft_sparsity=soft_sparsity,
+                smoothness=smoothness,
+                monotonicity=monotonicity,
+                hard_sparsity=hard_sparsity,
+            )
+            cp_tensor, errors = self._split_cp_result(result, return_errors)
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
             
-            decomposition = constrained_parafac(target_data, rank=rank, 
-                                                n_iter_max=n_iter_max, n_iter_max_inner=n_iter_max_inner,)
+        reconstruction = tl.cp_to_tensor(cp_tensor)
             
-            reconstruction = tl.cp_to_tensor(decomposition)
+        if unfold_domain is not None:
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
             
-            if unfold_domain is not None:
-                
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, 
-                                               undo=True, original_shape=original_shape, )
-            
-            if return_decomposition:
-                results = []
-                results.extend((decomposition, HyperData(reconstruction)))
-                return results
-                
-            else:
-                return reconstruction
+        if return_decomposition:
+            weights, factors = cp_tensor
+            results = [weights, factors, reconstruction]
+            if return_errors:
+                results.append(errors)
+            return results
 
-          
+        return reconstruction
+
     
-    # def tensor_ring(self, input_tensor, rank, mode=0, svd='truncated_svd', implementation='tensorly', 
-    #                 return_decomposition=False, unfold_domain=None, verbose=False, ):
-    #     """
-    #     Tensor Ring decomposition via recursive SVD
-    
-    #     Decomposes input_tensor into a sequence of order-3 tensors (factors).
-    
-    #     Parameters
-    #     ----------
-    #     input_tensor : tensorly.tensor
-    #         The input tensor to decompose.
+    def tensor_ring_als(self, tensor, rank, ls_solve='lstsq',
+                        n_iter_max=100, tol=1e-06, random_state=None,
+                        verbose=False, callback=None,
+                        implementation='tensorly', return_decomposition=False,
+                        unfold_domain=None, unfold_method='row_major',
+                        working_dtype=None):
+        """
+        Denoise a tensor with Tensor-Ring alternating least squares.
+
+        This wraps :func:`tensorly.decomposition.tensor_ring_als` and returns
+        the dense Tensor-Ring reconstruction by default.
+
+        Parameters
+        ----------
+        tensor : ndarray
+            Input tensor to decompose.
+        rank : int or sequence of int
+            Tensor-Ring rank. An integer applies the same rank to every core.
+        ls_solve : {'lstsq', 'normal_eq'}, optional
+            Least-squares solver. ``'lstsq'`` is more numerically stable;
+            ``'normal_eq'`` can be faster but less accurate.
+        n_iter_max : int, optional
+            Maximum number of ALS iterations.
+        tol : float, optional
+            Stop when the relative reconstruction-error change is below this
+            value.
+        random_state : None, int, or numpy.random.RandomState, optional
+            Random state used to initialize the Tensor-Ring cores.
+        verbose : bool, optional
+            If True, print TensorLy iteration information.
+        callback : callable or None, optional
+            TensorLy callback receiving the current ``TRTensor`` and relative
+            reconstruction error after each iteration.
+        implementation : {'tensorly'}, optional
+            Numerical implementation to use.
+        return_decomposition : bool, optional
+            If True, return ``(tr_decomposition, reconstruction)``.
+        unfold_domain : {'real', 'reciprocal', 'both'} or None, optional
+            Unfold a 4D tensor before decomposition and refold the dense
+            reconstruction afterward.
+        unfold_method : str, optional
+            Traversal method used when unfolding.
+        working_dtype : dtype or None, optional
+            Optional dtype used during decomposition.
+
+        Returns
+        -------
+        ndarray or tuple
+            Dense Tensor-Ring reconstruction, or the ``TRTensor`` and dense
+            reconstruction when ``return_decomposition=True``.
+        """
+        if implementation != 'tensorly':
+            raise ValueError(f"Unknown implementation: {implementation}")
+
+        if unfold_domain is not None:
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
+
+        tr_decomposition = tr_als(
+            tensor,
+            rank=rank,
+            ls_solve=ls_solve,
+            n_iter_max=n_iter_max,
+            tol=tol,
+            random_state=random_state,
+            verbose=verbose,
+            callback=callback,
+        )
+        reconstruction = tl.tr_to_tensor(tr_decomposition)
+
+        if unfold_metadata is not None:
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
+
+        if return_decomposition:
+            return tr_decomposition, reconstruction
+        return reconstruction
+
+
+    def tensor_ring_als_sampled(
+            self, tensor, rank, n_samples, n_iter_max=100, tol=1e-06,
+            uniform_sampling=False, randomized_error=False,
+            random_state=None, verbose=False, callback=None,
+            implementation='tensorly', return_decomposition=False,
+            unfold_domain=None, unfold_method='row_major',
+            working_dtype=None):
+        """
+        Denoise a tensor with sampled Tensor-Ring alternating least squares.
+
+        Sampling reduces the least-squares problem size and can make Tensor-Ring
+        decomposition faster at the cost of approximation accuracy.
+
+        Parameters
+        ----------
+        tensor : ndarray
+            Input tensor to decompose.
+        rank : int or sequence of int
+            Tensor-Ring rank. An integer applies the same rank to every core.
+        n_samples : int or sequence of int
+            Rows sampled while updating each core. An integer applies the same
+            sample count to every mode.
+        n_iter_max : int, optional
+            Maximum number of sampled ALS iterations.
+        tol : float, optional
+            Stop when the relative reconstruction-error change is below this
+            value.
+        uniform_sampling : bool, optional
+            Use uniform sampling instead of leverage-score sampling.
+        randomized_error : bool, optional
+            Estimate the residual using random sampling instead of computing
+            the exact residual after each iteration.
+        random_state : None, int, or numpy.random.RandomState, optional
+            Random state used for initialization and sampling.
+        verbose : bool, optional
+            If True, print TensorLy iteration information.
+        callback : callable or None, optional
+            TensorLy callback receiving the current ``TRTensor`` and relative
+            reconstruction error after each iteration.
+        implementation : {'tensorly'}, optional
+            Numerical implementation to use.
+        return_decomposition : bool, optional
+            If True, return ``(tr_decomposition, reconstruction)``.
+        unfold_domain : {'real', 'reciprocal', 'both'} or None, optional
+            Unfold a 4D tensor before decomposition and refold the dense
+            reconstruction afterward.
+        unfold_method : str, optional
+            Traversal method used when unfolding.
+        working_dtype : dtype or None, optional
+            Optional dtype used during decomposition.
+
+        Returns
+        -------
+        ndarray or tuple
+            Dense Tensor-Ring reconstruction, or the ``TRTensor`` and dense
+            reconstruction when ``return_decomposition=True``.
+        """
+        if implementation != 'tensorly':
+            raise ValueError(f"Unknown implementation: {implementation}")
+
+        if unfold_domain is not None:
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
+
+        tr_decomposition = tr_als_sampled(
+            tensor,
+            rank=rank,
+            n_samples=n_samples,
+            n_iter_max=n_iter_max,
+            tol=tol,
+            uniform_sampling=uniform_sampling,
+            randomized_error=randomized_error,
+            random_state=random_state,
+            verbose=verbose,
+            callback=callback,
+        )
+        reconstruction = tl.tr_to_tensor(tr_decomposition)
+
+        if unfold_metadata is not None:
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
+
+        if return_decomposition:
+            return tr_decomposition, reconstruction
+        return reconstruction
         
-    #     rank : Union[int, List[int]]
-    #         Maximum allowable TR rank of the factors. If int, then this is the same for all the factors.
-    #         If list, then rank[k] is the rank of the kth factor.
-    
-    #     mode : int, optional, default is 0
-    #         Index of the first factor to compute.
-    
-    #     svd : str, optional, default is 'truncated_svd'
-    #         Function to use to compute the SVD. Acceptable values are in tensorly.SVD_FUNS.
-    
-    #     verbose : boolean, optional
-    #         Level of verbosity.
-    
-    #     return_decomposition : boolean, optional
-    #         Whether to return the decomposition along with the reconstruction.
-    
-    #     unfold_domain : any, optional
-    #         Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
-    
-    #     Returns
-    #     -------
-    #     factors : TR factors
-    #         Order-3 tensors of the TR decomposition.
-    
-    #     Examples
-    #     --------
-    #     Decompose a tensor into Tensor Ring factors
-    #     >>> tr_factors = tensor_ring(tensor, rank=5)
-    #     >>> tr_factors.shape
-    #     (5, 3, 3)
-    
-    #     Notes
-    #     -----
-    #     Tensor Ring decomposition decomposes the input tensor into a sequence of order-3 tensors
-    #     (factors) by recursively applying SVD.
-    #     """
-    #     # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
-    #     if unfold_domain is not None:
-    #         original_shape = input_tensor.shape
-    #         input_tensor = unfold_tensor(input_tensor, unfold_domain)
-    
-    #     # Tensor Ring decomposition
-    #     factors = t_ring(input_tensor, rank=rank, mode=mode, svd=svd, verbose=verbose)
-    
-    #     # Reconstruct the tensor from TR factors
-    #     #TODO: how to get original back?
-    #     reconstruction = tl.tt_matrix.tt_matrix_to_tensor(factors)
-        
-    #     # Re-fold the tensor if it was unfolded
-    #     if unfold_domain is not None:
-    #         reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
-    
-    #     if return_decomposition:
-    #         results = []
-    #         results.extend((factors, HyperData(reconstruction)))
-    #         return results
-    #     else:
-    #         return reconstruction
-        
-    def tensor_train_matrix(self, tensor, rank='same', svd='truncated_svd', implementation='tensorly',
-                            verbose=False, return_decomposition=False, unfold_domain=None):
+    def tensor_train_matrix(self, tensor, rank, svd='truncated_svd', verbose=False,
+                            implementation='tensorly', return_decomposition=False,
+                            unfold_domain=None, unfold_method='row_major',
+                            working_dtype=None):
         """Decompose a tensor into a matrix in tt-format
     
         Decomposes the input tensor into a matrix in Tensor Train (TT) format.
@@ -6926,7 +12270,7 @@ class DenoisingMethods:
         ----------
         tensor : tensorized matrix
     
-        rank : 'same', float or int tuple, optional
+        rank : 'same', float or int tuple
             If 'same', creates a decomposition with the same number of parameters as tensor.
             If float, creates a decomposition with rank x the number of parameters of tensor.
             Otherwise, the actual rank to be used, e.g., (1, rank_2, ..., 1) of size tensor.ndim//2.
@@ -6943,6 +12287,9 @@ class DenoisingMethods:
     
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32``.
     
         Returns
         -------
@@ -6955,34 +12302,41 @@ class DenoisingMethods:
         in TT-format by recursively applying SVD.
         """
         
-        if implementation == 'tensorly':
+        if implementation != 'tensorly':
+            raise ValueError(f"Unknown implementation: {implementation}")
+
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
     
-            # Apply unfolding 
-            if unfold_domain is not None:
-                original_shape = tensor.shape
-                tensor = unfold_tensor(tensor, unfold_domain)
+        # Tensor Train matrix decomposition
+        tt_matrix = tt_mat(tensor, rank=rank, svd=svd, verbose=verbose)
+    
+        # Reconstruct the tensorized matrix from TT-Matrix factors.
+        reconstruction = tt_matrix_to_tensor(tt_matrix)
         
-            # Tensor Train matrix decomposition
-            tt_matrix = tt_mat(tensor, rank=rank, svd=svd, verbose=verbose)
-        
-            # Reconstruct the matrix from TT decomposition
-            reconstruction = tl.tt_matrix_to_tensor(tt_matrix)
-            
-            # Re-fold the tensor if it was unfolded
-            if unfold_domain is not None:
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
-        
-            if return_decomposition:
-                results = []
-                results.extend((tt_matrix, HyperData(reconstruction)))
-                return results
-            else:
-                return reconstruction
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
+    
+        if return_decomposition:
+            return tt_matrix, HyperData(reconstruction)
+        else:
+            return reconstruction
             
 
     def tensor_train(self, input_tensor, rank, svd='truncated_svd', verbose=False, 
-                     return_decomposition=False, unfold_domain=None,
-                     implementation = 'tensorly',):
+                     return_decomposition=False, unfold_domain=None, unfold_method='row_major',
+                     implementation='tensorly', working_dtype=None):
         """TT decomposition via recursive SVD
     
         Decomposes input_tensor into a sequence of order-3 tensors (factors) – also known as Tensor-Train decomposition.
@@ -7007,6 +12361,9 @@ class DenoisingMethods:
     
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32``.
     
         Returns
         -------
@@ -7019,36 +12376,44 @@ class DenoisingMethods:
         (factors) by recursively applying SVD.
         """
         
-        if implementation == 'tensorly':
-            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
-            if unfold_domain is not None:
-                original_shape = input_tensor.shape
-                input_tensor = unfold_tensor(input_tensor, unfold_domain)
+        if implementation != 'tensorly':
+            raise ValueError(f"Unknown implementation: {implementation}")
+
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            input_tensor, unfold_metadata = self._unfold_with_hyperdata(
+                input_tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            input_tensor = np.asarray(input_tensor, dtype=working_dtype)
+    
+        # Tensor-Train decomposition
+        factors = tt(input_tensor, rank=rank, svd=svd, verbose=verbose)
+    
+        # Reconstruct the tensor from TT factors.
+        reconstruction = tt_to_tensor(factors)
         
-            # Tensor-Train decomposition
-            factors = tt(input_tensor, rank=rank, svd=svd, verbose=verbose)
-        
-            # Reconstruct the tensor from TT factors
-            reconstruction = tl.tt_matrix_to_tensor(factors)
-            
-            # Re-fold the tensor if it was unfolded
-            if unfold_domain is not None:
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
-        
-            if return_decomposition:
-                results = []
-                results.extend((factors, HyperData(reconstruction)))
-                return results
-            else:
-                return reconstruction
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
+    
+        if return_decomposition:
+            return factors, HyperData(reconstruction)
+        else:
+            return reconstruction
     
     def non_negative_tucker_hals(self, tensor, rank, n_iter_max=100, init='svd', 
                                  svd='truncated_svd', tol=1e-08, sparsity_coefficients=None, 
                                  core_sparsity_coefficient=None, fixed_modes=None, 
                                  random_state=None, verbose=False, normalize_factors=False, 
                                  return_errors=False, exact=False, algorithm='fista', 
-                                 return_decomposition=False, unfold_domain=None,
-                                 implementation = 'tensorly',):
+                                 return_decomposition=False, unfold_domain=None, unfold_method='row_major',
+                                 implementation='tensorly', working_dtype=None):
         """Non-negative Tucker decomposition with HALS
         
         Uses HALS to update each factor column-wise and uses FISTA or active set algorithm to update the core.
@@ -7106,6 +12471,9 @@ class DenoisingMethods:
         
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32``.
         
         Returns
         -------
@@ -7121,40 +12489,63 @@ class DenoisingMethods:
         ensuring all elements are non-negative.
         """
         
-        if implementation == 'tensorly':
+        if implementation != 'tensorly':
+            raise ValueError(f"Unknown implementation: {implementation}")
+
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
         
-            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
-            if unfold_domain is not None:
-                original_shape = tensor.shape
-                tensor = unfold_tensor(tensor, unfold_domain)
-            
-            # Non-negative Tucker decomposition with HALS
-            factors, core, errors = nnth(tensor, rank=rank, n_iter_max=n_iter_max, init=init, svd=svd, tol=tol,
-                                            sparsity_coefficients=sparsity_coefficients, core_sparsity_coefficient=core_sparsity_coefficient,
-                                            fixed_modes=fixed_modes, random_state=random_state, verbose=verbose,
-                                            normalize_factors=normalize_factors, return_errors=return_errors, exact=exact,
-                                            algorithm=algorithm)
-            
-            # Reconstruct the tensor from Tucker factors and core
-            reconstruction = tl.tucker_to_tensor((core, factors))
-            
-            # Re-fold the tensor if it was unfolded
-            if unfold_domain is not None:
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
-            
-            if return_decomposition:
-                results = [factors, core, reconstruction]
-                if return_errors:
-                    results.append(errors)
-                return results
-            else:
-                return reconstruction
+        # Non-negative Tucker decomposition with HALS
+        result = nnth(
+            tensor,
+            rank=rank,
+            n_iter_max=n_iter_max,
+            init=init,
+            svd=svd,
+            tol=tol,
+            sparsity_coefficients=sparsity_coefficients,
+            core_sparsity_coefficient=core_sparsity_coefficient,
+            fixed_modes=fixed_modes,
+            random_state=random_state,
+            verbose=verbose,
+            normalize_factors=normalize_factors,
+            return_errors=return_errors,
+            exact=exact,
+            algorithm=algorithm,
+        )
+        tucker_tensor, errors = self._split_tucker_result(result, return_errors)
+        core, factors = tucker_tensor
+        
+        # Reconstruct the tensor from Tucker factors and core
+        reconstruction = tl.tucker_tensor.tucker_to_tensor((core, factors))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
+        
+        if return_decomposition:
+            results = [core, factors, reconstruction]
+            if return_errors:
+                results.append(errors)
+            return results
+        else:
+            return reconstruction
     
     
     def non_negative_tucker(self, tensor, rank, n_iter_max=10, init='svd', tol=0.0001, 
                             random_state=None, verbose=False, return_errors=False, 
-                            normalize_factors=False, return_decomposition=False, unfold_domain=None,
-                            implementation = 'tensorly',):
+                            normalize_factors=False, return_decomposition=False, unfold_domain=None, unfold_method='row_major',
+                            implementation='tensorly', working_dtype=None):
         """Non-negative Tucker decomposition
         
         Iterative multiplicative update.
@@ -7193,6 +12584,9 @@ class DenoisingMethods:
         
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32``.
         
         Returns
         -------
@@ -7208,37 +12602,58 @@ class DenoisingMethods:
         ensuring all elements are non-negative.
         """
         
-        if implementation == 'tensorly':
-    
-            # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
-            if unfold_domain is not None:
-                original_shape = tensor.shape
-                tensor = unfold_tensor(tensor, unfold_domain)
-            
-            # Non-negative Tucker decomposition
-            core, factors, errors = nnt(tensor, rank=rank, n_iter_max=n_iter_max, init=init, tol=tol,
-                                                                               random_state=random_state, verbose=verbose, return_errors=return_errors,
-                                                                               normalize_factors=normalize_factors)
-            
-            # Reconstruct the tensor from Tucker factors and core
-            reconstruction = tl.tucker_to_tensor((core, factors))
-            
-            # Re-fold the tensor if it was unfolded
-            if unfold_domain is not None:
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
-            
-            if return_decomposition:
-                results = [core, factors, reconstruction]
-                if return_errors:
-                    results.append(errors)
-                return results
-            else:
-                return reconstruction
+        if implementation != 'tensorly':
+            raise ValueError(f"Unknown implementation: {implementation}")
+
+        # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
+        if unfold_domain is not None:
+            tensor, unfold_metadata = self._unfold_with_hyperdata(
+                tensor, unfold_domain, unfold_method
+            )
+        else:
+            unfold_metadata = None
+
+        if working_dtype is not None:
+            tensor = np.asarray(tensor, dtype=working_dtype)
+        
+        # Non-negative Tucker decomposition
+        result = nnt(
+            tensor,
+            rank=rank,
+            n_iter_max=n_iter_max,
+            init=init,
+            tol=tol,
+            random_state=random_state,
+            verbose=verbose,
+            return_errors=return_errors,
+            normalize_factors=normalize_factors,
+        )
+        tucker_tensor, errors = self._split_tucker_result(result, return_errors)
+        core, factors = tucker_tensor
+        
+        # Reconstruct the tensor from Tucker factors and core
+        reconstruction = tl.tucker_tensor.tucker_to_tensor((core, factors))
+        
+        # Re-fold the tensor if it was unfolded
+        if unfold_domain is not None:
+            reconstruction = self._refold_with_hyperdata(
+                reconstruction, unfold_metadata
+            )
+        
+        if return_decomposition:
+            results = [core, factors, reconstruction]
+            if return_errors:
+                results.append(errors)
+            return results
+        else:
+            return reconstruction
 
     def partial_tucker(self, tensor, rank, modes=None, n_iter_max=100, 
                        init='svd', tol=0.0001, svd='truncated_svd', random_state=None, 
-                       erbose=False, mask=None, svd_mask_repeats=5, 
-                       return_decomposition=False, unfold_domain=None, implementation='tensorly'):
+                       verbose=False, mask=None, svd_mask_repeats=5, 
+                       return_decomposition=False, unfold_domain=None,
+                       unfold_method='row_major', implementation='tensorly',
+                       working_dtype=None):
         """Partial Tucker decomposition via Higher Order Orthogonal Iteration (HOI)
         
         Decomposes tensor into a Tucker decomposition exclusively along the provided modes.
@@ -7284,6 +12699,9 @@ class DenoisingMethods:
         
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
+
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32``.
         
         Returns
         -------
@@ -7303,30 +12721,56 @@ class DenoisingMethods:
             
             # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
             if unfold_domain is not None:
-                original_shape = tensor.shape
-                tensor = unfold_tensor(tensor, unfold_domain)
+                tensor, unfold_metadata = self._unfold_with_hyperdata(
+                    tensor, unfold_domain, unfold_method
+                )
+            else:
+                unfold_metadata = None
+
+            if working_dtype is not None:
+                tensor = np.asarray(tensor, dtype=working_dtype)
             
             # Partial Tucker decomposition
-            core, factors = partial_tuck(tensor, rank=rank, modes=modes, n_iter_max=n_iter_max, init=init, tol=tol,
-                                                                  svd=svd, random_state=random_state, verbose=verbose, mask=mask,
-                                                                  svd_mask_repeats=svd_mask_repeats)
+            result = partial_tuck(
+                tensor,
+                rank=rank,
+                modes=modes,
+                n_iter_max=n_iter_max,
+                init=init,
+                tol=tol,
+                svd=svd,
+                random_state=random_state,
+                verbose=verbose,
+                mask=mask,
+                svd_mask_repeats=svd_mask_repeats,
+            )
+            tucker_tensor, _ = self._split_tucker_result(
+                result,
+                return_errors=True,
+            )
+            core, factors = tucker_tensor
             
             # Reconstruct the tensor from Tucker factors and core
             reconstruction = tl.tucker_tensor.tucker_to_tensor((core, factors))
             
             # Re-fold the tensor if it was unfolded
             if unfold_domain is not None:
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+                reconstruction = self._refold_with_hyperdata(
+                    reconstruction, unfold_metadata
+                )
             
             if return_decomposition:
                 return core, factors, reconstruction
             else:
                 return reconstruction
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
 
     def tucker(self, tensor, rank, fixed_factors=None, n_iter_max=100, init='svd', 
                return_errors=False, svd='truncated_svd', tol=0.0001, random_state=None, 
-               mask=None, verbose=False, return_decomposition=False, unfold_domain=None,
-               implementation='tensorly',):
+               mask=None, verbose=False, return_decomposition=False,
+               unfold_domain=None, unfold_method='row_major',
+               implementation='tensorly', working_dtype=None):
         
         """Tucker decomposition via Higher Order Orthogonal Iteration (HOI)
         
@@ -7374,6 +12818,9 @@ class DenoisingMethods:
         unfold_domain : any, optional
             Apply unfolding if desired (reduces dimensionality of input tensor and computation time).
             
+        working_dtype : dtype or None
+            Optional dtype used during decomposition, e.g. ``np.float32``.
+
         implementation : string, optional
             'tensorly' to use Tensorly package implementation or 
             'zhang' to use that in Zhang et al. (2020), see 'Notes' below.
@@ -7401,20 +12848,43 @@ class DenoisingMethods:
             
             # Apply unfolding if desired (this reduces dimensionality of input tensor and computation time)
             if unfold_domain is not None:
-                original_shape = tensor.shape
-                tensor = unfold_tensor(tensor, unfold_domain)
+                tensor, unfold_metadata = self._unfold_with_hyperdata(
+                    tensor, unfold_domain, unfold_method
+                )
+            else:
+                unfold_metadata = None
+
+            if working_dtype is not None:
+                tensor = np.asarray(tensor, dtype=working_dtype)
             
             # Tucker decomposition
-            core, factors, errors = tuck(tensor, rank=rank, fixed_factors=fixed_factors, n_iter_max=n_iter_max, init=init,
-                                                                  return_errors=return_errors, svd=svd, tol=tol, random_state=random_state,
-                                                                  mask=mask, verbose=verbose)
+            result = tuck(
+                tensor,
+                rank=rank,
+                fixed_factors=fixed_factors,
+                n_iter_max=n_iter_max,
+                init=init,
+                return_errors=return_errors,
+                svd=svd,
+                tol=tol,
+                random_state=random_state,
+                mask=mask,
+                verbose=verbose,
+            )
+            tucker_tensor, errors = self._split_tucker_result(
+                result,
+                return_errors=return_errors,
+            )
+            core, factors = tucker_tensor
             
             # Reconstruct the tensor from Tucker factors and core
             reconstruction = tl.tucker_tensor.tucker_to_tensor((core, factors))
             
             # Re-fold the tensor if it was unfolded
             if unfold_domain is not None:
-                reconstruction = unfold_tensor(reconstruction, unfold_domain, undo=True, original_shape=original_shape)
+                reconstruction = self._refold_with_hyperdata(
+                    reconstruction, unfold_metadata
+                )
             
             if return_decomposition:
                 results = [core, factors, reconstruction]
@@ -7423,6 +12893,8 @@ class DenoisingMethods:
                 return results
             else:
                 return reconstruction
+        else:
+            raise ValueError(f"Unknown implementation: {implementation}")
 
     
     # # =============================================================================
@@ -7524,43 +12996,37 @@ class DenoisingMethods:
         
 #%%
 
-class Denoiser:
+class _DenoiseEngine:
     """
-    The Denoiser class is designed to apply various denoising techniques to 4D-STEM data. It manages
-    different types of denoising methods, including filtering and machine learning methods 
-    to improve the quality of the data. The class can handle 2D, 3D, and 4D data, applying the 
-    appropriate denoising methods based on the dimensionality of the input data.
+    Private dispatcher for applying denoising methods to 2D, 3D, and 4D data.
+
+    ``HyperData.denoise(...)`` is the public API. This helper owns method
+    lookup, argument validation, and dimensional routing, while
+    ``_DenoisingMethods`` stores the numerical algorithms.
 
     Attributes
     ----------
     target_data : ndarray
         The data to be denoised, which can be 2D, 3D, or 4D.
 
-    methods : DenoisingMethods
-        An instance of the DenoisingMethods class, which contains all the available denoising techniques.
+    methods : _DenoisingMethods
+        The private numerical-method collection.
         
     Methods
     -------
     denoise(method_name, target_data=None, **kwargs)
         Applies the specified denoising method to the target data using the provided parameters.
-    
-    apply_denoising(real_space_method=None, reciprocal_space_method=None, 
-                    real_space_kwargs=None, reciprocal_space_kwargs=None, **kwargs)
-        Applies the specified denoising methods to the target data in real space and/or reciprocal space.
-        The method dynamically updates the parameters for the respective methods and handles the data 
-        based on its dimensionality. When only one method (real-space or reciprocal-space) is provided,
-        direct keyword arguments can be used. When both methods are provided, dictionaries are used 
-        to manage the respective parameters.
+    apply(method, domain='reciprocal', **kwargs)
+        Applies a method directly to 2D/3D data, slice-wise over a selected
+        coordinate domain for 4D data, or directly to the whole array when
+        ``domain=None``.
 
     Notes
     -----
-    - The `denoise` method fetches the appropriate method from the DenoisingMethods instance and applies it to 
+    - The `denoise` method fetches the appropriate method from the _DenoisingMethods instance and applies it to 
       the data. It raises a ValueError if the specified method is not found.
-    - The `apply_denoising` method intelligently updates the keyword arguments for real-space and reciprocal-space 
-      methods, ensuring that parameters are passed correctly. It supports handling of 2D, 3D, and 4D data, 
-      with appropriate processing for each dimensionality.
-    - For 2D and 3D data, the method does not support simultaneous application of real-space and reciprocal-space methods 
-      and will raise a ValueError if both are provided.
+    - The `apply` method supports direct 2D/3D denoising and 4D slice-wise
+      routing through real or reciprocal coordinates.
     """
     
     def __init__(self, target_data):
@@ -7569,11 +13035,169 @@ class Denoiser:
             self.array = target_data
             self.ndim = target_data.ndim
 
-        self.methods = DenoisingMethods()
+        self.methods = _DenoisingMethods()
         
         # Make a list of available denoising methods accessible (exclude helper functions starting with "_")
         available_methods = [m for m, v in inspect.getmembers(self.methods, predicate=inspect.ismethod) if not m.startswith('_')]
-        self.available_methods = available_methods
+        self.available_methods = sorted(available_methods)
+
+    @staticmethod
+    def _parameter_display(param):
+        """Return a compact display string for a method parameter."""
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return f"*{param.name}"
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return f"**{param.name}"
+        if param.default is inspect.Parameter.empty:
+            return f"{param.name}=..."
+        return f"{param.name}={repr(param.default)}"
+
+    @staticmethod
+    def _parameter_info(param):
+        """Return structured information for one user-facing parameter."""
+        default = None
+        has_default = param.default is not inspect.Parameter.empty
+        if has_default:
+            default = param.default
+
+        annotation = None
+        if param.annotation is not inspect.Parameter.empty:
+            annotation = (
+                param.annotation.__name__
+                if hasattr(param.annotation, '__name__')
+                else str(param.annotation)
+            )
+
+        return {
+            'name': param.name,
+            'kind': param.kind.description,
+            'required': (
+                not has_default
+                and param.kind not in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                )
+            ),
+            'default': default,
+            'has_default': has_default,
+            'annotation': annotation,
+        }
+
+    @staticmethod
+    def _doc_summary(docstring):
+        """Return the first paragraph of a docstring."""
+        if not docstring:
+            return ''
+        paragraphs = docstring.strip().split('\n\n')
+        return ' '.join(paragraph.strip() for paragraph in paragraphs[0].splitlines())
+
+    def method_info(self, method_name=None, include_doc=True, print_info=False):
+        """
+        Return signature and argument information for denoising methods.
+
+        The first numerical-method argument is the data array supplied by
+        ``HyperData.denoise``. It is intentionally excluded from
+        ``method_parameters`` because users should not pass it manually.
+        """
+        if method_name is None:
+            info = {'available_methods': tuple(self.available_methods)}
+            if print_info:
+                print("Available denoising methods:")
+                print(', '.join(self.available_methods))
+            return info
+
+        if not isinstance(method_name, str) or not method_name:
+            raise ValueError("method_name must be a non-empty string or None.")
+
+        method = getattr(self.methods, method_name, None)
+        if method is None or method_name.startswith('_'):
+            raise ValueError(
+                f"No such method '{method_name}'. Available methods are: "
+                f"{', '.join(self.available_methods)}"
+            )
+
+        signature = inspect.signature(method)
+        parameters = list(signature.parameters.values())
+
+        injected_data_parameter = None
+        method_parameters = parameters
+        if parameters and parameters[0].kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            injected_data_parameter = parameters[0].name
+            method_parameters = parameters[1:]
+
+        parameter_info = [
+            self._parameter_info(param)
+            for param in method_parameters
+        ]
+        required = [
+            param['name']
+            for param in parameter_info
+            if param['required']
+        ]
+        optional = [
+            param
+            for param in parameter_info
+            if not param['required']
+        ]
+        method_kwargs_display = ', '.join(
+            self._parameter_display(param)
+            for param in method_parameters
+        )
+        example_call = f"my_dataset.denoise(method='{method_name}'"
+        if method_kwargs_display:
+            example_call += f", {method_kwargs_display}"
+        example_call += ")"
+
+        docstring = inspect.getdoc(method) or ''
+        info = {
+            'method': method_name,
+            'full_signature': f"{method_name}{signature}",
+            'method_kwargs_signature': f"{method_name}({method_kwargs_display})",
+            'example_call': example_call,
+            'injected_data_parameter': injected_data_parameter,
+            'required_parameters': required,
+            'optional_parameters': optional,
+            'parameters': parameter_info,
+            'doc_summary': self._doc_summary(docstring),
+        }
+        if include_doc:
+            info['docstring'] = docstring
+
+        if print_info:
+            print(f"Method: {method_name}")
+            if info['doc_summary']:
+                print(info['doc_summary'])
+            print()
+            print("Use:")
+            print(f"  {example_call}")
+            print()
+            print(
+                "Data input supplied automatically by HyperData.denoise: "
+                f"{injected_data_parameter}"
+            )
+            if required:
+                print("Required method arguments:")
+                for name in required:
+                    print(f"  - {name}")
+            else:
+                print("Required method arguments: none")
+
+            if optional:
+                print("Optional method arguments:")
+                for param in optional:
+                    if param['kind'] == 'variadic keyword':
+                        print(f"  - **{param['name']}")
+                    elif param['kind'] == 'variadic positional':
+                        print(f"  - *{param['name']}")
+                    elif param['has_default']:
+                        print(f"  - {param['name']}={repr(param['default'])}")
+                    else:
+                        print(f"  - {param['name']}")
+
+        return info
 
     def denoise(self, method_name, target_data=None, **kwargs):
                 
@@ -7595,77 +13219,54 @@ class Denoiser:
         else:
             raise ValueError(f"No such method '{method_name}'. Available methods are: {', '.join(self.available_methods)}")
     
-    # @jit(nopython=True, parallel=True)
-    def apply_denoising(self, real_space_method=None, real_space_kwargs=None, 
-                        reciprocal_space_method=None, reciprocal_space_kwargs=None, 
-                        advanced_method=None, advanced_kwargs=None, **kwargs):
-        
-        #TODO: add a way to return possible inputs for each function
-        
-        if real_space_kwargs is None:
-            real_space_kwargs = {}
-        if reciprocal_space_kwargs is None:
-            reciprocal_space_kwargs = {}
-        if advanced_kwargs is None:
-            advanced_kwargs = {}
-            
-        if real_space_method:
-            real_space_kwargs.update(kwargs)
-        if reciprocal_space_method:
-            reciprocal_space_kwargs.update(kwargs)
-        if advanced_method:
-            advanced_kwargs.update(kwargs)
-        
-        if real_space_method is None and reciprocal_space_method is None:
-                      
-            if advanced_method:
-                
-                #TODO: assert the method is a string and is within the list of methods
-                return self.denoise(advanced_method, **advanced_kwargs)
-            
-            elif advanced_method is not None:
-                raise ValueError("The input method is undefined.")
-            
-            else:
-                raise ValueError("No denoising method provided.")
-                        
+    def apply(self, method, domain='reciprocal', **kwargs):
+        """Apply one denoising method using inferred dimensional routing."""
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a non-empty string.")
+
+        if domain is None:
+            return self.denoise(method, **kwargs)
+
+        if not isinstance(domain, str):
+            raise ValueError("domain must be a string or None.")
+        domain = domain.lower()
+        if domain in ('real_space', 'r'):
+            domain = 'real'
+        elif domain in ('reciprocal_space', 'k', 'k_space'):
+            domain = 'reciprocal'
+        if domain not in ('real', 'reciprocal'):
+            raise ValueError("domain must be 'real', 'reciprocal', or None.")
+
         dims = self.ndim
 
         # Below, we handle different dimensions accordingly
-        if dims == 2:
-            if real_space_method and not reciprocal_space_method:
-                return self.denoise(real_space_method, **real_space_kwargs)
-            elif reciprocal_space_method and not real_space_method:
-                return self.denoise(reciprocal_space_method, **reciprocal_space_kwargs)
-            elif real_space_method and reciprocal_space_method:
-                raise ValueError("Cannot handle both real space and reciprocal space methods simultaneously for 2D data.")
-
-        elif dims == 3:
-            if real_space_method and not reciprocal_space_method:
-                return np.array([self.denoise(real_space_method, target_data=slice, **real_space_kwargs) for slice in self.array])
-            elif reciprocal_space_method and not real_space_method:
-                return np.array([self.denoise(reciprocal_space_method, target_data=slice, **reciprocal_space_kwargs) for slice in self.array])
-            elif real_space_method and reciprocal_space_method:
-                raise ValueError("Cannot handle both real space and reciprocal space methods simultaneously for 3D data.")
+        if dims in (2, 3):
+            return self.denoise(method, **kwargs)
 
         elif dims == 4:
             ry, rx, ky, kx = self.array.shape
             processed_data = np.zeros_like(self.array)
 
-            if real_space_method:
+            if domain == 'real':
                 for i in tqdm(range(ky), desc = 'Filtering real-space images'):
                     for j in range(kx):
-                        processed_data[:, :, i, j] = self.denoise(real_space_method, target_data=self.array[:, :, i, j], **real_space_kwargs)
+                        processed_data[:, :, i, j] = self.denoise(
+                            method,
+                            target_data=self.array[:, :, i, j],
+                            **kwargs,
+                        )
 
-            if reciprocal_space_method:
+            elif domain == 'reciprocal':
                 for i in tqdm(range(ry), desc = 'Filtering diffraction patterns'):
                     for j in range(rx):
-                        processed_data[i, j, :, :] = self.denoise(reciprocal_space_method, target_data=self.array[i, j, :, :], **reciprocal_space_kwargs)
+                        processed_data[i, j, :, :] = self.denoise(
+                            method,
+                            target_data=self.array[i, j, :, :],
+                            **kwargs,
+                        )
 
-            return HyperData(processed_data)
+            return processed_data
 
         else:
             raise ValueError("Unsupported image dimensionality")
 
-
-            
