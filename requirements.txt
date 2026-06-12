@@ -11,3 +11,5 @@ opencv-python==4.10.*              # or headless
 xgboost
 abtem
 ase
+tensorly==0.9.*
+numba==0.61.*
