@@ -1,5 +1,6 @@
 name: 4denoise-main
-channels: [conda-forge]
+channels:
+  - conda-forge
 dependencies:
   - python=3.11
   - numpy=1.26.4
@@ -9,13 +10,15 @@ dependencies:
   - scikit-learn=1.4.*
   - h5py=3.10.*
   - tqdm=4.66.*
-  - jupyterlab=4.2.*
+  - tensorly=0.9.*
+  - numba=0.61.*
   - ipykernel=6.29.*
   - notebook=7.3.2
   - jupyterlab=4.3.4
-  - py-opencv=4.10.*      
   - pip
   - pip:
+      # Headless OpenCV avoids Qt/X11 dependencies on compute nodes.
+      - opencv-python-headless==4.10.*
       - py4dstem==0.14.18
       - ncempy==1.11.1
       - emdfile==0.0.16
