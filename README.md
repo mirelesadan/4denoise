@@ -114,6 +114,25 @@ python -m unittest discover -s tests
 axes. `real_shape` is `(Ry, Rx)` only for a 4D scan; it is `None` for a 3D
 stack because the original 2D scan geometry is not known.
 
+`HyperData.get_strains()` returns a `StrainResult` with named maps, fit
+quality, and the source scan calibration when the maps match the 4D scan:
+
+```python
+result = data.get_strains(centers=measured, ref_centers=reference)
+result.as_real_space('exx').show()
+result.as_real_space('relative_fit_rmse').show()
+valid = result.valid_mask
+```
+
+`exx`, `eyy`, and `exy` are dimensionless, while `erot` is in radians.
+`fit_rmse` is the RMS peak-position residual in the units supplied for the
+peaks; `relative_fit_rmse` divides it by the RMS reference-peak radius.
+Neither is a confidence probability: compare error with `match_counts` and
+`outlier_counts`, especially when only a few peaks were fitted. Existing
+four-value unpacking and numeric indexing still work. With
+`return_transform=True`, detailed transforms and peak-rejection information
+are available through `result.diagnostics` and as item `result[4]`.
+
 For a raw binary file with known layout, pass the full stored shape and dtype:
 
 ```python
