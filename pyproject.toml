@@ -42,6 +42,7 @@ bm = ["bm3d", "bm4d"]
 [tool.setuptools]
 py-modules = [
   "fourdenoise",
+  "fourdenoise_geometry",
   "abTEM_helpers",
   "rippleModel",
   "kin_diff_sim"

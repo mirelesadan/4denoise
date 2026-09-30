@@ -22,17 +22,45 @@ import cv2
 """
 
 def abTEM2numpy(abTEM_dp_object, resize_dims=None):
-    """
-    Convert a DiffractionPatterns object from abTEM to a numpy array with a user-defined 
-    """
+    """Return diffraction data as a NumPy array, optionally resizing its last two axes.
 
-    if abTEM_dp_object.is_lazy:
-        abTEM_dp_object.compute()
-        
-    if resize_dims:
-        array = cv2.resize(abTEM_dp_object.array, resize_dims, interpolation=cv2.INTER_LINEAR)
-    
-    return array
+    ``resize_dims`` uses OpenCV's ``(width, height)`` order. Leading scan axes
+    are retained and each diffraction pattern is resized independently.
+    """
+    measurement = abTEM_dp_object
+    if measurement.is_lazy:
+        computed = measurement.compute()
+        measurement = measurement if computed is None else computed
+
+    array = np.asarray(measurement.array)
+    if resize_dims is None:
+        return array
+
+    if (
+        not isinstance(resize_dims, (tuple, list, np.ndarray))
+        or len(resize_dims) != 2
+        or any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value <= 0
+            for value in resize_dims
+        )
+    ):
+        raise ValueError("resize_dims must be a positive integer (width, height) pair.")
+    if array.ndim < 2 or array.dtype.kind not in 'iuf':
+        raise ValueError("Diffraction data must be a real-valued array with at least 2 axes.")
+
+    width, height = map(int, resize_dims)
+    working = array.astype(np.result_type(array.dtype, np.float32), copy=False)
+    if working.ndim == 2:
+        return cv2.resize(working, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    output = np.empty(working.shape[:-2] + (height, width), dtype=working.dtype)
+    for index in np.ndindex(working.shape[:-2]):
+        output[index] = cv2.resize(
+            working[index], (width, height), interpolation=cv2.INTER_LINEAR,
+        )
+    return output
     
 
 def simulate_diff(atom_model, substrate=None, interlayer_dist=2, vacuum=2,
@@ -315,14 +343,23 @@ def rot_lattice(atom_model, theta_tilt=0, phi_rot=0, rotZ=0, units='deg', show=T
 
     return tilted_atom_model
 
-def add_poisson_noise(array, counts):
+def add_poisson_noise(array, counts, rng=None):
+    """Sample a Poisson diffraction image with the requested expected total counts."""
+    values = np.asarray(array, dtype=float)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("array must contain only finite values.")
+    if isinstance(counts, (bool, np.bool_)) or not np.isscalar(counts):
+        raise ValueError("counts must be a finite non-negative number.")
+    counts = float(counts)
+    if not np.isfinite(counts) or counts < 0:
+        raise ValueError("counts must be a finite non-negative number.")
 
-    # Remove any negative numbers and normalize
-    noisy_array = np.copy(array)
-    noisy_array[noisy_array < 0] = 0
-    noisy_array = noisy_array/np.max(noisy_array)
-    
-    np.random.poisson(noisy_array, size=counts)
+    signal = np.clip(values, 0, None)
+    total = signal.sum()
+    if total == 0:
+        return np.zeros(values.shape, dtype=np.int64)
+    generator = np.random.default_rng() if rng is None else rng
+    return generator.poisson(signal * (counts / total))
     
 
 def show_atoms_top_and_side(atom_model, 

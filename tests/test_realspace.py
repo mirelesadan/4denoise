@@ -33,7 +33,7 @@ class RealSpaceTests(unittest.TestCase):
         self.assertEqual(self.image.pixel_size, (2.0, 3.0))
         with self.assertRaisesRegex(ValueError, '2D'):
             fd.RealSpace(np.ones((2, 3, 4)))
-        for factor in (float('nan'), float('inf'), (1.0, -2.0)):
+        for factor in (float('nan'), float('inf'), 0.0, (1.0, 0.0)):
             with self.assertRaises(ValueError):
                 fd.RealSpace(np.ones((2, 2)), units='nm', conv_factor=factor)
         with self.assertRaisesRegex(TypeError, 'real-valued'):
@@ -48,6 +48,49 @@ class RealSpaceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.image.set_scale('um', float('nan'))
         self.assertEqual((self.image.units, self.image.conv_factor), before)
+
+    def test_flip_preserves_physical_scan_coordinates(self):
+        source = np.arange(3 * 4 * 2 * 2).reshape(3, 4, 2, 2)
+        flipped = fd.HyperData(
+            source, real_units='nm', real_conv_factor=(2.0, 3.0),
+            real_origin=(10.0, 20.0), flip_axis=(0, 1),
+        )
+        self.assertEqual(flipped.real_origin, (14.0, 29.0))
+        self.assertEqual(flipped.real_conv_factor, (-2.0, -3.0))
+        np.testing.assert_array_equal(
+            flipped.get_dp(14, 29, selection_units='calibrated').array,
+            source[-1, -1],
+        )
+        cropped = flipped.crop(
+            ylim=(10.0, 14.0), xlim=(23.0, 29.0),
+            real_limit_units='calibrated',
+        )
+        np.testing.assert_array_equal(cropped.array, flipped.array[1:3, 1:3])
+        self.assertEqual(cropped.real_origin, (12.0, 26.0))
+        restored = fd.HyperData(
+            flipped.array, real_units=flipped.real_units,
+            real_conv_factor=flipped.real_conv_factor,
+            real_origin=flipped.real_origin, flip_axis=(0, 1),
+        )
+        np.testing.assert_array_equal(restored.array, source)
+        self.assertEqual(restored.real_origin, (10.0, 20.0))
+        self.assertEqual(restored.real_conv_factor, (2.0, 3.0))
+
+    def test_signed_realspace_crop_and_scale_bar(self):
+        image = fd.RealSpace(
+            np.arange(12).reshape(3, 4), units='nm',
+            conv_factor=(-2.0, -3.0), origin=(14.0, 29.0),
+        )
+        cropped = image.crop(
+            (10.0, 14.0), (23.0, 29.0),
+            selection_units='calibrated',
+        )
+        np.testing.assert_array_equal(cropped.array, image.array[1:3, 1:3])
+        self.assertEqual(cropped.origin, (12.0, 26.0))
+        _, ax = image.show(show=False, scale_bar=3.0)
+        self.assertEqual(len(ax.lines), 3)
+        self.assertEqual(tuple(ax.images[0].get_extent()), (30.5, 18.5, 9.0, 15.0))
+        self.assertGreater(ax.lines[0].get_xdata()[0], ax.lines[0].get_xdata()[1])
 
     def test_show_reuses_axes_and_maps_pixel_overlay_to_calibrated_axes(self):
         fig, ax = plt.subplots()
