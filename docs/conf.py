@@ -39,6 +39,19 @@ linkcheck_workers = 2
 linkcheck_rate_limit_timeout = 30
 
 
+def _github_file_check_uri(app, uri):
+    """Check repository file existence without GitHub's HTML-page rate limits.
+
+    Only the checker's URI changes; readers still see the normal GitHub link.
+    Missing files still return HTTP 404. Fragment/query links are left intact
+    because raw content cannot validate HTML anchors or page-specific options.
+    """
+    prefix = "https://github.com/mirelesadan/4Denoise/blob/"
+    if uri.lower().startswith(prefix.lower()) and "#" not in uri and "?" not in uri:
+        return "https://raw.githubusercontent.com/mirelesadan/4Denoise/" + uri[len(prefix):]
+    return None
+
+
 def _require_verified_external_links(app, exception):
     """Do not let HTTP 503 responses silently pass as ignored links."""
     if exception is not None or app.builder.name != "linkcheck":
@@ -56,6 +69,7 @@ def _require_verified_external_links(app, exception):
 
 
 def setup(app):
+    app.connect("linkcheck-process-uri", _github_file_check_uri)
     app.connect("build-finished", _require_verified_external_links)
 
 html_theme = "furo"

@@ -3,12 +3,16 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import Mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('execute_demo', ROOT / 'scripts' / 'execute_demo.py')
 demo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(demo)
+conf_spec = importlib.util.spec_from_file_location('docs_conf', ROOT / 'docs' / 'conf.py')
+docs_conf = importlib.util.module_from_spec(conf_spec)
+conf_spec.loader.exec_module(docs_conf)
 
 
 class DemoValidationTests(unittest.TestCase):
@@ -53,6 +57,30 @@ class DemoValidationTests(unittest.TestCase):
             demo.resolve_output(ROOT, ROOT / demo.DEMO)
         with self.assertRaisesRegex(ValueError, 'extension'):
             demo.resolve_output(ROOT, ROOT / 'report.txt')
+
+
+class LinkValidationTests(unittest.TestCase):
+    def test_repo_file_links_check_the_exact_file_on_the_content_host(self):
+        for repository in ('4Denoise', '4denoise'):
+            uri = f'https://github.com/mirelesadan/{repository}/blob/main/missing_file.py'
+            self.assertEqual(
+                docs_conf._github_file_check_uri(None, uri),
+                'https://raw.githubusercontent.com/mirelesadan/4Denoise/main/missing_file.py',
+            )
+
+    def test_other_destinations_queries_and_fragments_are_unchanged(self):
+        base = 'https://github.com/mirelesadan/4Denoise/blob/main/gui.m'
+        for uri in (base + '#L10', base + '?plain=1',
+                    'https://github.com/another/repo/blob/main/gui.m',
+                    'https://zenodo.org/records/17246822',
+                    'https://github.com/mirelesadan/4Denoise/pull/9'):
+            self.assertIsNone(docs_conf._github_file_check_uri(None, uri))
+
+    def test_validation_hooks_are_registered(self):
+        app = Mock()
+        docs_conf.setup(app)
+        app.connect.assert_any_call('linkcheck-process-uri', docs_conf._github_file_check_uri)
+        app.connect.assert_any_call('build-finished', docs_conf._require_verified_external_links)
 
 
 if __name__ == '__main__':

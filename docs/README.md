@@ -122,6 +122,11 @@ references. Fix invalid destinations rather than broadly ignoring failures;
 external sites can also fail temporarily, in which case inspect the report
 before retrying the check.
 
+GitHub file links without fragments or queries are checked against the same
+file on `raw.githubusercontent.com`, avoiding GitHub HTML-page rate limits.
+Their visible links are unchanged; a missing file still fails with HTTP 404.
+Other external links (including any with anchors) are checked as written.
+
 `demo-notebook` executes only `DEMO_exp_4dstem_ripple_processing.ipynb` and the
 included full mini dataset. It starts a fresh kernel using the runner's Python
 interpreter, discards cached outputs, and rejects cell errors or skipped code.
