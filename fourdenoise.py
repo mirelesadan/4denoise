@@ -107,6 +107,13 @@ from tensorly.decomposition import symmetric_parafac_power_iteration as sym_para
 
 from pathlib import Path
 from typing import Union, Sequence, Tuple
+from fourdenoise_rq import (
+    RQCalibration,
+    RQComparison,
+    _coerce_rq_calibration,
+    _reframe_rq_calibration,
+    _rotation_matrix as _rq_rotation_matrix,
+)
 from fourdenoise_geometry import (
     _calibrated_center_to_pixels,
     _center_to_calibrated,
@@ -794,6 +801,7 @@ class _HDF5ChunkReader:
                 reciprocal_conv_factor=self._metadata.get('reciprocal_conv_factor'),
                 polar_metadata=self._metadata.get('polar_metadata'),
                 center_beam_metadata=self._metadata.get('center_beam_metadata'),
+                rq_calibration=self._metadata.get('rq_calibration'),
             )
     
 #%%
@@ -1261,7 +1269,25 @@ def anscombe_transform(array, inverse=False):
     return transformed_arr
 
 def add_poisson_noise(array, counts):
-    
+    """Draw Poisson counts from the relative intensities of an array.
+
+    Parameters
+    ----------
+    array : array_like
+        Input intensities. Negative values are set to zero in a copy before
+        normalizing the array; the original is not modified. The remaining
+        intensities must have a positive sum.
+    counts : float
+        Expected total count across the array, distributed in proportion to
+        its nonnegative intensities.
+
+    Returns
+    -------
+    numpy.ndarray
+        Random integer counts with the same shape as ``array``. The realized
+        total generally differs from ``counts`` because it is Poisson sampled.
+    """
+
     # Remove any negative numbers and normalize
     noisy_array = np.copy(array)
     noisy_array[noisy_array < 0] = 0
@@ -3909,7 +3935,31 @@ def reconstruct_height(xGrad, yGrad, y_bds_flat, x_bds_flat, iterations=10, thre
 
 
 def fix_sign_errors_adaptive(img, max_window_size=7, initial_window_size=3, variance_threshold=0.05):
-    
+    """Flip pixels whose signs disagree with an adaptive local median.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Two-dimensional array of signed values. It is not modified.
+    max_window_size : int, optional
+        Largest odd neighborhood width considered around each pixel.
+    initial_window_size : int, optional
+        Starting odd neighborhood width; it must not exceed
+        ``max_window_size``.
+    variance_threshold : float, optional
+        Stop expanding a neighborhood once its variance is below this value.
+
+    Returns
+    -------
+    numpy.ndarray
+        Copy of ``img`` with sign-disagreeing pixels multiplied by -1.
+
+    Notes
+    -----
+    Neighborhoods are clipped at image edges. If no window falls below the
+    variance threshold, the median of the largest examined window is used.
+    """
+
     # Ensure both dimensions of the initial window size are odd for center pixel calculation
     if initial_window_size % 2 == 0 or max_window_size % 2 == 0:
         raise ValueError("Both initial_window_size and max_window_size must be odd.")
@@ -4219,9 +4269,34 @@ def _calculate_metric(data, function):
         raise ValueError(f"Unsupported function: {function}")
     return metric
 
-def get_average_clusters(dataset, cluster_map, 
+def get_average_clusters(dataset, cluster_map,
                          plot_averages=True, vmin=4, vmax=14,cmap='turbo',logScale=False):
-    
+    """Average diffraction patterns at scan positions with the same cluster ID.
+
+    Parameters
+    ----------
+    dataset : HyperData
+        Four-dimensional data with shape ``(Ry, Rx, Ky, Kx)``.
+    cluster_map : numpy.ndarray
+        Integer labels with shape ``(Ry, Rx)``. The current implementation
+        expects contiguous labels ``0, 1, ..., K-1``.
+    plot_averages : bool, optional
+        Display each cluster average before returning it.
+    vmin, vmax : float, optional
+        Color limits for the displayed images only.
+    cmap : str, optional
+        Matplotlib colormap for the displayed images.
+    logScale : bool, optional
+        Display ``log(average + 1)`` rather than ``average + 1``. This does
+        not change the returned data.
+
+    Returns
+    -------
+    HyperData
+        Stack of cluster-mean patterns with shape ``(K, Ky, Kx)``. The
+        returned object does not currently inherit the input calibration.
+    """
+
     A, B, C, D = dataset.shape
     E, F = cluster_map.shape
     
@@ -4527,6 +4602,30 @@ def spiral_matrix(matrix, return_indices=True):
     return np.concatenate(result)
 
 def gradient_ascent(data, start, learning_rate=0.1, max_iters=100):
+    """Walk uphill in a 2D image using its local numerical gradient.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional scalar field.
+    start : tuple of float
+        Initial ``(y, x)`` position in pixel coordinates.
+    learning_rate : float, optional
+        Step multiplier applied to the gradient at each visited pixel.
+    max_iters : int, optional
+        Maximum number of update steps.
+
+    Returns
+    -------
+    tuple of float
+        Final ``(y, x)`` position, which can be subpixel.
+
+    Notes
+    -----
+    Gradient values are sampled at integer-truncated coordinates. The walk
+    does not constrain positions to the image bounds; an oversized step can
+    produce an indexing error.
+    """
     y, x = start
     for i in range(max_iters):
         grad_y, grad_x = np.gradient(data)
@@ -4538,12 +4637,50 @@ def gradient_ascent(data, start, learning_rate=0.1, max_iters=100):
 
 # Gaussian fitting
 def gaussian_2d(xdata, y0, x0, yalpha, xalpha, amplitude, offset):
+    """Evaluate an axis-aligned 2D Gaussian in ``(y, x)`` coordinates.
+
+    Parameters
+    ----------
+    xdata : pair of array_like
+        Broadcastable ``(y, x)`` coordinate arrays, or a ``(2, N)`` array.
+    y0, x0 : float
+        Center in pixel coordinates.
+    yalpha, xalpha : float
+        Gaussian standard deviations along the y and x axes.
+    amplitude : float
+        Gaussian peak amplitude relative to the baseline.
+    offset : float
+        Constant baseline.
+
+    Returns
+    -------
+    numpy.ndarray
+        Model values with the broadcast shape of the coordinates.
+    """
     y, x = xdata
     return offset + amplitude * np.exp(
         -(((y - y0) ** 2 / (2 * yalpha ** 2)) + ((x - x0) ** 2 / (2 * xalpha ** 2)))
     )
 
 def fit_gaussian_2d(data):
+    """Fit an axis-aligned Gaussian and return its ``(y, x)`` center.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional image to fit with :func:`gaussian_2d`.
+
+    Returns
+    -------
+    tuple of float
+        Fitted center ``(y0, x0)`` in pixel coordinates. Other fitted
+        parameters are not returned.
+
+    Notes
+    -----
+    The fit is unweighted and unconstrained. Its initial center is the middle
+    pixel, with unit widths, maximum image value as amplitude, and zero offset.
+    """
     x = np.arange(data.shape[1])
     y = np.arange(data.shape[0])
     x, y = np.meshgrid(x, y)
@@ -4554,6 +4691,28 @@ def fit_gaussian_2d(data):
 
 # Elliptical Gaussian fitting
 def elliptical_gaussian_2d(xdata, y0, x0, yalpha, xalpha, theta, amplitude, offset):
+    """Evaluate a rotated elliptical Gaussian in ``(y, x)`` coordinates.
+
+    Parameters
+    ----------
+    xdata : pair of array_like
+        Broadcastable ``(y, x)`` coordinate arrays, or a ``(2, N)`` array.
+    y0, x0 : float
+        Center in pixel coordinates.
+    yalpha, xalpha : float
+        Gaussian standard deviations along the rotated principal axes.
+    theta : float
+        In-plane rotation angle in radians.
+    amplitude : float
+        Gaussian peak amplitude relative to the baseline.
+    offset : float
+        Constant baseline.
+
+    Returns
+    -------
+    numpy.ndarray
+        Model values with the broadcast shape of the coordinates.
+    """
     y, x = xdata
     a = (np.cos(theta)**2 / (2 * xalpha**2)) + (np.sin(theta)**2 / (2 * yalpha**2))
     b = -(np.sin(2*theta) / (4 * xalpha**2)) + (np.sin(2*theta) / (4 * yalpha**2))
@@ -4561,6 +4720,25 @@ def elliptical_gaussian_2d(xdata, y0, x0, yalpha, xalpha, theta, amplitude, offs
     return offset + amplitude * np.exp(-(a * ((x - x0)**2) + 2 * b * (x - x0) * (y - y0) + c * ((y - y0)**2)))
 
 def fit_elliptical_gaussian_2d(data):
+    """Fit a rotated elliptical Gaussian and return its ``(y, x)`` center.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional image to fit with :func:`elliptical_gaussian_2d`.
+
+    Returns
+    -------
+    tuple of float
+        Fitted center ``(y0, x0)`` in pixel coordinates. Widths, angle,
+        amplitude, and offset are fitted but not returned.
+
+    Notes
+    -----
+    The fit is unweighted and unconstrained. It starts at the middle pixel
+    with unit widths, zero rotation, maximum image value as amplitude, and
+    zero offset.
+    """
     x = np.arange(data.shape[1])
     y = np.arange(data.shape[0])
     x, y = np.meshgrid(x, y)
@@ -5324,6 +5502,17 @@ class StrainResult:
 #%% The main 4D-STEM object
 
 class HyperData:
+    """Hold diffraction data and its real- and reciprocal-space calibration.
+
+    The final two axes are diffraction coordinates ``(Ky, Kx)``. A 4D array
+    has scan axes ``(Ry, Rx, Ky, Kx)``; a 3D array is a stack of patterns
+    ``(N, Ky, Kx)`` whose original 2D scan layout is not assumed. A 2D array
+    represents one image or pattern. Input may be an array or a supported
+    data-file path. Methods provide loading,
+    visualization, preprocessing, denoising, peak analysis, and strain maps.
+
+    See :meth:`__init__` for file-format, calibration, and metadata options.
+    """
 
     def __init__(self, data,
                  real_units: str = None,
@@ -5342,7 +5531,8 @@ class HyperData:
                  raw_order='C',
                  raw_trim_meta=None,
                  raw_trim_dims=(128, 128),
-                 mat_variable=None):
+                 mat_variable=None,
+                 rq_calibration=None):
         """Wrap an array or load a dataset with optional axis reversal.
 
         ``flip_axis`` accepts one axis or a sequence of axes to reverse. For
@@ -5368,6 +5558,9 @@ class HyperData:
         array; it is required when the file has multiple suitable arrays.
         Assigning a new ``array`` later refreshes the shape, dtype, and
         denoising engine; shape-dependent metadata is cleared when necessary.
+        ``rq_calibration`` is an optional :class:`RQCalibration` or saved
+        calibration dictionary describing real-to-detector orientation.
+        Saved files restore it automatically; axis flips update its frame.
         """
         loaded_metadata = {}
 
@@ -5423,6 +5616,8 @@ class HyperData:
             center_beam_metadata = loaded_metadata.get('center_beam_metadata')
         if real_origin is None:
             real_origin = loaded_metadata.get('real_origin', (0.0, 0.0))
+        if rq_calibration is None:
+            rq_calibration = loaded_metadata.get('rq_calibration')
 
         if data.ndim < 2:
             raise ValueError(
@@ -5460,6 +5655,20 @@ class HyperData:
         self.real_units = None
         self.real_conv_factor = None
         self.real_origin = _normalize_real_origin(real_origin)
+        self.rq_calibration = rq_calibration
+        if flip_axes and self.rq_calibration is not None:
+            real_flip = np.eye(2)
+            q_flip = np.eye(2)
+            for axis in flip_axes:
+                if axis == self.ndim - 1:
+                    q_flip[0, 0] = -1
+                elif axis == self.ndim - 2:
+                    q_flip[1, 1] = -1
+                elif self.ndim == 4:
+                    real_flip[1 - axis, 1 - axis] = -1
+            self.rq_calibration = _reframe_rq_calibration(
+                self.rq_calibration, real=real_flip, reciprocal=q_flip,
+            )
         self.reciprocal_units = None
         self.reciprocal_conv_factor = None
         self.unfold_metadata = _clone_unfold_metadata(
@@ -5516,6 +5725,7 @@ class HyperData:
             if old_shape[-2:] != new_array.shape[-2:]:
                 self.polar_metadata = None
                 self.center_beam_metadata = None
+                self.rq_calibration = None
 
     @staticmethod
     def _normalize_flip_axes(flip_axis, ndim):
@@ -5610,6 +5820,148 @@ class HyperData:
             raise ValueError(f"'{label}_conv_factor' must be a positive finite scalar.")
         return units.strip(), factor
 
+    @property
+    def rq_calibration(self):
+        """Optional immutable real-to-detector orientation calibration."""
+        return self._rq_calibration
+
+    @rq_calibration.setter
+    def rq_calibration(self, value):
+        self._rq_calibration = _coerce_rq_calibration(value)
+
+    def set_rq_calibration(self, rotation_deg=None, mirror_axis=None, *, calibration=None):
+        """Store real-to-detector orientation without changing array values.
+
+        Parameters
+        ----------
+        rotation_deg : float or None, optional
+            Counterclockwise real-to-detector angle in Cartesian image axes
+            (x right, y up). None defaults to zero when no calibration is given.
+        mirror_axis : {None, 'x', 'y'}, optional
+            Reflect about this real-frame axis before the rotation. Reflection
+            about x negates the y component; reflection about y negates x.
+        calibration : RQCalibration or dict, optional
+            Reuse a calibration or its saved dictionary instead of supplying
+            an angle/reflection. For example, ``calibration=viewer.calibration``.
+
+        Returns
+        -------
+        HyperData
+            This object, with updated metadata. Assign ``rq_calibration=None``
+            to clear it. Save/load and copy preserve the calibration.
+        """
+        if calibration is not None:
+            if rotation_deg is not None or mirror_axis is not None:
+                raise ValueError("Supply calibration or rotation_deg/mirror_axis, not both.")
+            self.rq_calibration = calibration
+        else:
+            self.rq_calibration = RQCalibration(
+                0.0 if rotation_deg is None else rotation_deg, mirror_axis,
+            )
+        return self
+
+    def compare_rq(self, real_image, reciprocal_image, *, layout='overlay',
+                   real_alpha=0.7, reciprocal_alpha=0.7, interactive=True,
+                   scale=None, translation=(0.0, 0.0), real_show_kwargs=None,
+                   reciprocal_show_kwargs=None, figsize=(12, 8), show=True,
+                   export_path='rq_alignment.png'):
+        """Compare a fixed real-space image with a movable diffraction image.
+
+        This manual calibration viewer is useful with a virtual STEM image and
+        a corresponding defocused shadow image. Only the two 2D inputs are
+        copied. Original images and the full dataset are never resampled.
+        Use an interactive Matplotlib backend (``%matplotlib widget`` with
+        ipympl in Jupyter, or Qt in Spyder) for the sliders and buttons.
+
+        Parameters
+        ----------
+        real_image : RealSpace or 2D ndarray
+            Fixed reference. An array matching the dataset's 2D scan shape
+            inherits its real-space calibration; other arrays use pixels.
+        reciprocal_image : ReciprocalSpace or 2D ndarray
+            Cartesian diffraction/shadow image. Its own beam metadata takes
+            precedence. A plain array matching ``pattern_shape`` inherits this
+            dataset's reciprocal calibration and beam metadata. The pivot is
+            ``center_px``, then ``mean_fit_center_px``, then a calibrated center
+            converted to pixels, or finally ``((Ky-1)/2, (Kx-1)/2)``. Stale or
+            malformed center metadata raises an error rather than being used.
+        layout : {'overlay', 'side_by_side'}, optional
+            Overlay both images or show the fixed reference and transformed
+            diffraction image on separate axes in the same reference frame.
+        real_alpha, reciprocal_alpha : float, optional
+            Independent image opacities in [0, 1]. GUI sliders control both.
+        interactive : bool, optional
+            Show rotation, opacity, scale, shift, mirror, reset, apply and
+            export controls. Noninteractive viewers can still be updated
+            programmatically with ``viewer.set_parameters(...)``.
+        scale : positive float or None, optional
+            Real horizontal pixels per diffraction pixel. None fits the image
+            inside the reference field. This registration scale does not change
+            either object's physical calibration. Unequal scan spacings are
+            respected when rotating, even when tick labels use pixels.
+        translation : (float, float), optional
+            ``(dy, dx)`` real-image pixels relative to its geometric midpoint.
+            The diffraction pivot is placed at that midpoint plus this shift.
+        real_show_kwargs, reciprocal_show_kwargs : dict or None, optional
+            Display options: ``cmap``, ``vmin``, ``vmax``, ``power``, ``logScale``,
+            ``percentiles``, ``symmetric``, ``title`` and ``interpolation``.
+            Diffraction display defaults to logScale=True; real display is
+            linear. The real options additionally accept ``axis_units``,
+            ``axes``, ``grid``, ``scale_bar``, ``scale_bar_color``, and
+            ``scale_bar_label`` for the shared reference frame.
+        figsize : (float, float), optional
+            Figure size in inches.
+        show : bool, optional
+            Call Matplotlib show. Set False for scripted composition/testing.
+        export_path : path-like, optional
+            Initial filename in the GUI's editable export box.
+
+        Returns
+        -------
+        RQComparison
+            Retain this object as ``viewer``. Its ``calibration`` is the inverse
+            of the displayed diffraction correction, with reflection included.
+            Apply calibration stores that orientation on this dataset. Scale,
+            shift and opacity remain preview settings; ``data.save(...)``
+            persists the applied orientation along with the other metadata.
+
+        Examples
+        --------
+        >>> viewer = data.compare_rq(virtual_image, shadow_image)
+        >>> viewer.set_parameters(rotation_deg=12.5, real_alpha=0.6)
+        >>> calibration = viewer.apply()
+        """
+        from weakref import ref
+
+        if not isinstance(real_image, RealSpace):
+            array = np.asarray(real_image)
+            real_image = (
+                self._spawn_real(array) if array.shape == self.real_shape
+                else RealSpace(array)
+            )
+        if not isinstance(reciprocal_image, ReciprocalSpace):
+            array = np.asarray(reciprocal_image)
+            reciprocal_image = (
+                self._spawn_reciprocal(array) if array.shape == self.pattern_shape
+                else ReciprocalSpace(array)
+            )
+        owner_ref = ref(self)
+
+        def apply_calibration(calibration):
+            owner = owner_ref()
+            if owner is None:
+                raise RuntimeError("The source HyperData no longer exists; use viewer.calibration.")
+            owner.set_rq_calibration(calibration=calibration)
+
+        return RQComparison(
+            real_image, reciprocal_image, calibration=self.rq_calibration,
+            on_apply=apply_calibration, layout=layout,
+            real_alpha=real_alpha, reciprocal_alpha=reciprocal_alpha,
+            interactive=interactive, scale=scale, translation=translation,
+            real_show_kwargs=real_show_kwargs, reciprocal_show_kwargs=reciprocal_show_kwargs,
+            figsize=figsize, show=show, export_path=export_path,
+        )
+
     def set_real_scale(self, units: str, conv_factor):
         """
         Attach scalar or ``(y, x)`` real-space units per pixel.
@@ -5694,6 +6046,7 @@ class HyperData:
                         'real_units', 'real_conv_factor', 'real_origin',
                         'reciprocal_units', 'reciprocal_conv_factor',
                         'polar_metadata', 'center_beam_metadata',
+                        'rq_calibration',
                     ):
                         if key in group:
                             metadata[key] = _read_hdf5_value(group, key)
@@ -5807,6 +6160,10 @@ class HyperData:
                                     'polar_metadata': polar_block.polar_metadata,
                                     'unfold_metadata': None,
                                     'center_beam_metadata': None,
+                                    'rq_calibration': (
+                                        polar_block.rq_calibration.to_dict()
+                                        if polar_block.rq_calibration is not None else None
+                                    ),
                                 }
                                 metadata_group = file.create_group('metadata')
                                 metadata_group.attrs['kind'] = 'dict'
@@ -5903,6 +6260,9 @@ class HyperData:
             'polar_metadata': self.polar_metadata,
             'unfold_metadata': self.unfold_metadata,
             'center_beam_metadata': self.center_beam_metadata,
+            'rq_calibration': (
+                self.rq_calibration.to_dict() if self.rq_calibration is not None else None
+            ),
         }
 
         def _write_file(target):
@@ -5963,6 +6323,7 @@ class HyperData:
                polar_metadata=_SCALE_UNSET,
                center_beam_metadata=_SCALE_UNSET,
                real_origin=_SCALE_UNSET,
+               rq_calibration=_SCALE_UNSET,
                preserve_unfold=False):
         """Create an object; retain unfolding only for shape-preserving values."""
         if real_units is _SCALE_UNSET:
@@ -5982,6 +6343,8 @@ class HyperData:
             )
         if real_origin is _SCALE_UNSET:
             real_origin = self.real_origin
+        if rq_calibration is _SCALE_UNSET:
+            rq_calibration = self.rq_calibration
 
         result = HyperData(
             data,
@@ -5996,6 +6359,7 @@ class HyperData:
                 else None
             ),
             real_origin=real_origin,
+            rq_calibration=rq_calibration,
         )
         if preserve_unfold and result.shape == self.shape:
             result.unfold_metadata = _clone_unfold_metadata(
@@ -7248,7 +7612,10 @@ class HyperData:
 
         if return_array:
             return reshaped
-        return self._spawn(reshaped)
+        return self._spawn(
+            reshaped,
+            rq_calibration=(self.rq_calibration if reshaped.shape[-2:] == self.pattern_shape else None),
+        )
 
 
     def swap_domains(self):
@@ -7288,6 +7655,10 @@ class HyperData:
             reciprocal_units=reciprocal_units,
             reciprocal_conv_factor=reciprocal_factor,
             center_beam_metadata=None,
+            rq_calibration=(
+                RQCalibration.from_matrix(self.rq_calibration.inverse_matrix, source='domain_swap')
+                if self.rq_calibration is not None else None
+            ),
         )
     
     
@@ -8087,7 +8458,12 @@ class HyperData:
                     prefilter=order > 1,
                 )
 
-            return self._spawn(new_data, center_beam_metadata=None)
+            return self._spawn(
+                new_data, center_beam_metadata=None,
+                rq_calibration=_reframe_rq_calibration(
+                    self.rq_calibration, reciprocal=_rq_rotation_matrix(angle_degrees),
+                ),
+            )
 
         output_dtype = (
             self.dtype if order == 0
@@ -8139,7 +8515,12 @@ class HyperData:
                     order=int(order),
                 )
 
-        return self._spawn(new_data, center_beam_metadata=None)
+        return self._spawn(
+            new_data, center_beam_metadata=None,
+            rq_calibration=_reframe_rq_calibration(
+                self.rq_calibration, reciprocal=_rq_rotation_matrix(angle_degrees),
+            ),
+        )
     
     def standardize(self, method='local'):
         """
@@ -8528,9 +8909,8 @@ class HyperData:
             counts retain their original range and subpixel values.
         rshape : tuple of (int, int), optional
             Shape (Ny_out, Nx_out) for real-space resizing (generalized binning).
-            - If rshape divides the current real-space shape, block-averaging
-              (binning) is used.
-            - Otherwise, bilinear interpolation is used along the real-space axes.
+            When ``rshape`` divides the current real-space shape, block
+            averaging is used. Otherwise, the scan axes are interpolated.
             Resampling integer data produces floating-point output so fractional
             counts are not truncated.
         real_limit_units : {'auto', 'pixels', 'calibrated'}, optional
@@ -9520,12 +9900,10 @@ class HyperData:
             True pixels. If operation == 'random', picks a random True pixel
             and returns its DP.
         operation : {'mean','median','max','min','std','random','flat_mean'} | None
-            Operation to apply. Defaults to 'mean' if None.
-            - 'mean','median','max','min','std' : aggregate over the selected
-              real-space region (or globally if no region/mask is given).
-            - 'random' : return a single randomly selected diffraction pattern.
-            - 'flat_mean' : special two-step operation based on radial masking
-              and a flat-field style threshold (see implementation).
+            Operation to apply. Defaults to 'mean' if None. The reduction
+            operations aggregate over the selected real-space region (or the
+            full scan when no region is given). ``random`` selects one pattern;
+            ``flat_mean`` uses radial masking and a flat-field threshold.
         selection_units : {'pixels', 'calibrated', 'auto'}, optional
             Unit system used to interpret ``y`` and ``x`` for 4D data.
             Defaults to ``'pixels'`` so scalar calls such as ``get_dp(i, j)``
@@ -10564,40 +10942,26 @@ class HyperData:
             Radius (in pixels) of the local window used by the center-finding
             algorithm in each diffaction pattern.
         ref_coords : array-like or nested list
-            Reference peak coordinates:
-              - 4D, array input:
-                  ndarray of shape (n_peaks, 2) used for every DP (same peaks).
-              - 4D, ragged list-of-lists:
-                  `ref_coords[i][j]` is array-like of shape (n_ij, 2) for each
-                  real-space position (i, j).
-              - 3D, array input:
-                  ndarray of shape (B_peaks, 2) used for each DP index.
-              - 3D, ragged list:
-                  `ref_coords[i]` is array-like of shape (n_i, 2) for each DP.
+            For 4D array input, shape ``(n_peaks, 2)`` supplies shared peaks.
+            For a 4D ragged list, ``ref_coords[i][j]`` holds the peaks at
+            scan position ``(i, j)``. For 3D array input, shape
+            ``(n_peaks, 2)`` supplies shared peaks; a 3D ragged list uses
+            ``ref_coords[i]`` for pattern ``i``.
     
         method : {'CoM', 'gaussian', 'elliptical_gaussian'}, optional
             Local center-refinement method for each diffraction pattern.
         real_mask : ndarray[bool] or None, optional
             Only used for 4D datasets. Boolean mask of shape (Ny, Nx) defining
-            which real-space positions (i, j) should have centers computed.
-            - If real_mask[i, j] is True:
-                The center-finding algorithm is applied at (i, j).
-            - If real_mask[i, j] is False:
-                Centers are skipped and filled with zeros:
-                  * 4D + array ref_coords:
-                      all_centers[i, j] remains zeros (n_peaks, 2).
-                  * 4D + ragged list-of-lists:
-                      an array of zeros with shape like ref_coords[i][j] is stored.
-            This accelerates center-finding by skipping unmasked positions.
-            For 3D datasets, passing real_mask is not supported and raises an error.
+            which real-space positions have centers computed. False positions
+            are skipped and filled with zeros, retaining the peak count for
+            array or ragged input. A 3D stack does not accept ``real_mask``.
     
         Returns
         -------
-        centers :
-            - 4D & array input -> ndarray (Ny, Nx, n_peaks, 2)
-            - 4D & list input  -> list of lists of arrays
-            - 3D & array input -> ndarray (B, n_peaks, 2)
-            - 3D & list input  -> list of arrays
+        centers : ndarray or list
+            Fixed-peak input returns ``(Ny, Nx, n_peaks, 2)`` for 4D or
+            ``(B, n_peaks, 2)`` for 3D. Ragged input returns a matching
+            nested list of per-pattern coordinate arrays.
         """
         assert 2 < self.ndim < 5, "HyperData must be 3D or 4D"
     
@@ -10701,15 +11065,10 @@ class HyperData:
         r : float, optional
             Integration radius in pixels.
         centers : array-like or list, optional
-            If array:
-              - shape (Ny, Nx, n_peaks, 2) for 4D
-              - shape (B,  n_peaks, 2)     for 3D
-            If list:
-              - 4D: list of length Ny, each an inner list of length Nx of (n_ij, 2)
-                arrays, so that `centers[i][j]` has shape (n_ij, 2) for DP (i, j).
-              - 3D: list of length B of (n_i, 2) arrays, so that `centers[i]` has
-                shape (n_i, 2) for DP i.
-            If None, centers are refined from `ref_coords` within each
+            Fixed-peak arrays have shape ``(Ny, Nx, n_peaks, 2)`` for 4D or
+            ``(B, n_peaks, 2)`` for 3D. Ragged input holds a coordinate
+            array per pattern, nested by scan row for 4D. If None, centers
+            are refined from ``ref_coords`` within each
             diffraction pattern before its intensities are integrated.
         ref_coords : array-like or nested list, optional
             Reference peak coordinates used when `centers is None`.
@@ -10723,31 +11082,19 @@ class HyperData:
             Fraction of the estimated background to subtract per included pixel.
         real_mask : ndarray[bool] or None, optional
             Only used for 4D datasets. Boolean mask of shape (Ny, Nx) defining
-            which real-space positions (i, j) should have intensities computed.
-            - If real_mask[i, j] is True:
-                Intensities are computed at (i, j) using the provided centers.
-            - If real_mask[i, j] is False:
-                Intensities are skipped and filled with zeros:
-                  * 4D + array centers:
-                      all_ints[i, j, :] remains zeros (n_peaks,).
-                  * 4D + ragged list-of-lists:
-                      a 1D zero array of length equal to the number of centers
-                      for that DP is stored.
-            This can accelerate processing when only a subset of DPs are of interest.
-            For 3D datasets, `real_mask` is not supported and will raise an error.
+            which real-space positions have intensities computed. False
+            positions are skipped and filled with zeros, retaining the peak
+            count for array or ragged input. A 3D stack does not accept
+            ``real_mask``.
         **resBg_kwargs :
             Additional keyword arguments forwarded to `dp.get_intensities(...)`.
     
         Returns
         -------
         all_ints : np.ndarray or list
-            If the peak positions were an array (and all DPs share n_peaks), returns a
-            fixed-shape ndarray:
-              - (Ny, Nx, n_peaks) for 4D
-              - (B,     n_peaks)  for 3D
-    
-            If the peak positions were a list (ragged), returns a list of the same shape,
-            where each entry is the 1D intensity array for that DP.
+            Fixed-peak input returns ``(Ny, Nx, n_peaks)`` for 4D or
+            ``(B, n_peaks)`` for 3D. Ragged input returns a matching list of
+            per-pattern intensity arrays.
         """
         assert 2 < self.ndim < 5, "HyperData must be 3D or 4D"
     
@@ -13494,11 +13841,16 @@ class ReciprocalSpace:
     conv_factor : float or None, optional
         Conversion factor from pixels to physical units, expressed as
         ``units / pixel``. When omitted, plots default to pixel units.
+    polar_metadata : dict or None, optional
+        Description of a ``(kr, ktheta)`` image produced by a polar transform.
+    center_beam_metadata : dict or None, optional
+        Direct-beam center and radius information, when available.
     """
 
     def __init__(self, data, units: str = None, conv_factor: float = None,
                  polar_metadata: dict = None,
                  center_beam_metadata: dict = None):
+        """Store the image and copy optional polar and direct-beam metadata."""
         self.array = data
         self.shape = data.shape
         self._denoise_engine = _DenoiseEngine(data)
@@ -14782,14 +15134,10 @@ class ReciprocalSpace:
             Order of rotational symmetry to enforce (e.g., 4 for 4-fold, 6 for
             6-fold). If None or < 2, no symmetry enforcement is applied.
         sym_mode : {"none", "repair", "prune", "both"}, optional
-            How to enforce n_fold symmetry on the detected peaks:
-            - "none":   no symmetry post-processing.
-            - "repair": keep all detected peaks and add missing symmetric ones
-                        for sufficiently complete orbits.
-            - "prune":  keep only peaks belonging to sufficiently complete
-                        n-fold orbits; do not add synthetic peaks.
-            - "both":   keep only peaks in sufficiently complete orbits and
-                        add synthetic peaks at missing symmetric positions.
+            How to enforce ``n_fold`` symmetry. ``none`` leaves detected peaks
+            unchanged; ``repair`` adds missing peaks in sufficiently complete
+            orbits; ``prune`` keeps only sufficiently complete orbits; and
+            ``both`` prunes incomplete orbits and repairs retained ones.
         sym_tolerance_px : float, optional
             Maximum Euclidean distance (in pixels) between a detected peak and
             its ideal symmetric position for them to be considered the same.
@@ -15674,6 +16022,7 @@ class RealSpace:
 
     def __init__(self, data, units: str = None, conv_factor=None,
                  origin=(0.0, 0.0), quantity='Intensity', value_units=None):
+        """Validate a 2D image and attach its optional spatial calibration."""
         array = np.asarray(data)
         if array.ndim != 2:
             raise ValueError("RealSpace requires a 2D image.")
