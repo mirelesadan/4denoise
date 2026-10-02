@@ -39,11 +39,23 @@ notebook = [
   "xgboost",
 ]
 bm = ["bm3d", "bm4d"]
+interactive = ["ipympl>=0.9,<1"]
+docs = [
+  "sphinx>=7.2,<9",
+  "myst-parser>=4,<5",
+  "furo>=2024.8.6,<2026",
+]
+docs-test = [
+  "nbclient>=0.10,<1",
+  "nbformat>=5.10,<6",
+  "ipykernel>=6.29,<8",
+]
 
 [tool.setuptools]
 py-modules = [
   "fourdenoise",
   "fourdenoise_geometry",
+  "fourdenoise_rq",
   "abTEM_helpers",
   "rippleModel",
   "kin_diff_sim"

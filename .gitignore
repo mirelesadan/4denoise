@@ -9,6 +9,7 @@ __pycache__/
 htmlcov/
 build/
 dist/
+/docs/_build/
 *.egg-info/
 .venv/
 venv/
@@ -17,6 +18,7 @@ venv/
 .ipynb_checkpoints/
 
 # Large or generated microscopy data
+/analysis_outputs/
 *.raw
 *.dm3
 *.dm4
