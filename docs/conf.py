@@ -74,6 +74,7 @@ def setup(app):
 
 html_theme = "furo"
 html_title = "4Denoise documentation"
+html_baseurl = "https://mirelesadan.github.io/4Denoise/"
 html_show_sourcelink = False
 html_theme_options = {
     "light_css_variables": {

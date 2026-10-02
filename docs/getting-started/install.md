@@ -50,6 +50,8 @@ python -m sphinx -b html -W --keep-going docs docs/_build/html
 
 Open `docs/_build/html/index.html` in a browser. The build imports the core
 `fourdenoise` module to read docstrings; it does not run the large
-experimental notebook. The documentation site is not published yet.
+experimental notebook. The public site is rebuilt from the validated `main`
+branch, so it describes the development version rather than a versioned
+PyPI release.
 
 Continue with the [mini-data quickstart](quickstart.md).
