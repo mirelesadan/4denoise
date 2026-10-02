@@ -23,7 +23,9 @@ The [3D strain-mapping case study](case-studies/3d-strain-mapping.md) links the
 full experimental and simulation notebooks and describes the external data,
 compute requirements, and MATLAB GUI. It is not a routine installation test.
 
-The guide can be built locally with Sphinx. It is not published yet.
+This guide follows the repository's `main` branch. GitHub Actions validates
+the documentation and mini-data DEMO before publishing updates to GitHub
+Pages. You can also [build the guide locally](getting-started/install.md#build-this-guide).
 
 ```{toctree}
 :maxdepth: 2

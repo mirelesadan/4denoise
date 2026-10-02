@@ -50,8 +50,8 @@ Jupyter kernel with `jupyter lab`.
 
 ## Explore
 
-- [Documentation guide](docs/index.md): installation, task guides, a curated API reference, and the case study.
-- [3D strain-mapping case study](docs/case-studies/3d-strain-mapping.md): external data, experimental notebook, simulation, and MATLAB GUI.
+- [Documentation website](https://mirelesadan.github.io/4Denoise/): installation, task guides, a curated API reference, and the case study.
+- [3D strain-mapping case study](https://mirelesadan.github.io/4Denoise/case-studies/3d-strain-mapping.html): external data, experimental notebook, simulation, and MATLAB GUI.
 - [Experimental processing notebook](exp_MoS2_MoSe2_processing.ipynb): the full, compute-intensive analysis.
 - [Simulation notebook](generateSimulatedRipple_4Ddata.ipynb): the companion ripple simulation workflow.
 
@@ -60,9 +60,10 @@ repository; they are available from the
 [Zenodo data record](https://zenodo.org/records/17246822). The case study
 explains which stages have been verified. The documentation guide can be built
 locally with `python -m pip install -e ".[docs]"` followed by
-`python -m sphinx -b html -W --keep-going docs docs/_build/html`. It has not
-been published as a website yet. PyPI publication is not required for the
-editable install above.
+`python -m sphinx -b html -W --keep-going docs docs/_build/html`. Its
+[source pages](docs/index.md) are maintained in this repository. GitHub Pages
+publishes the validated `main` branch automatically; PyPI publication is not
+required for either the website or the editable install above.
 
 To run the local unit tests: `python -m unittest discover -s tests`.
 

@@ -1,8 +1,9 @@
 # 4Denoise documentation plan
 
 This is the editorial map for the documentation work, not a user-facing guide
-page. The guide entry is `docs/index.md`; the Sphinx/MyST website builds
-locally but has not been published. This plan does not appear in site navigation.
+page. The guide entry is `docs/index.md`; the Sphinx/MyST website is published
+at https://mirelesadan.github.io/4Denoise/ from validated `main` commits.
+This plan does not appear in site navigation.
 
 ## Purpose and audience
 
@@ -95,8 +96,8 @@ can have their own reference page after their supported API is reviewed.
 3. Build the Sphinx/MyST site locally with the package installed. Start
    autodoc with the core module; optional simulation imports need their own
    dependency handling.
-4. Add CI checks for the documentation build, unit tests, and a bounded
-   example. Publish the verified site through GitHub Pages afterward.
+4. Require the documentation build, links, unit tests, and bounded example
+   checks before merging. Publish only when the main-branch checks pass.
 
 Publishing to PyPI is not a prerequisite: the repository already has a
 `pyproject.toml` and supports editable installation.
@@ -140,6 +141,29 @@ to ignored `docs/_build/`. Research notebooks and external experimental data
 are deliberately excluded; successful CI is not full scientific validation
 of the 3D reconstruction workflow.
 
-Update the guide and lightweight example alongside API changes. Publishing
-the verified site through GitHub Pages is a separate next step; this workflow
-does not deploy a website.
+## Publication and updates
+
+The repository's Pages source is **GitHub Actions**, not a `gh-pages` branch.
+Only `main` runs package the HTML using `upload-pages-artifact` and deploy
+through the `github-pages` environment. Pull requests and manual runs on other
+branches never publish. The environment also restricts deployment to `main`.
+
+The deployment waits for `docs-build`, `docs-links`, `demo-notebook`, and
+`site-tests`. The last job calls the existing Python test workflow to verify
+the same revision being published rather than relying on a separate workflow
+finishing first. Failed validation leaves the current live site unchanged.
+Only the deployment job receives Pages-write and OIDC permissions; it does
+not check out or execute package code. Deployments are serialized rather than
+cancelled while in progress. Only `docs/_build/html` is published, never the
+research datasets, notebook execution artifacts, or entire repository.
+
+After deployment, the workflow checks the live homepage, quickstart, API page,
+stylesheet, and search index. A failure here is reported but does not
+automatically roll back a deployment. Inspect the Pages environment and
+workflow logs, fix the source through a PR, and redeploy. The workflow can be
+run manually on `main` to retry publication after a temporary service outage.
+
+Update guide pages and the DEMO alongside API changes, then merge only after
+the required checks pass. No manual HTML upload is needed. The site tracks
+development `main`; versioned release documentation and PyPI publication are
+separate decisions.

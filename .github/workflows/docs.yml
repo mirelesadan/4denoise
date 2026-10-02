@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: docs-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   MPLBACKEND: Agg
@@ -23,6 +23,9 @@ jobs:
   docs-build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,6 +42,14 @@ jobs:
           python -m pip check
       - name: Build HTML with warnings treated as errors
         run: python -m sphinx -b html -W --keep-going docs docs/_build/html
+      - name: Configure GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/configure-pages@v6
+      - name: Package the validated site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/_build/html
       - name: Save HTML preview
         if: always()
         uses: actions/upload-artifact@v7
@@ -105,3 +116,35 @@ jobs:
           path: docs/_build/demo/*.ipynb
           retention-days: 7
           if-no-files-found: warn
+
+  # Reuse the core suite to gate this exact main revision, not a different run.
+  site-tests:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    uses: ./.github/workflows/tests.yml
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [docs-build, docs-links, demo-notebook, site-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    steps:
+      - name: Deploy validated documentation
+        id: deployment
+        uses: actions/deploy-pages@v5
+      - name: Verify published pages and assets
+        env:
+          SITE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          for page in index.html getting-started/quickstart.html reference/hyperdata.html _static/styles/furo.css searchindex.js; do
+            echo "Checking ${SITE_URL%/}/$page"
+            curl --fail --silent --show-error --location --retry 5 --retry-delay 5 --retry-all-errors --max-time 10 "${SITE_URL%/}/$page" --output /dev/null
+          done
